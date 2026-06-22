@@ -71,8 +71,10 @@ static inline int check_ring(Drone* drone, Target* ring) {
         Vec3 intersection = add3(drone->prev_pos, scalmul3(dir, t));
         float d = norm3(sub3(intersection, ring->pos));
 
-        if (d < (ring->radius - 0.5f) && valid_dir) return 1;
-        if (d < ring->radius + 0.5f) return -1;
+        // margins scale with radius
+        float margin = 0.25f * ring->radius;
+        if (d < (ring->radius - margin) && valid_dir) return 1;
+        if (d < ring->radius + margin) return -1;
     }
     return 0;
 }

@@ -39,7 +39,7 @@
 #define MARGIN_X (GRID_X - 1)
 #define MARGIN_Y (GRID_Y - 1)
 #define MARGIN_Z (GRID_Z - 1)
-#define RING_RADIUS 2.0f
+#define RING_RADIUS 0.5f
 #define V_TARGET 0.05f
 
 #define DRONE_OBS_SIZE 19
