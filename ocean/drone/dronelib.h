@@ -221,6 +221,10 @@ static inline Vec3 random_pos(unsigned int* rng) {
     };
 }
 
+static inline bool out_of_bounds(Vec3 p) {
+    return fabsf(p.x) > GRID_X || fabsf(p.y) > GRID_Y || fabsf(p.z) > GRID_Z;
+}
+
 // physics
 
 static inline float rpm_hover(const Params* p) {

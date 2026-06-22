@@ -33,6 +33,7 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
     cfg->ring_reward = dict_get(kwargs, "ring_reward")->value;
     cfg->collision_penalty = dict_get(kwargs, "collision_penalty")->value;
     cfg->time_penalty = dict_get(kwargs, "time_penalty")->value;
+    cfg->oob_penalty = dict_get(kwargs, "oob_penalty")->value;
     cfg->alpha_dist = dict_get(kwargs, "alpha_dist")->value;
     env->task_config = cfg;
 }

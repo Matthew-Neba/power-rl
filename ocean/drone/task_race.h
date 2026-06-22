@@ -9,6 +9,7 @@ typedef struct {
     float ring_reward;
     float collision_penalty;
     float time_penalty;
+    float oob_penalty;
     float alpha_dist;
 } RaceConfig;
 
@@ -115,6 +116,8 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
         reward -= cfg->collision_penalty;
     }
 
+    if (out_of_bounds(agent->state.pos)) reward -= cfg->oob_penalty;
+
     reward -= cfg->time_penalty;
     return reward;
 }
@@ -122,7 +125,8 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
 static bool race_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
-    return state->rings_passed[idx] >= cfg->max_rings || agent->episode_length >= HORIZON;
+    return state->rings_passed[idx] >= cfg->max_rings || out_of_bounds(agent->state.pos) ||
+           agent->episode_length >= HORIZON;
 }
 
 static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
@@ -134,6 +138,7 @@ static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* 
     log_task_add(log, 0, (float)state->rings_passed[idx]);
     log_task_add(log, 1, state->collisions[idx]);
     log_task_add(log, 2, completed);
+    log_task_add(log, 3, out_of_bounds(agent->state.pos) ? 1.0f : 0.0f);
 }
 
 static void race_render(DroneEnv* env, Client* client) {
@@ -147,8 +152,8 @@ static void race_render(DroneEnv* env, Client* client) {
 
 static const Task TASK_RACE = {
     .name = "race",
-    .log_keys = {"rings_passed", "ring_collisions", "completed"},
-    .num_log_keys = 3,
+    .log_keys = {"rings_passed", "ring_collisions", "completed", "oob"},
+    .num_log_keys = 4,
     .init = race_init,
     .close = race_close,
     .env_reset = race_env_reset,
