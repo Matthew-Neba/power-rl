@@ -15,6 +15,7 @@ typedef struct {
     float hover_vel;
     float alpha_hover;
     float alpha_shaping;
+    float alpha_omega;
 } HoverConfig;
 
 typedef struct {
@@ -116,8 +117,9 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
     HoverState* state = (HoverState*)env->task_state;
 
     float curr = hover_potential(cache->dist, cache->vel, cache->omega, cfg);
-    float reward = cfg->alpha_hover * curr 
-                 + cfg->alpha_shaping * (curr - state->prev_potential[idx]);
+    float reward = cfg->alpha_hover * curr
+                 + cfg->alpha_shaping * (curr - state->prev_potential[idx])
+                 - cfg->alpha_omega * cache->omega;
     state->prev_potential[idx] = curr;
 
     float score = hover_score(cache->dist, cache->vel, cache->omega);

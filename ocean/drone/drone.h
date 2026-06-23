@@ -71,9 +71,8 @@ struct DroneEnv {
     void* task_config;
     void* task_state;
 
-    // reward primitives
+    // shared reward primitive
     float alpha_dist;
-    float alpha_omega;
 
     Client* client;
 };
@@ -139,8 +138,7 @@ void c_step(DroneEnv* env) {
 
         float reward = env->task->reward(env, agent, i, &cache);
         reward += env->alpha_dist * (cache.prev_dist - cache.dist);
-        reward -= env->alpha_omega * cache.omega;
-        
+
         bool done = env->task->done(env, agent, i, &cache);
 
         agent->episode_return += reward;

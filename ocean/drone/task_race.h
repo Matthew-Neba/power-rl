@@ -15,6 +15,7 @@ typedef struct {
     float collision_penalty;
     float time_penalty;
     float oob_penalty;
+    float alpha_omega;
 } RaceConfig;
 
 typedef struct {
@@ -111,7 +112,7 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
 
-    float reward = 0.0f;
+    float reward = -cfg->alpha_omega * cache->omega;
 
     int result = check_ring(agent, &state->ring_buffer[state->ring_idx[idx]]);
     if (result == 1) {

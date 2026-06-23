@@ -20,6 +20,7 @@ static void hover_config(DroneEnv* env, Dict* kwargs) {
     cfg->hover_vel = dict_get(kwargs, "hover_vel")->value;
     cfg->alpha_hover = dict_get(kwargs, "alpha_hover")->value;
     cfg->alpha_shaping = dict_get(kwargs, "alpha_shaping")->value;
+    cfg->alpha_omega = dict_get(kwargs, "hover_alpha_omega")->value;
     env->task_config = cfg;
 }
 
@@ -30,6 +31,7 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
     cfg->collision_penalty = dict_get(kwargs, "collision_penalty")->value;
     cfg->time_penalty = dict_get(kwargs, "time_penalty")->value;
     cfg->oob_penalty = dict_get(kwargs, "oob_penalty")->value;
+    cfg->alpha_omega = dict_get(kwargs, "race_alpha_omega")->value;
     env->task_config = cfg;
 }
 
@@ -37,7 +39,6 @@ void my_init(Env* env, Dict* kwargs) {
     env->num_agents = (int)dict_get(kwargs, "num_drones")->value;
 
     env->alpha_dist = dict_get(kwargs, "alpha_dist")->value;
-    env->alpha_omega = dict_get(kwargs, "alpha_omega")->value;
 
     float hover_w = dict_get(kwargs, "hover_frac")->value;
     float race_w = dict_get(kwargs, "race_frac")->value;
