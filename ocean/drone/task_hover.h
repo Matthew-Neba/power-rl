@@ -99,6 +99,7 @@ static void hover_reset(DroneEnv* env, Drone* agent, int idx) {
 
     agent->state.pos = random_pos(&env->rng);
     hover_set_target(&env->rng, agent, cfg->target_dist);
+    agent->target->normal = (Vec3){0.0f, 0.0f, 0.0f};
 
     float dist = norm3(sub3(agent->target->pos, agent->state.pos));
     float vel = norm3(agent->state.vel);
@@ -139,12 +140,13 @@ static bool hover_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
 static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;
-    log->score += state->score[idx];
-    log->perf += state->perf[idx];
-    log_task_add(log, 0, state->ema_dist[idx]);
-    log_task_add(log, 1, state->ema_vel[idx]);
-    log_task_add(log, 2, state->ema_omega[idx]);
-    log_task_add(log, 3, cache->dist > (cfg->target_dist + 1.0f) ? 1.0f : 0.0f);
+    log->hover_n += 1.0f;
+    log->hover_perf += state->perf[idx];
+    log->hover_score += state->score[idx];
+    log->hover_keys[0] += state->ema_dist[idx];
+    log->hover_keys[1] += state->ema_vel[idx];
+    log->hover_keys[2] += state->ema_omega[idx];
+    log->hover_keys[3] += cache->dist > (cfg->target_dist + 1.0f) ? 1.0f : 0.0f;
 }
 
 // definition

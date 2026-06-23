@@ -143,12 +143,13 @@ static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* 
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
     float completed = state->rings_passed[idx] >= cfg->max_rings ? 1.0f : 0.0f;
-    log->score += (float)state->rings_passed[idx];
-    log->perf += completed;
-    log_task_add(log, 0, (float)state->rings_passed[idx]);
-    log_task_add(log, 1, state->collisions[idx]);
-    log_task_add(log, 2, completed);
-    log_task_add(log, 3, out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ? 1.0f : 0.0f);
+    log->race_n += 1.0f;
+    log->race_perf += completed;
+    log->race_score += (float)state->rings_passed[idx];
+    log->race_keys[0] += (float)state->rings_passed[idx];
+    log->race_keys[1] += state->collisions[idx];
+    log->race_keys[2] += completed;
+    log->race_keys[3] += out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ? 1.0f : 0.0f;
 }
 
 static void race_render(DroneEnv* env, Client* client) {

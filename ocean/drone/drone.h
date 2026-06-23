@@ -23,20 +23,25 @@ typedef struct {
 
 #define MAX_TASK_LOG_ENTRIES 16
 
+// Per-task log blocks each carry their own episode count (hover_n / race_n) so the
+// generic vec aggregator (sum all fields, divide by total n) still yields correct
+// per-task averages: dividing a task's key by its own count cancels the global n.
 typedef struct Log Log;
 struct Log {
-    float score;
-    float perf;
     float episode_return;
     float episode_length;
-    float task[MAX_TASK_LOG_ENTRIES];
     float n;
-};
 
-static inline void log_task_add(Log* log, int idx, float value) {
-    if (idx < 0 || idx >= MAX_TASK_LOG_ENTRIES) return;
-    log->task[idx] += value;
-}
+    float hover_n;
+    float hover_perf;
+    float hover_score;
+    float hover_keys[4]; // ema_dist, ema_vel, ema_omega, oob
+
+    float race_n;
+    float race_perf;
+    float race_score;
+    float race_keys[4]; // rings_passed, ring_collisions, completed, oob
+};
 
 typedef struct DroneEnv DroneEnv;
 typedef struct Client Client;
