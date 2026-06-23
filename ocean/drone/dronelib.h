@@ -42,7 +42,7 @@
 #define RING_RADIUS 0.5f
 #define V_TARGET 0.05f
 
-#define NUM_TASKS 2
+#define NUM_TASKS 3
 #define DRONE_OBS_SIZE (19 + NUM_TASKS) // 19 physical obs + one-hot task id
 
 // Core Parameters

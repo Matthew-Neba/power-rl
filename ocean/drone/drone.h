@@ -36,6 +36,11 @@ struct Log {
     float race_perf;
     float race_score;
     float race_keys[4]; // rings_passed, ring_collisions, completed, oob
+
+    float sphere_n;
+    float sphere_perf;
+    float sphere_score;
+    float sphere_keys[4]; // ema_dist, ema_vel, ema_omega, oob
 };
 
 typedef struct DroneEnv DroneEnv;

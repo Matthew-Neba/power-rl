@@ -3,6 +3,7 @@
 #include "render.h"
 #include "task_hover.h"
 #include "task_race.h"
+#include "task_sphere.h"
 #include <time.h>
 
 #ifdef __EMSCRIPTEN__
@@ -17,6 +18,11 @@ static void setup_task(DroneEnv* env, int task) {
         RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
         cfg->max_rings = 10;
         env->task_config = cfg;
+    } else if (task == 2) {
+        env->task = &TASK_SPHERE;
+        SphereConfig* cfg = (SphereConfig*)calloc(1, sizeof(SphereConfig));
+        cfg->radius = 4.0f;
+        env->task_config = cfg;
     } else {
         env->task = &TASK_HOVER;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
@@ -28,8 +34,7 @@ static void setup_task(DroneEnv* env, int task) {
 }
 
 static void toggle_task(DroneEnv* env) {
-    int current = (env->task == &TASK_RACE) ? 1 : 0;
-    setup_task(env, (current + 1) % 2);
+    setup_task(env, (env->task->id + 1) % NUM_TASKS);
 }
 
 #ifdef __EMSCRIPTEN__
