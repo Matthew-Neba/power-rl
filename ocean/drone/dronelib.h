@@ -42,7 +42,8 @@
 #define RING_RADIUS 0.5f
 #define V_TARGET 0.05f
 
-#define DRONE_OBS_SIZE 19
+#define NUM_TASKS 2
+#define DRONE_OBS_SIZE (19 + NUM_TASKS) // 19 physical obs + one-hot task id
 
 // Core Parameters
 #define DT 0.002f // 500 Hz
@@ -378,7 +379,7 @@ static inline void move_drone(Drone* drone, float* actions) {
 
 // observations
 
-void compute_drone_observations(Drone* agent, float* observations) {
+void compute_drone_observations(Drone* agent, int task_id, float* observations) {
     int idx = 0;
     Quat q = agent->state.quat;
     Quat q_inv = quat_inverse(q);
@@ -413,4 +414,8 @@ void compute_drone_observations(Drone* agent, float* observations) {
     observations[idx++] = normal_body.x;
     observations[idx++] = normal_body.y;
     observations[idx++] = normal_body.z;
+
+    // one-hot task id
+    for (int t = 0; t < NUM_TASKS; t++)
+        observations[idx++] = (t == task_id) ? 1.0f : 0.0f;
 }

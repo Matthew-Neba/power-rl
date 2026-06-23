@@ -43,6 +43,7 @@ typedef struct Client Client;
 
 typedef struct {
     const char* name;
+    int id; // task index, also the one-hot slot in the observation
 
     void (*init)(DroneEnv* env);
     void (*close)(DroneEnv* env);
@@ -79,7 +80,8 @@ struct DroneEnv {
 
 void compute_observations(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++)
-        compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE);
+        compute_drone_observations(&env->agents[i], env->task->id,
+                                   env->observations + i * DRONE_OBS_SIZE);
 }
 
 void reset_agent_base(Drone* agent, unsigned int* rng) {

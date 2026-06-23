@@ -163,6 +163,7 @@ static void race_render(DroneEnv* env, Client* client) {
 
 static const Task TASK_RACE = {
     .name = "race",
+    .id = 1,
     .init = race_init,
     .close = race_close,
     .env_reset = race_env_reset,

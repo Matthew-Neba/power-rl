@@ -152,6 +152,7 @@ static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache*
 
 static const Task TASK_HOVER = {
     .name = "hover",
+    .id = 0,
     .init = hover_init,
     .close = hover_close,
     .env_reset = NULL,
