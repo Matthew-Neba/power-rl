@@ -12,7 +12,7 @@
 
 #include "dronelib.h"
 
-#define HORIZON 1024
+#define HORIZON 2048
 
 typedef struct {
     float dist;

@@ -2,7 +2,10 @@
 
 #include "drone.h"
 
-#define RACE_OOB_SCALE 1.5f
+#define RACE_OOB_SCALE 2.0f
+
+#define RACE_RING_MIN_DIST (2.0f * RING_RADIUS)
+#define RACE_RING_MAX_DIST 8.0f
 
 // types
 
@@ -16,8 +19,8 @@ typedef struct {
 } RaceConfig;
 
 typedef struct {
-    Target* ring_buffer;
-    int* ring_idx;
+    Target* ring_buffer; // one fixed track per env, shared by all drones
+    int* ring_idx;       // per-agent progress along the track
     int* rings_passed;
     float* collisions;
 } RaceState;
@@ -48,13 +51,14 @@ static void race_close(DroneEnv* env) {
 
 // helpers
 
-static inline void reset_rings(unsigned int* rng, Target* ring_buffer, int num_rings) {
-    ring_buffer[0] = rndring(rng, RING_RADIUS);
-    for (int i = 1; i < num_rings; i++) {
-        do {
-            ring_buffer[i] = rndring(rng, RING_RADIUS);
-        } while (norm3(sub3(ring_buffer[i].pos, ring_buffer[i - 1].pos)) < 2.0f * RING_RADIUS);
-    }
+static inline Target gen_next_ring(unsigned int* rng, const Target* current) {
+    Target ring;
+    float dist;
+    do {
+        ring = rndring(rng, RING_RADIUS);
+        dist = norm3(sub3(ring.pos, current->pos));
+    } while (dist < RACE_RING_MIN_DIST || dist > RACE_RING_MAX_DIST);
+    return ring;
 }
 
 static inline int check_ring(Drone* drone, Target* ring) {
@@ -74,7 +78,7 @@ static inline int check_ring(Drone* drone, Target* ring) {
         float d = norm3(sub3(intersection, ring->pos));
 
         // margins scale with radius
-        float margin = 0.25f * ring->radius;
+        float margin = 0.1f * ring->radius;
         if (d < (ring->radius - margin) && valid_dir) return 1;
         if (d < ring->radius + margin) return -1;
     }
@@ -86,7 +90,9 @@ static inline int check_ring(Drone* drone, Target* ring) {
 static void race_env_reset(DroneEnv* env) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
-    reset_rings(&env->rng, state->ring_buffer, cfg->max_rings);
+    state->ring_buffer[0] = rndring(&env->rng, RING_RADIUS);
+    for (int i = 1; i < cfg->max_rings; i++)
+        state->ring_buffer[i] = gen_next_ring(&env->rng, &state->ring_buffer[i - 1]);
 }
 
 static void race_reset(DroneEnv* env, Drone* agent, int idx) {
