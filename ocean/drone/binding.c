@@ -64,8 +64,9 @@ static inline float task_avg(float sum, float n) { return n > 0.0f ? sum / n : 0
 void my_log(Log* log, Dict* out) {
     float hn = log->hover_n, rn = log->race_n;
 
-    dict_set(out, "perf", log->hover_perf + log->race_perf);
-    dict_set(out, "score", log->hover_score + log->race_score);
+    int active = (hn > 0.0f) + (rn > 0.0f);
+    dict_set(out, "perf", (task_avg(log->hover_perf, hn) + task_avg(log->race_perf, rn)) / active);
+    dict_set(out, "score", (task_avg(log->hover_score, hn) + task_avg(log->race_score, rn)) / active);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
 
