@@ -15,12 +15,11 @@ typedef struct {
     float collision_penalty;
     float time_penalty;
     float oob_penalty;
-    float alpha_dist;
 } RaceConfig;
 
 typedef struct {
-    Target* ring_buffer; // one fixed track per env, shared by all drones
-    int* ring_idx;       // per-agent progress along the track
+    Target* ring_buffer;
+    int* ring_idx;
     int* rings_passed;
     float* collisions;
 } RaceState;
@@ -112,7 +111,7 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
 
-    float reward = cfg->alpha_dist * (cache->prev_dist - cache->dist);
+    float reward = 0.0f;
 
     int result = check_ring(agent, &state->ring_buffer[state->ring_idx[idx]]);
     if (result == 1) {
@@ -163,8 +162,6 @@ static void race_render(DroneEnv* env, Client* client) {
 
 static const Task TASK_RACE = {
     .name = "race",
-    .log_keys = {"rings_passed", "ring_collisions", "completed", "oob"},
-    .num_log_keys = 4,
     .init = race_init,
     .close = race_close,
     .env_reset = race_env_reset,

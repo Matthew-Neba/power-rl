@@ -21,11 +21,6 @@ typedef struct {
     float omega;
 } StepCache;
 
-#define MAX_TASK_LOG_ENTRIES 16
-
-// Per-task log blocks each carry their own episode count (hover_n / race_n) so the
-// generic vec aggregator (sum all fields, divide by total n) still yields correct
-// per-task averages: dividing a task's key by its own count cancels the global n.
 typedef struct Log Log;
 struct Log {
     float episode_return;
@@ -48,8 +43,6 @@ typedef struct Client Client;
 
 typedef struct {
     const char* name;
-    const char* log_keys[MAX_TASK_LOG_ENTRIES];
-    int num_log_keys;
 
     void (*init)(DroneEnv* env);
     void (*close)(DroneEnv* env);
@@ -77,6 +70,10 @@ struct DroneEnv {
     const Task* task;
     void* task_config;
     void* task_state;
+
+    // reward primitives
+    float alpha_dist;
+    float alpha_omega;
 
     Client* client;
 };
@@ -141,6 +138,9 @@ void c_step(DroneEnv* env) {
         };
 
         float reward = env->task->reward(env, agent, i, &cache);
+        reward += env->alpha_dist * (cache.prev_dist - cache.dist);
+        reward -= env->alpha_omega * cache.omega;
+        
         bool done = env->task->done(env, agent, i, &cache);
 
         agent->episode_return += reward;

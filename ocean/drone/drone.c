@@ -9,40 +9,27 @@
 #include <emscripten.h>
 #endif
 
-// Build (or rebuild) the demo task in place, freeing any previous task first.
-static void setup_task(DroneEnv* env, const char* task) {
+static void setup_task(DroneEnv* env, int task) {
     if (env->task != NULL) env->task->close(env);
 
-    if (strcmp(task, "race") == 0) {
+    if (task == 1) {
         env->task = &TASK_RACE;
         RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
         cfg->max_rings = 10;
-        cfg->ring_reward = 1.0f;
-        cfg->collision_penalty = 0.5f;
-        cfg->time_penalty = 0.0f;
-        cfg->oob_penalty = 1.0f;
-        cfg->alpha_dist = 1.0f;
         env->task_config = cfg;
     } else {
         env->task = &TASK_HOVER;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->target_dist = 5.0f;
-        cfg->hover_dist = 0.1f;
-        cfg->hover_omega = 0.1f;
-        cfg->hover_vel = 0.1f;
-        cfg->alpha_dist = 0.782192f;
-        cfg->alpha_hover = 0.071445f;
-        cfg->alpha_shaping = 3.9754f;
-        cfg->alpha_omega = 0.00135588f;
         env->task_config = cfg;
     }
     env->task->init(env);
     c_reset(env);
 }
 
-// Toggle hover <-> race, used by the SPACE key in both run loops.
 static void toggle_task(DroneEnv* env) {
-    setup_task(env, env->task == &TASK_RACE ? "hover" : "race");
+    int current = (env->task == &TASK_RACE) ? 1 : 0;
+    setup_task(env, (current + 1) % 2);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -63,8 +50,7 @@ void emscriptenStep(void* e) {
 int main(int argc, char** argv) {
     srand(time(NULL));
 
-    // Pick the task to demo: ./drone [hover|race], defaults to hover.
-    const char* task = argc > 1 ? argv[1] : "hover";
+    int task = argc > 1 ? atoi(argv[1]) : 0;
 
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
     env->num_agents = 16;
