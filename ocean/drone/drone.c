@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
     int task = argc > 1 ? atoi(argv[1]) : 0;
 
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
-    env->num_agents = 16;
+    env->num_agents = 64;
 
     env->observations = (float*)calloc(env->num_agents * DRONE_OBS_SIZE, sizeof(float));
     env->actions = (float*)calloc(env->num_agents * 4, sizeof(float));
