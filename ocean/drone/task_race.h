@@ -144,7 +144,7 @@ static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* 
     RaceState* state = (RaceState*)env->task_state;
     float completed = state->rings_passed[idx] >= cfg->max_rings ? 1.0f : 0.0f;
     log->race_n += 1.0f;
-    log->race_perf += completed;
+    log->race_perf += (float)state->rings_passed[idx] / (float)cfg->max_rings;
     log->race_score += (float)state->rings_passed[idx];
     log->race_keys[0] += (float)state->rings_passed[idx];
     log->race_keys[1] += state->collisions[idx];
