@@ -70,18 +70,21 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
 
-    dict_set(out, "hover/perf", task_avg(log->hover_perf, hn));
-    dict_set(out, "race/perf", task_avg(log->race_perf, rn));
-    dict_set(out, "hover/score", task_avg(log->hover_score, hn));
-    dict_set(out, "race/score", task_avg(log->race_score, rn));
-    dict_set(out, "hover/episode_frac", hn);
-    dict_set(out, "race/episode_frac", rn);
-    dict_set(out, "hover/oob", task_avg(log->hover_keys[3], hn));
-    dict_set(out, "race/oob", task_avg(log->race_keys[3], rn));
-    dict_set(out, "hover/ema_dist", task_avg(log->hover_keys[0], hn));
-    dict_set(out, "race/rings_passed", task_avg(log->race_keys[0], rn));
-    dict_set(out, "hover/ema_vel", task_avg(log->hover_keys[1], hn));
-    dict_set(out, "race/ring_collisions", task_avg(log->race_keys[1], rn));
-    dict_set(out, "hover/ema_omega", task_avg(log->hover_keys[2], hn));
-    dict_set(out, "race/completed", task_avg(log->race_keys[2], rn));
+    // The dashboard alternates keys even->left / odd->right column, so emit interleaved:
+    // left column = hover|race comparison metrics (perf, score, oob), right column =
+    // per-task detail grouped by task.
+    dict_set(out, "hover/perf", task_avg(log->hover_perf, hn));         // L
+    dict_set(out, "hover/ema_dist", task_avg(log->hover_keys[0], hn));  // R
+    dict_set(out, "race/perf", task_avg(log->race_perf, rn));           // L
+    dict_set(out, "hover/ema_vel", task_avg(log->hover_keys[1], hn));   // R
+    dict_set(out, "hover/score", task_avg(log->hover_score, hn));       // L
+    dict_set(out, "hover/ema_omega", task_avg(log->hover_keys[2], hn)); // R
+    dict_set(out, "race/score", task_avg(log->race_score, rn));         // L
+    dict_set(out, "race/rings_passed", task_avg(log->race_keys[0], rn));    // R
+    dict_set(out, "hover/oob", task_avg(log->hover_keys[3], hn));       // L
+    dict_set(out, "race/ring_collisions", task_avg(log->race_keys[1], rn)); // R
+    dict_set(out, "race/oob", task_avg(log->race_keys[3], rn));         // L
+    dict_set(out, "race/completed", task_avg(log->race_keys[2], rn));   // R
+    dict_set(out, "hover/episode_frac", hn);                            // L
+    dict_set(out, "race/episode_frac", rn);                            // R
 }
