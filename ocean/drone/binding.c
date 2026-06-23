@@ -73,19 +73,19 @@ static inline float task_avg(float sum, float n) { return n > 0.0f ? sum / n : 0
 void my_log(Log* log, Dict* out) {
     float hn = log->hover_n, rn = log->race_n;
 
+    // Standard summary keys first, in the canonical order shared across envs (matches
+    // ocean/breakout): perf, score, episode_return, episode_length. perf/score are the
+    // cross-task blend — hover_* and race_* fields are each already divided by the total
+    // episode count by the aggregator and the tasks are disjoint, so summing gives the
+    // all-episode average (keeps env/score available for the sweep objective).
+    dict_set(out, "perf", log->hover_perf + log->race_perf);
+    dict_set(out, "score", log->hover_score + log->race_score);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
 
-    // Overall per-episode averages across both tasks. hover_* and race_* fields are
-    // each already divided by the total episode count by the aggregator, and the two
-    // tasks' episodes are disjoint, so summing gives the all-episode average. Keeps
-    // top-level score/perf available (the sweep objective keys on env/score).
-    dict_set(out, "perf", log->hover_perf + log->race_perf);
-    dict_set(out, "score", log->hover_score + log->race_score);
-
-    // Stats table fills row-major across 2 columns in insertion order, so emit
-    // hover then race for each metric: left column = hover, right column = race,
-    // letting you read across a row to compare. Both tasks expose 7 keys each.
+    // Then emit hover then race for each metric so matching logs land across from each
+    // other in the 2-column table (left = hover, right = race). task_avg divides each
+    // field by that task's own episode count, cancelling the aggregator's global-n division.
     dict_set(out, "hover/perf", task_avg(log->hover_perf, hn));
     dict_set(out, "race/perf", task_avg(log->race_perf, rn));
     dict_set(out, "hover/score", task_avg(log->hover_score, hn));
