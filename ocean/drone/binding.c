@@ -65,7 +65,14 @@ void my_init(Env* env, Dict* kwargs) {
     init(env);
 }
 
+// Average a per-task accumulated field by that task's episode count (0 if none).
+// Dividing by the task's own aggregated count cancels the global-n division the vec
+// aggregator already applied, recovering the true per-task-episode average.
+static inline float task_avg(float sum, float n) { return n > 0.0f ? sum / n : 0.0f; }
+
 void my_log(Log* log, Dict* out) {
+    float hn = log->hover_n, rn = log->race_n;
+
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
 
@@ -73,28 +80,24 @@ void my_log(Log* log, Dict* out) {
     // each already divided by the total episode count by the aggregator, and the two
     // tasks' episodes are disjoint, so summing gives the all-episode average. Keeps
     // top-level score/perf available (the sweep objective keys on env/score).
-    dict_set(out, "score", log->hover_score + log->race_score);
     dict_set(out, "perf", log->hover_perf + log->race_perf);
+    dict_set(out, "score", log->hover_score + log->race_score);
 
-    // Per-task averages: each key is divided by its own (aggregated) episode count,
-    // which cancels the global-n division done by the vec aggregator. *_n is the
-    // fraction of episodes that were this task.
-    if (log->hover_n > 0.0f) {
-        dict_set(out, "hover/frac", log->hover_n);
-        dict_set(out, "hover/perf", log->hover_perf / log->hover_n);
-        dict_set(out, "hover/score", log->hover_score / log->hover_n);
-        dict_set(out, "hover/ema_dist", log->hover_keys[0] / log->hover_n);
-        dict_set(out, "hover/ema_vel", log->hover_keys[1] / log->hover_n);
-        dict_set(out, "hover/ema_omega", log->hover_keys[2] / log->hover_n);
-        dict_set(out, "hover/oob", log->hover_keys[3] / log->hover_n);
-    }
-    if (log->race_n > 0.0f) {
-        dict_set(out, "race/frac", log->race_n);
-        dict_set(out, "race/perf", log->race_perf / log->race_n);
-        dict_set(out, "race/score", log->race_score / log->race_n);
-        dict_set(out, "race/rings_passed", log->race_keys[0] / log->race_n);
-        dict_set(out, "race/ring_collisions", log->race_keys[1] / log->race_n);
-        dict_set(out, "race/completed", log->race_keys[2] / log->race_n);
-        dict_set(out, "race/oob", log->race_keys[3] / log->race_n);
-    }
+    // Stats table fills row-major across 2 columns in insertion order, so emit
+    // hover then race for each metric: left column = hover, right column = race,
+    // letting you read across a row to compare. Both tasks expose 7 keys each.
+    dict_set(out, "hover/perf", task_avg(log->hover_perf, hn));
+    dict_set(out, "race/perf", task_avg(log->race_perf, rn));
+    dict_set(out, "hover/score", task_avg(log->hover_score, hn));
+    dict_set(out, "race/score", task_avg(log->race_score, rn));
+    dict_set(out, "hover/episode_frac", hn);
+    dict_set(out, "race/episode_frac", rn);
+    dict_set(out, "hover/oob", task_avg(log->hover_keys[3], hn));
+    dict_set(out, "race/oob", task_avg(log->race_keys[3], rn));
+    dict_set(out, "hover/ema_dist", task_avg(log->hover_keys[0], hn));
+    dict_set(out, "race/rings_passed", task_avg(log->race_keys[0], rn));
+    dict_set(out, "hover/ema_vel", task_avg(log->hover_keys[1], hn));
+    dict_set(out, "race/ring_collisions", task_avg(log->race_keys[1], rn));
+    dict_set(out, "hover/ema_omega", task_avg(log->hover_keys[2], hn));
+    dict_set(out, "race/completed", task_avg(log->race_keys[2], rn));
 }
