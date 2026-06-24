@@ -4,8 +4,10 @@
 
 #define RACE_OOB_SCALE 2.0f
 
-#define RACE_RING_MIN_DIST (2.0f * RING_RADIUS)
+#define RACE_RING_MIN_DIST (5.0f * RING_RADIUS)
 #define RACE_RING_MAX_DIST 8.0f
+#define RACE_RING_SEPARATION (3.0f * RING_RADIUS)
+#define RACE_MAX_PLACE_ATTEMPTS 100
 
 // types
 
@@ -51,14 +53,44 @@ static void race_close(DroneEnv* env) {
 
 // helpers
 
-static inline Target gen_next_ring(unsigned int* rng, const Target* current) {
-    Target ring;
-    float dist;
-    do {
+static inline bool ring_overlaps(const Target* rings, int count, Vec3 pos) {
+    for (int i = 0; i < count; i++)
+        if (norm3(sub3(rings[i].pos, pos)) < RACE_RING_SEPARATION) return true;
+    return false;
+}
+
+static inline Target gen_next_ring(unsigned int* rng, const Target* rings, int count) {
+    const Target* prev = &rings[count - 1];
+    Target ring = rndring(rng, RING_RADIUS);
+    for (int attempt = 0; attempt < RACE_MAX_PLACE_ATTEMPTS; attempt++) {
         ring = rndring(rng, RING_RADIUS);
-        dist = norm3(sub3(ring.pos, current->pos));
-    } while (dist < RACE_RING_MIN_DIST || dist > RACE_RING_MAX_DIST);
+        float dist = norm3(sub3(ring.pos, prev->pos));
+        if (dist < RACE_RING_MIN_DIST || dist > RACE_RING_MAX_DIST) continue;
+        if (ring_overlaps(rings, count, ring.pos)) continue;
+        break;
+    }
     return ring;
+}
+
+static inline Vec3 path_normal(const Target* rings, int n, int i) {
+    if (n < 2) return (Vec3){0.0f, 0.0f, 1.0f};
+    Vec3 dir;
+    if (i == 0) dir = sub3(rings[1].pos, rings[0].pos);
+    else if (i == n - 1) dir = sub3(rings[n - 1].pos, rings[n - 2].pos);
+    else dir = sub3(rings[i + 1].pos, rings[i - 1].pos);
+    float len = norm3(dir);
+    return len > 1e-6f ? scalmul3(dir, 1.0f / len) : (Vec3){0.0f, 0.0f, 1.0f};
+}
+
+static inline void center_rings(Target* rings, int n) {
+    Vec3 lo = rings[0].pos, hi = rings[0].pos;
+    for (int i = 1; i < n; i++) {
+        lo.x = fminf(lo.x, rings[i].pos.x); hi.x = fmaxf(hi.x, rings[i].pos.x);
+        lo.y = fminf(lo.y, rings[i].pos.y); hi.y = fmaxf(hi.y, rings[i].pos.y);
+        lo.z = fminf(lo.z, rings[i].pos.z); hi.z = fmaxf(hi.z, rings[i].pos.z);
+    }
+    Vec3 mid = scalmul3(add3(lo, hi), 0.5f);
+    for (int i = 0; i < n; i++) rings[i].pos = sub3(rings[i].pos, mid);
 }
 
 static inline int check_ring(Drone* drone, Target* ring) {
@@ -90,9 +122,17 @@ static inline int check_ring(Drone* drone, Target* ring) {
 static void race_env_reset(DroneEnv* env) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
+
     state->ring_buffer[0] = rndring(&env->rng, RING_RADIUS);
-    for (int i = 1; i < cfg->max_rings; i++)
-        state->ring_buffer[i] = gen_next_ring(&env->rng, &state->ring_buffer[i - 1]);
+    for (int i = 1; i < cfg->max_rings; i++) {
+        state->ring_buffer[i] = gen_next_ring(&env->rng, state->ring_buffer, i);
+    }
+
+    center_rings(state->ring_buffer, cfg->max_rings);
+
+    for (int i = 0; i < cfg->max_rings; i++) {
+        state->ring_buffer[i].normal = path_normal(state->ring_buffer, cfg->max_rings, i);
+    }
 }
 
 static void race_reset(DroneEnv* env, Drone* agent, int idx) {

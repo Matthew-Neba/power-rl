@@ -419,7 +419,7 @@ static void render_task(DroneEnv* env, Client* client) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
     for (int i = 0; i < cfg->max_rings; i++)
-        DrawRing3D(state->ring_buffer[i], 0.2f, GREEN, BLUE);
+        DrawRing3D(state->ring_buffer[i], 0.1f, GREEN, BLUE);
 }
 
 void c_render(DroneEnv* env) {
