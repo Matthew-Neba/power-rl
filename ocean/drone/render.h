@@ -27,7 +27,7 @@ Color COLORS[64] = {B, B, B, R, R, R, R, R,
 #undef B
 
 // 3D model config
-#define MODEL_SCALE_NORMAL 1.0f
+#define MODEL_SCALE_NORMAL 2.0f
 #define NUM_PROPELLERS 4
 static const int PROP_MESH_IDX[NUM_PROPELLERS] = {8, 6, 5, 7};
 static const float PROP_DIRS[NUM_PROPELLERS] = {1.0f, -1.0f, 1.0f, -1.0f};
