@@ -14,9 +14,6 @@
 typedef struct {
     int max_rings;
     float ring_reward;
-    float collision_penalty;
-    float time_penalty;
-    float oob_penalty;
     float alpha_omega;
 } RaceConfig;
 
@@ -163,12 +160,8 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
         reward += cfg->ring_reward;
     } else if (result == -1) {
         state->collisions[idx] += 1.0f;
-        reward -= cfg->collision_penalty;
     }
 
-    if (out_of_bounds(agent->state.pos, RACE_OOB_SCALE)) reward -= cfg->oob_penalty;
-
-    reward -= cfg->time_penalty;
     return reward;
 }
 

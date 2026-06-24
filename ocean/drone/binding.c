@@ -27,9 +27,6 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
     RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
     cfg->max_rings = (int)dict_get(kwargs, "max_rings")->value;
     cfg->ring_reward = dict_get(kwargs, "ring_reward")->value;
-    cfg->collision_penalty = dict_get(kwargs, "collision_penalty")->value;
-    cfg->time_penalty = dict_get(kwargs, "time_penalty")->value;
-    cfg->oob_penalty = dict_get(kwargs, "oob_penalty")->value;
     cfg->alpha_omega = dict_get(kwargs, "race_alpha_omega")->value;
     env->task_config = cfg;
 }
