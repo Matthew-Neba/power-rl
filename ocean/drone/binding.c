@@ -57,13 +57,13 @@ void my_init(Env* env, Dict* kwargs) {
     float race_w = dict_get(kwargs, "race_frac")->value;
     float sphere_w = dict_get(kwargs, "sphere_frac")->value;
     float total = hover_w + race_w + sphere_w;
-    float hover_frac = hover_w / total;
-    float race_frac = race_w / total;
+
+    float c_hover = hover_w / total;
+    float c_race = (hover_w + race_w) / total;
 
     int idx = (int)env->rng;
-    bool is_hover = (int)floorf((idx + 1) * hover_frac) > (int)floorf(idx * hover_frac);
-    bool is_race =
-        !is_hover && (int)floorf((idx + 1) * race_frac) > (int)floorf(idx * race_frac);
+    bool is_hover = (int)floorf((idx + 1) * c_hover) > (int)floorf(idx * c_hover);
+    bool is_race = !is_hover && (int)floorf((idx + 1) * c_race) > (int)floorf(idx * c_race);
 
     if (is_hover) {
         env->task = &TASK_HOVER;

@@ -42,8 +42,7 @@
 #define RING_RADIUS 0.5f
 #define V_TARGET 0.05f
 
-#define NUM_TASKS 3
-#define DRONE_OBS_SIZE (19 + NUM_TASKS) // 19 physical obs + one-hot task id
+#define DRONE_OBS_SIZE 19
 
 // Core Parameters
 #define DT 0.002f // 500 Hz
@@ -414,8 +413,4 @@ void compute_drone_observations(Drone* agent, int task_id, float* observations) 
     observations[idx++] = normal_body.x;
     observations[idx++] = normal_body.y;
     observations[idx++] = normal_body.z;
-
-    // one-hot task id
-    for (int t = 0; t < NUM_TASKS; t++)
-        observations[idx++] = (t == task_id) ? 1.0f : 0.0f;
 }
