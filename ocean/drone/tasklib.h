@@ -63,8 +63,8 @@ bool task_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
 
 void task_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     switch (env->task) {
-        case TASK_HOVER: hold_log(env, agent, idx, log, cache); break;
+        case TASK_HOVER: hover_log(env, agent, idx, log, cache); break;
         case TASK_RACE: race_log(env, agent, idx, log, cache); break;
-        case TASK_SPHERE: hold_log(env, agent, idx, log, cache); break;
+        case TASK_SPHERE: hover_log(env, agent, idx, log, cache); break;
     }
 }

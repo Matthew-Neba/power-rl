@@ -10,7 +10,7 @@
 #include "vecenv.h"
 
 
-static void hold_config(DroneEnv* env, Dict* kwargs) {
+static void hover_config(DroneEnv* env, Dict* kwargs) {
     HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
     cfg->target_dist = dict_get(kwargs, "hover_target_dist")->value;
     cfg->hover_dist = dict_get(kwargs, "hover_dist")->value;
@@ -53,13 +53,13 @@ void my_init(Env* env, Dict* kwargs) {
 
     if (is_hover) {
         env->task = TASK_HOVER;
-        hold_config(env, kwargs);
+        hover_config(env, kwargs);
     } else if (is_race) {
         env->task = TASK_RACE;
         race_config(env, kwargs);
     } else {
         env->task = TASK_SPHERE;
-        hold_config(env, kwargs);
+        hover_config(env, kwargs);
     }
 
     task_init(env);

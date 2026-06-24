@@ -8,8 +8,6 @@
 #define HOVER_SCORE_VEL_SCALE 0.01f
 #define HOVER_SCORE_OMEGA_SCALE 0.1f
 
-// Shared config for all hold-style tasks. A formation uses only the fields it
-// needs (hover ignores radius; sphere uses it for the slot layout).
 typedef struct {
     float target_dist;
     float hover_dist;
@@ -18,7 +16,7 @@ typedef struct {
     float alpha_hover;
     float alpha_shaping;
     float alpha_omega;
-    float radius; // formation scale (sphere); unused by hover
+    float radius;
 } HoverConfig;
 
 typedef struct {
@@ -59,8 +57,6 @@ static void hover_close(DroneEnv* env) {
 
 // helpers
 
-// Uniform-in-ball offset of the given radius. Shared spawn/target sampling for
-// hold-style tasks (hover places its target with it, sphere places its spawn).
 static inline Vec3 random_ball_offset(unsigned int* rng, float radius) {
     float u = rndf(0.0f, 1.0f, rng);
     float v = rndf(0.0f, 1.0f, rng);
@@ -86,11 +82,7 @@ static inline float hover_score(float dist, float vel, float omega) {
     return 1.0f / (1.0f + 0.05f * penalty);
 }
 
-// Shared reset for hold-style tasks: place the target, spawn the drone within
-// spawn_dist of it, and seed the per-agent tracking state. A formation supplies
-// only the target position. Reads config/state through the hover types, which
-// every hold task's config shares as a prefix.
-static void hold_reset(DroneEnv* env, Drone* agent, int idx, Vec3 target, float spawn_dist) {
+static void hover_reset_to(DroneEnv* env, Drone* agent, int idx, Vec3 target, float spawn_dist) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;
 
@@ -116,7 +108,26 @@ static void hold_reset(DroneEnv* env, Drone* agent, int idx, Vec3 target, float 
     state->prev_potential[idx] = hover_potential(dist, vel, omega, cfg);
 }
 
+static inline Vec3 sphere_slot(int idx, int num_agents, float radius) {
+    float phi = (float)M_PI * (sqrtf(5.0f) - 1.0f);
+    float y = 1.0f - 2.0f * ((float)idx / (float)num_agents);
+    float r = sqrtf(fmaxf(0.0f, 1.0f - y * y));
+    float theta = phi * (float)idx;
+    return (Vec3){radius * cosf(theta) * r, radius * sinf(theta) * r, radius * y};
+}
+
 // callbacks
+
+static void hover_reset(DroneEnv* env, Drone* agent, int idx) {
+    HoverConfig* cfg = (HoverConfig*)env->task_config;
+    hover_reset_to(env, agent, idx, random_pos(&env->rng), cfg->target_dist);
+}
+
+static void sphere_reset(DroneEnv* env, Drone* agent, int idx) {
+    HoverConfig* cfg = (HoverConfig*)env->task_config;
+    Vec3 slot = sphere_slot(idx, env->num_agents, cfg->radius);
+    hover_reset_to(env, agent, idx, slot, cfg->target_dist);
+}
 
 static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
@@ -142,8 +153,7 @@ static bool hover_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     return cache->dist > (cfg->target_dist + 1.0f) || agent->episode_length >= HORIZON;
 }
 
-// Shared log for hold-style tasks: accumulates into this task's bucket.
-static void hold_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
+static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;
     TaskLog* t = &log->task[env->task];
@@ -154,28 +164,4 @@ static void hold_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* 
     t->keys[1] += state->ema_vel[idx];
     t->keys[2] += state->ema_omega[idx];
     t->keys[3] += cache->dist > (cfg->target_dist + 1.0f) ? 1.0f : 0.0f;
-}
-
-// formations
-
-// hover: target is just a random point in the arena.
-static void hover_reset(DroneEnv* env, Drone* agent, int idx) {
-    HoverConfig* cfg = (HoverConfig*)env->task_config;
-    hold_reset(env, agent, idx, random_pos(&env->rng), cfg->target_dist);
-}
-
-// sphere: each drone holds a fixed slot on a Fibonacci-distributed sphere; the
-// sphere shape emerges once all drones reach their slots.
-static inline Vec3 sphere_slot(int idx, int num_agents, float radius) {
-    float phi = (float)M_PI * (sqrtf(5.0f) - 1.0f);
-    float y = 1.0f - 2.0f * ((float)idx / (float)num_agents);
-    float r = sqrtf(fmaxf(0.0f, 1.0f - y * y));
-    float theta = phi * (float)idx;
-    return (Vec3){radius * cosf(theta) * r, radius * sinf(theta) * r, radius * y};
-}
-
-static void sphere_reset(DroneEnv* env, Drone* agent, int idx) {
-    HoverConfig* cfg = (HoverConfig*)env->task_config;
-    Vec3 slot = sphere_slot(idx, env->num_agents, cfg->radius);
-    hold_reset(env, agent, idx, slot, cfg->target_dist);
 }
