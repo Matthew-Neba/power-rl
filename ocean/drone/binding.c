@@ -42,14 +42,18 @@ void my_init(Env* env, Dict* kwargs) {
     float hover_w = dict_get(kwargs, "hover_frac")->value;
     float race_w = dict_get(kwargs, "race_frac")->value;
     float sphere_w = dict_get(kwargs, "sphere_frac")->value;
-    float total = hover_w + race_w + sphere_w;
+    float cube_w = dict_get(kwargs, "cube_frac")->value;
+    float total = hover_w + race_w + sphere_w + cube_w;
 
     float c_hover = hover_w / total;
     float c_race = (hover_w + race_w) / total;
+    float c_sphere = (hover_w + race_w + sphere_w) / total;
 
     int idx = (int)env->rng;
     bool is_hover = (int)floorf((idx + 1) * c_hover) > (int)floorf(idx * c_hover);
     bool is_race = !is_hover && (int)floorf((idx + 1) * c_race) > (int)floorf(idx * c_race);
+    bool is_sphere =
+        !is_hover && !is_race && (int)floorf((idx + 1) * c_sphere) > (int)floorf(idx * c_sphere);
 
     if (is_hover) {
         env->task = TASK_HOVER;
@@ -57,8 +61,11 @@ void my_init(Env* env, Dict* kwargs) {
     } else if (is_race) {
         env->task = TASK_RACE;
         race_config(env, kwargs);
-    } else {
+    } else if (is_sphere) {
         env->task = TASK_SPHERE;
+        hover_config(env, kwargs);
+    } else {
+        env->task = TASK_CUBE;
         hover_config(env, kwargs);
     }
 
@@ -72,13 +79,14 @@ void my_log(Log* log, Dict* out) {
     TaskLog* h = &log->task[TASK_HOVER];
     TaskLog* r = &log->task[TASK_RACE];
     TaskLog* s = &log->task[TASK_SPHERE];
-    float hn = h->n, rn = r->n, sn = s->n;
+    TaskLog* c = &log->task[TASK_CUBE];
+    float hn = h->n, rn = r->n, sn = s->n, cn = c->n;
 
-    int active = (hn > 0.0f) + (rn > 0.0f) + (sn > 0.0f);
+    int active = (hn > 0.0f) + (rn > 0.0f) + (sn > 0.0f) + (cn > 0.0f);
     dict_set(out, "perf",
-        (task_avg(h->perf, hn) + task_avg(r->perf, rn) + task_avg(s->perf, sn)) / active);
+        (task_avg(h->perf, hn) + task_avg(r->perf, rn) + task_avg(s->perf, sn) + task_avg(c->perf, cn)) / active);
     dict_set(out, "score",
-        (task_avg(h->score, hn) + task_avg(r->score, rn) + task_avg(s->score, sn)) / active);
+        (task_avg(h->score, hn) + task_avg(r->score, rn) + task_avg(s->score, sn) + task_avg(c->score, cn)) / active);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
 
@@ -100,7 +108,14 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "sphere/ema_vel", task_avg(s->keys[1], sn));
     dict_set(out, "sphere/oob", task_avg(s->keys[3], sn));
     dict_set(out, "sphere/ema_omega", task_avg(s->keys[2], sn));
+    dict_set(out, "cube/perf", task_avg(c->perf, cn));
+    dict_set(out, "cube/ema_dist", task_avg(c->keys[0], cn));
+    dict_set(out, "cube/score", task_avg(c->score, cn));
+    dict_set(out, "cube/ema_vel", task_avg(c->keys[1], cn));
+    dict_set(out, "cube/oob", task_avg(c->keys[3], cn));
+    dict_set(out, "cube/ema_omega", task_avg(c->keys[2], cn));
     dict_set(out, "hover/episode_frac", hn);
     dict_set(out, "race/episode_frac", rn);
     dict_set(out, "sphere/episode_frac", sn);
+    dict_set(out, "cube/episode_frac", cn);
 }

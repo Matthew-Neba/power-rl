@@ -116,6 +116,20 @@ static inline Vec3 sphere_slot(int idx, int num_agents, float radius) {
     return (Vec3){radius * cosf(theta) * r, radius * sinf(theta) * r, radius * y};
 }
 
+static inline float cube_axis(int i, int side, float radius) {
+    if (side <= 1) return 0.0f;
+    return radius * (2.0f * (float)i / (float)(side - 1) - 1.0f);
+}
+
+static inline Vec3 cube_slot(int idx, int num_agents, float radius) {
+    int side = (int)ceilf(cbrtf((float)num_agents));
+    int x = idx % side;
+    int y = (idx / side) % side;
+    int z = idx / (side * side);
+    return (Vec3){cube_axis(x, side, radius), cube_axis(y, side, radius),
+                  cube_axis(z, side, radius)};
+}
+
 // callbacks
 
 static void hover_reset(DroneEnv* env, Drone* agent, int idx) {
@@ -126,6 +140,12 @@ static void hover_reset(DroneEnv* env, Drone* agent, int idx) {
 static void sphere_reset(DroneEnv* env, Drone* agent, int idx) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     Vec3 slot = sphere_slot(idx, env->num_agents, cfg->radius);
+    hover_reset_to(env, agent, idx, slot, cfg->target_dist);
+}
+
+static void cube_reset(DroneEnv* env, Drone* agent, int idx) {
+    HoverConfig* cfg = (HoverConfig*)env->task_config;
+    Vec3 slot = cube_slot(idx, env->num_agents, cfg->radius);
     hover_reset_to(env, agent, idx, slot, cfg->target_dist);
 }
 

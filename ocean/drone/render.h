@@ -426,6 +426,14 @@ static void render_task(DroneEnv* env, Client* client) {
             }
             break;
         }
+        case TASK_CUBE: {
+            HoverConfig* cfg = (HoverConfig*)env->task_config;
+            for (int i = 0; i < env->num_agents; i++) {
+                Vec3 p = cube_slot(i, env->num_agents, cfg->radius);
+                DrawSphere((Vector3){p.x, p.y, p.z}, 0.08f, (Color){0, 255, 255, 120});
+            }
+            break;
+        }
         default: break; // hover: nothing to draw
     }
 }
