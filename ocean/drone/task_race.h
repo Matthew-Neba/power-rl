@@ -133,16 +133,26 @@ static void race_env_reset(DroneEnv* env) {
 }
 
 static void race_reset(DroneEnv* env, Drone* agent, int idx) {
+    RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
 
-    do {
-        agent->state.pos = random_pos(&env->rng);
-    } while (norm3(sub3(agent->state.pos, state->ring_buffer[0].pos)) < 2.0f * RING_RADIUS);
+    int g = (int)(rand_r(&env->rng) % cfg->max_rings);
+    Target* gate = &state->ring_buffer[g];
 
-    state->ring_idx[idx] = 0;
+    float back = rndf(1.0f, 3.0f, &env->rng);
+    Vec3 pos = sub3(gate->pos, scalmul3(gate->normal, back));
+    pos = add3(pos, (Vec3){rndf(-0.3f, 0.3f, &env->rng), rndf(-0.3f, 0.3f, &env->rng),
+                           rndf(-0.3f, 0.3f, &env->rng)});
+    agent->state.pos = (Vec3){
+        clampf(pos.x, -MARGIN_X, MARGIN_X),
+        clampf(pos.y, -MARGIN_Y, MARGIN_Y),
+        clampf(pos.z, -MARGIN_Z, MARGIN_Z),
+    };
+
+    state->ring_idx[idx] = g;
     state->rings_passed[idx] = 0;
     state->collisions[idx] = 0.0f;
-    *agent->target = state->ring_buffer[0];
+    *agent->target = *gate;
 }
 
 static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
@@ -168,17 +178,18 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
 static bool race_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
-    return state->rings_passed[idx] >= cfg->max_rings || out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ||
+    return state->ring_idx[idx] >= cfg->max_rings || out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ||
            agent->episode_length >= HORIZON;
 }
 
 static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
-    float completed = state->rings_passed[idx] >= cfg->max_rings ? 1.0f : 0.0f;
+    int available = cfg->max_rings - (state->ring_idx[idx] - state->rings_passed[idx]);
+    float completed = state->ring_idx[idx] >= cfg->max_rings ? 1.0f : 0.0f;
     TaskLog* t = &log->task[TASK_RACE];
     t->n += 1.0f;
-    t->perf += (float)state->rings_passed[idx] / (float)cfg->max_rings;
+    t->perf += (float)state->rings_passed[idx] / (float)available;
     t->score += (float)state->rings_passed[idx];
     t->keys[0] += (float)state->rings_passed[idx];
     t->keys[1] += state->collisions[idx];
