@@ -29,26 +29,19 @@ typedef struct {
     float omega;
 } StepCache;
 
+typedef struct {
+    float n;
+    float perf;
+    float score;
+    float keys[4];
+} TaskLog;
+
 typedef struct Log Log;
 struct Log {
     float episode_return;
     float episode_length;
     float n;
-
-    float hover_n;
-    float hover_perf;
-    float hover_score;
-    float hover_keys[4]; // ema_dist, ema_vel, ema_omega, oob
-
-    float race_n;
-    float race_perf;
-    float race_score;
-    float race_keys[4]; // rings_passed, ring_collisions, completed, oob
-
-    float sphere_n;
-    float sphere_perf;
-    float sphere_score;
-    float sphere_keys[4]; // ema_dist, ema_vel, ema_omega, oob
+    TaskLog task[NUM_TASKS];
 };
 
 typedef struct DroneEnv DroneEnv;

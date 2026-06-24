@@ -8,7 +8,7 @@
 #endif
 
 static void setup_task(DroneEnv* env, int task) {
-    task_close(env); // null-safe on the first call before any task is set
+    task_close(env);
 
     if (task == TASK_RACE) {
         env->task = TASK_RACE;
@@ -17,8 +17,9 @@ static void setup_task(DroneEnv* env, int task) {
         env->task_config = cfg;
     } else if (task == TASK_SPHERE) {
         env->task = TASK_SPHERE;
-        SphereConfig* cfg = (SphereConfig*)calloc(1, sizeof(SphereConfig));
+        HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->radius = 4.0f;
+        cfg->target_dist = 5.0f;
         env->task_config = cfg;
     } else {
         env->task = TASK_HOVER;
