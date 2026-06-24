@@ -27,10 +27,6 @@ static void setup_task(DroneEnv* env, int task) {
     c_reset(env);
 }
 
-static void toggle_task(DroneEnv* env) {
-    setup_task(env, (env->task + 1) % NUM_TASKS);
-}
-
 #ifdef __EMSCRIPTEN__
 typedef struct {
     DroneEnv* env;
@@ -39,7 +35,9 @@ typedef struct {
 
 void emscriptenStep(void* e) {
     WebRenderArgs* args = (WebRenderArgs*)e;
-    if (IsKeyPressed(KEY_SPACE)) toggle_task(args->env);
+    if (IsKeyPressed(KEY_SPACE)) {
+        setup_task(args->env, (args->env->task + 1) % NUM_TASKS);
+    }
     forward_puffernet(args->net, args->env->observations, args->env->actions);
     c_step(args->env);
     c_render(args->env);
@@ -74,7 +72,7 @@ int main(int argc, char** argv) {
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
-        if (IsKeyPressed(KEY_SPACE)) toggle_task(env);
+        if (IsKeyPressed(KEY_SPACE)) setup_task(env, (env->task + 1) % NUM_TASKS);
         forward_puffernet(net, env->observations, env->actions);
         c_step(env);
         c_render(env);
