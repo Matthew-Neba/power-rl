@@ -17,6 +17,7 @@ typedef struct {
     float alpha_shaping;
     float alpha_omega;
     float sphere_radius;
+    int horizon;
 } HoverConfig;
 
 typedef struct {
@@ -181,7 +182,7 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
 
 static bool hover_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
-    return cache->dist > (cfg->target_dist + 1.0f) || agent->episode_length >= HORIZON;
+    return cache->dist > (cfg->target_dist + 1.0f) || agent->episode_length >= cfg->horizon;
 }
 
 static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {

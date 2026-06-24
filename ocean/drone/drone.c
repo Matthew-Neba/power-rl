@@ -14,28 +14,33 @@ static void setup_task(DroneEnv* env, int task) {
         env->task = TASK_RACE;
         RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
         cfg->max_rings = 10;
+        cfg->horizon = 2048;
         env->task_config = cfg;
     } else if (task == TASK_SPHERE) {
         env->task = TASK_SPHERE;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->sphere_radius = 4.0f;
         cfg->target_dist = 5.0f;
+        cfg->horizon = 1024;
         env->task_config = cfg;
     } else if (task == TASK_CUBE) {
         env->task = TASK_CUBE;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->sphere_radius = 4.0f;
         cfg->target_dist = 5.0f;
+        cfg->horizon = 1024;
         env->task_config = cfg;
     } else if (task == TASK_FLAG) {
         env->task = TASK_FLAG;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->target_dist = 5.0f;
+        cfg->horizon = 1024;
         env->task_config = cfg;
     } else {
         env->task = TASK_HOVER;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->target_dist = 5.0f;
+        cfg->horizon = 1024;
         env->task_config = cfg;
     }
     task_init(env);

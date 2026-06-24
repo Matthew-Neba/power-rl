@@ -15,6 +15,7 @@ typedef struct {
     int max_rings;
     float ring_reward;
     float alpha_omega;
+    int horizon;
 } RaceConfig;
 
 typedef struct {
@@ -181,7 +182,8 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
 }
 
 static bool race_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
-    return out_of_bounds(agent->state.pos, RACE_OOB_SCALE) || agent->episode_length >= HORIZON;
+    RaceConfig* cfg = (RaceConfig*)env->task_config;
+    return out_of_bounds(agent->state.pos, RACE_OOB_SCALE) || agent->episode_length >= cfg->horizon;
 }
 
 static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {

@@ -20,6 +20,7 @@ static void hover_config(DroneEnv* env, Dict* kwargs) {
     cfg->alpha_shaping = dict_get(kwargs, "alpha_shaping")->value;
     cfg->alpha_omega = dict_get(kwargs, "hover_alpha_omega")->value;
     cfg->sphere_radius = dict_get(kwargs, "sphere_radius")->value;
+    cfg->horizon = (int)dict_get(kwargs, "hover_horizon")->value;
     env->task_config = cfg;
 }
 
@@ -28,6 +29,7 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
     cfg->max_rings = (int)dict_get(kwargs, "max_rings")->value;
     cfg->ring_reward = dict_get(kwargs, "ring_reward")->value;
     cfg->alpha_omega = dict_get(kwargs, "race_alpha_omega")->value;
+    cfg->horizon = (int)dict_get(kwargs, "race_horizon")->value;
     env->task_config = cfg;
 }
 
