@@ -27,7 +27,7 @@ Color COLORS[64] = {B, B, B, R, R, R, R, R,
 #undef B
 
 // 3D model config
-#define MODEL_SCALE_NORMAL 2.0f
+#define MODEL_SCALE_NORMAL 3.0f
 #define NUM_PROPELLERS 4
 static const int PROP_MESH_IDX[NUM_PROPELLERS] = {8, 6, 5, 7};
 static const float PROP_DIRS[NUM_PROPELLERS] = {1.0f, -1.0f, 1.0f, -1.0f};
@@ -638,6 +638,8 @@ void c_render(DroneEnv* env) {
     DrawText("Left click + drag: Rotate camera", 10, y, 16, LIGHTGRAY);
     y += 18;
     DrawText("Mouse wheel: Zoom in/out", 10, y, 16, LIGHTGRAY);
+    y += 18;
+    DrawText("Space: Change task", 10, y, 16, LIGHTGRAY);
     y += 18;
     DrawText(TextFormat("Tab: Inspect mode [%s]", inspect_mode ? "ON" : "OFF"), 10, y, 16,
              inspect_mode ? PUFF_GREEN : LIGHTGRAY);

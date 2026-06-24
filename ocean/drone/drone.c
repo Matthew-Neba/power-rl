@@ -58,7 +58,7 @@ void emscriptenStep(void* e) {
 int main(int argc, char** argv) {
     srand(time(NULL));
 
-    int task = argc > 1 ? atoi(argv[1]) : 0;
+    int task = argc > 1 ? atoi(argv[1]) : TASK_RACE;
 
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
     env->num_agents = 64;
