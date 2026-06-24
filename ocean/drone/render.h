@@ -14,9 +14,14 @@
 #define R (Color){255, 0, 0, 255}
 #define W (Color){255, 255, 255, 255}
 #define B (Color){0, 0, 255, 255}
-Color COLORS[64] = {W, B, B, R, R, B, B, W, B, W, B, R, R, B, W, B, B, B, W, R, R, W,
-                    B, B, R, R, R, R, R, R, R, R, R, R, R, R, R, R, R, R, B, B, W, R,
-                    R, W, B, B, B, W, B, R, R, B, W, B, W, B, B, R, R, B, B, W};
+Color COLORS[64] = {B, B, B, R, R, R, R, R,
+                    B, B, B, W, W, W, W, W,
+                    B, B, B, R, R, R, R, R,
+                    B, B, B, W, W, W, W, W,
+                    R, R, R, R, R, R, R, R,
+                    W, W, W, W, W, W, W, W,
+                    R, R, R, R, R, R, R, R,
+                    W, W, W, W, W, W, W, W};
 #undef R
 #undef W
 #undef B
@@ -410,32 +415,11 @@ void DrawDronePrimitive(Client* client, Drone* agent, float* actions, Color body
 // Task-specific overlays
 static void render_task(DroneEnv* env, Client* client) {
     (void)client;
-    switch (env->task) {
-        case TASK_RACE: {
-            RaceConfig* cfg = (RaceConfig*)env->task_config;
-            RaceState* state = (RaceState*)env->task_state;
-            for (int i = 0; i < cfg->max_rings; i++)
-                DrawRing3D(state->ring_buffer[i], 0.2f, GREEN, BLUE);
-            break;
-        }
-        case TASK_SPHERE: {
-            HoverConfig* cfg = (HoverConfig*)env->task_config;
-            for (int i = 0; i < env->num_agents; i++) {
-                Vec3 p = sphere_slot(i, env->num_agents, cfg->radius);
-                DrawSphere((Vector3){p.x, p.y, p.z}, 0.08f, (Color){0, 255, 255, 120});
-            }
-            break;
-        }
-        case TASK_CUBE: {
-            HoverConfig* cfg = (HoverConfig*)env->task_config;
-            for (int i = 0; i < env->num_agents; i++) {
-                Vec3 p = cube_slot(i, env->num_agents, cfg->radius);
-                DrawSphere((Vector3){p.x, p.y, p.z}, 0.08f, (Color){0, 255, 255, 120});
-            }
-            break;
-        }
-        default: break; // hover: nothing to draw
-    }
+    if (env->task != TASK_RACE) return;
+    RaceConfig* cfg = (RaceConfig*)env->task_config;
+    RaceState* state = (RaceState*)env->task_state;
+    for (int i = 0; i < cfg->max_rings; i++)
+        DrawRing3D(state->ring_buffer[i], 0.2f, GREEN, BLUE);
 }
 
 void c_render(DroneEnv* env) {

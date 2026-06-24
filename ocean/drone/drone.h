@@ -19,9 +19,10 @@ typedef enum {
     TASK_RACE = 1,
     TASK_SPHERE = 2,
     TASK_CUBE = 3,
+    TASK_FLAG = 4,
 } TaskType;
 
-#define NUM_TASKS 4
+#define NUM_TASKS 5
 
 typedef struct {
     float dist;

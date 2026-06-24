@@ -10,6 +10,7 @@ const char* task_name(TaskType task) {
         case TASK_RACE: return "race";
         case TASK_SPHERE: return "sphere";
         case TASK_CUBE: return "cube";
+        case TASK_FLAG: return "flag";
     }
     return "?";
 }
@@ -40,6 +41,7 @@ void task_reset(DroneEnv* env, Drone* agent, int idx) {
         case TASK_HOVER: hover_reset(env, agent, idx); break;
         case TASK_SPHERE: sphere_reset(env, agent, idx); break;
         case TASK_CUBE: cube_reset(env, agent, idx); break;
+        case TASK_FLAG: flag_reset(env, agent, idx); break;
         case TASK_RACE: race_reset(env, agent, idx); break;
     }
 }
