@@ -56,25 +56,30 @@ static inline bool ring_overlaps(const Target* rings, int count, Vec3 pos) {
     return false;
 }
 
-static inline Target gen_next_ring(unsigned int* rng, const Target* rings, int count) {
+static inline bool in_gap_band(Vec3 a, Vec3 b) {
+    float d = norm3(sub3(a, b));
+    return d >= RACE_RING_MIN_DIST && d <= RACE_RING_MAX_DIST;
+}
+
+static inline Target gen_next_ring(unsigned int* rng, const Target* rings, int count,
+                                   const Target* close) {
     const Target* prev = &rings[count - 1];
-    Target ring = rndring(rng, RING_RADIUS);
+    Target best = rndring(rng, RING_RADIUS);
+    bool have_fallback = false;
     for (int attempt = 0; attempt < RACE_MAX_PLACE_ATTEMPTS; attempt++) {
-        ring = rndring(rng, RING_RADIUS);
-        float dist = norm3(sub3(ring.pos, prev->pos));
-        if (dist < RACE_RING_MIN_DIST || dist > RACE_RING_MAX_DIST) continue;
+        Target ring = rndring(rng, RING_RADIUS);
+        if (!in_gap_band(ring.pos, prev->pos)) continue;
         if (ring_overlaps(rings, count, ring.pos)) continue;
-        break;
+        if (!have_fallback) { best = ring; have_fallback = true; }
+        if (close != NULL && !in_gap_band(ring.pos, close->pos)) continue;
+        return ring;
     }
-    return ring;
+    return best;
 }
 
 static inline Vec3 path_normal(const Target* rings, int n, int i) {
     if (n < 2) return (Vec3){0.0f, 0.0f, 1.0f};
-    Vec3 dir;
-    if (i == 0) dir = sub3(rings[1].pos, rings[0].pos);
-    else if (i == n - 1) dir = sub3(rings[n - 1].pos, rings[n - 2].pos);
-    else dir = sub3(rings[i + 1].pos, rings[i - 1].pos);
+    Vec3 dir = sub3(rings[(i + 1) % n].pos, rings[(i - 1 + n) % n].pos);
     float len = norm3(dir);
     return len > 1e-6f ? scalmul3(dir, 1.0f / len) : (Vec3){0.0f, 0.0f, 1.0f};
 }
@@ -122,7 +127,8 @@ static void race_env_reset(DroneEnv* env) {
 
     state->ring_buffer[0] = rndring(&env->rng, RING_RADIUS);
     for (int i = 1; i < cfg->max_rings; i++) {
-        state->ring_buffer[i] = gen_next_ring(&env->rng, state->ring_buffer, i);
+        const Target* close = (i == cfg->max_rings - 1) ? &state->ring_buffer[0] : NULL;
+        state->ring_buffer[i] = gen_next_ring(&env->rng, state->ring_buffer, i, close);
     }
 
     center_rings(state->ring_buffer, cfg->max_rings);
@@ -164,9 +170,8 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
     int result = check_ring(agent, &state->ring_buffer[state->ring_idx[idx]]);
     if (result == 1) {
         state->rings_passed[idx]++;
-        state->ring_idx[idx]++;
-        if (state->ring_idx[idx] < cfg->max_rings)
-            *agent->target = state->ring_buffer[state->ring_idx[idx]];
+        state->ring_idx[idx] = (state->ring_idx[idx] + 1) % cfg->max_rings;
+        *agent->target = state->ring_buffer[state->ring_idx[idx]];
         reward += cfg->ring_reward;
     } else if (result == -1) {
         state->collisions[idx] += 1.0f;
@@ -176,23 +181,18 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
 }
 
 static bool race_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
-    RaceConfig* cfg = (RaceConfig*)env->task_config;
-    RaceState* state = (RaceState*)env->task_state;
-    return state->ring_idx[idx] >= cfg->max_rings || out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ||
-           agent->episode_length >= HORIZON;
+    return out_of_bounds(agent->state.pos, RACE_OOB_SCALE) || agent->episode_length >= HORIZON;
 }
 
 static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
-    int available = cfg->max_rings - (state->ring_idx[idx] - state->rings_passed[idx]);
-    float completed = state->ring_idx[idx] >= cfg->max_rings ? 1.0f : 0.0f;
     TaskLog* t = &log->task[TASK_RACE];
     t->n += 1.0f;
-    t->perf += (float)state->rings_passed[idx] / (float)available;
+    t->perf += fminf((float)state->rings_passed[idx] / (float)cfg->max_rings, 1.0f);
     t->score += (float)state->rings_passed[idx];
     t->keys[0] += (float)state->rings_passed[idx];
     t->keys[1] += state->collisions[idx];
-    t->keys[2] += completed;
+    t->keys[2] += state->rings_passed[idx] >= cfg->max_rings ? 1.0f : 0.0f;
     t->keys[3] += out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ? 1.0f : 0.0f;
 }
