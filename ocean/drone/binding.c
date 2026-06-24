@@ -9,9 +9,6 @@
 #define Env DroneEnv
 #include "vecenv.h"
 
-#include "task_hover.h"
-#include "task_race.h"
-#include "task_sphere.h"
 
 static void hover_config(DroneEnv* env, Dict* kwargs) {
     HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
@@ -66,17 +63,17 @@ void my_init(Env* env, Dict* kwargs) {
     bool is_race = !is_hover && (int)floorf((idx + 1) * c_race) > (int)floorf(idx * c_race);
 
     if (is_hover) {
-        env->task = &TASK_HOVER;
+        env->task = TASK_HOVER;
         hover_config(env, kwargs);
     } else if (is_race) {
-        env->task = &TASK_RACE;
+        env->task = TASK_RACE;
         race_config(env, kwargs);
     } else {
-        env->task = &TASK_SPHERE;
+        env->task = TASK_SPHERE;
         sphere_config(env, kwargs);
     }
 
-    env->task->init(env);
+    task_init(env);
     init(env);
 }
 

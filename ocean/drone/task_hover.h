@@ -147,18 +147,3 @@ static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache*
     log->hover_keys[2] += state->ema_omega[idx];
     log->hover_keys[3] += cache->dist > (cfg->target_dist + 1.0f) ? 1.0f : 0.0f;
 }
-
-// definition
-
-static const Task TASK_HOVER = {
-    .name = "hover",
-    .id = 0,
-    .init = hover_init,
-    .close = hover_close,
-    .env_reset = NULL,
-    .reset = hover_reset,
-    .reward = hover_reward,
-    .done = hover_done,
-    .log = hover_log,
-    .render = NULL,
-};

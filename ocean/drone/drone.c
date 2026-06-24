@@ -1,9 +1,6 @@
 #include "drone.h"
 #include "puffernet.h"
 #include "render.h"
-#include "task_hover.h"
-#include "task_race.h"
-#include "task_sphere.h"
 #include <time.h>
 
 #ifdef __EMSCRIPTEN__
@@ -11,30 +8,30 @@
 #endif
 
 static void setup_task(DroneEnv* env, int task) {
-    if (env->task != NULL) env->task->close(env);
+    task_close(env); // null-safe on the first call before any task is set
 
-    if (task == 1) {
-        env->task = &TASK_RACE;
+    if (task == TASK_RACE) {
+        env->task = TASK_RACE;
         RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
         cfg->max_rings = 10;
         env->task_config = cfg;
-    } else if (task == 2) {
-        env->task = &TASK_SPHERE;
+    } else if (task == TASK_SPHERE) {
+        env->task = TASK_SPHERE;
         SphereConfig* cfg = (SphereConfig*)calloc(1, sizeof(SphereConfig));
         cfg->radius = 4.0f;
         env->task_config = cfg;
     } else {
-        env->task = &TASK_HOVER;
+        env->task = TASK_HOVER;
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
         cfg->target_dist = 5.0f;
         env->task_config = cfg;
     }
-    env->task->init(env);
+    task_init(env);
     c_reset(env);
 }
 
 static void toggle_task(DroneEnv* env) {
-    setup_task(env, (env->task->id + 1) % NUM_TASKS);
+    setup_task(env, (env->task + 1) % NUM_TASKS);
 }
 
 #ifdef __EMSCRIPTEN__

@@ -151,25 +151,3 @@ static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* 
     log->race_keys[2] += completed;
     log->race_keys[3] += out_of_bounds(agent->state.pos, RACE_OOB_SCALE) ? 1.0f : 0.0f;
 }
-
-static void race_render(DroneEnv* env, Client* client) {
-    RaceConfig* cfg = (RaceConfig*)env->task_config;
-    RaceState* state = (RaceState*)env->task_state;
-    for (int i = 0; i < cfg->max_rings; i++)
-        DrawRing3D(state->ring_buffer[i], 0.2f, GREEN, BLUE);
-}
-
-// definition
-
-static const Task TASK_RACE = {
-    .name = "race",
-    .id = 1,
-    .init = race_init,
-    .close = race_close,
-    .env_reset = race_env_reset,
-    .reset = race_reset,
-    .reward = race_reward,
-    .done = race_done,
-    .log = race_log,
-    .render = race_render,
-};

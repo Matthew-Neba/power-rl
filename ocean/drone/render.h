@@ -407,6 +407,29 @@ void DrawDronePrimitive(Client* client, Drone* agent, float* actions, Color body
     }
 }
 
+// Task-specific overlays
+static void render_task(DroneEnv* env, Client* client) {
+    (void)client;
+    switch (env->task) {
+        case TASK_RACE: {
+            RaceConfig* cfg = (RaceConfig*)env->task_config;
+            RaceState* state = (RaceState*)env->task_state;
+            for (int i = 0; i < cfg->max_rings; i++)
+                DrawRing3D(state->ring_buffer[i], 0.2f, GREEN, BLUE);
+            break;
+        }
+        case TASK_SPHERE: {
+            SphereConfig* cfg = (SphereConfig*)env->task_config;
+            for (int i = 0; i < env->num_agents; i++) {
+                Vec3 p = sphere_slot(i, env->num_agents, cfg->radius);
+                DrawSphere((Vector3){p.x, p.y, p.z}, 0.08f, (Color){0, 255, 255, 120});
+            }
+            break;
+        }
+        default: break; // hover: nothing to draw
+    }
+}
+
 void c_render(DroneEnv* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
@@ -529,7 +552,7 @@ void c_render(DroneEnv* env) {
     }
 
     // Task-specific rendering
-    if (env->task->render) env->task->render(env, client);
+    render_task(env, client);
 
     // Targets (shown in inspect mode)
     if (inspect_mode) {
@@ -548,7 +571,7 @@ void c_render(DroneEnv* env) {
 
     // Heads up display
     int y = 10;
-    DrawText(TextFormat("Task: %s", env->task->name), 10, y, 20, WHITE);
+    DrawText(TextFormat("Task: %s", task_name(env->task)), 10, y, 20, WHITE);
     y += 25;
     DrawText(TextFormat("Tick: %d / %d", env->tick, HORIZON), 10, y, 20, WHITE);
     y += 25;

@@ -142,26 +142,3 @@ static void sphere_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache
     log->sphere_keys[2] += state->ema_omega[idx];
     log->sphere_keys[3] += out_of_bounds(agent->state.pos, 1.0f) ? 1.0f : 0.0f;
 }
-
-static void sphere_render(DroneEnv* env, Client* client) {
-    SphereConfig* cfg = (SphereConfig*)env->task_config;
-    for (int i = 0; i < env->num_agents; i++) {
-        Vec3 p = sphere_slot(i, env->num_agents, cfg->radius);
-        DrawSphere((Vector3){p.x, p.y, p.z}, 0.08f, (Color){0, 255, 255, 120});
-    }
-}
-
-// definition
-
-static const Task TASK_SPHERE = {
-    .name = "sphere",
-    .id = 2,
-    .init = sphere_init,
-    .close = sphere_close,
-    .env_reset = NULL,
-    .reset = sphere_reset,
-    .reward = sphere_reward,
-    .done = sphere_done,
-    .log = sphere_log,
-    .render = sphere_render,
-};
