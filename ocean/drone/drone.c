@@ -27,6 +27,18 @@ static void setup_task(DroneEnv* env, int task) {
     c_reset(env);
 }
 
+// we render at 60Hz, but drone frames are 100Hz
+static void step_realtime(DroneEnv* env, PufferNet* net) {
+    static double accum = 0.0;
+    accum += GetFrameTime();
+    if (accum > 0.25) accum = 0.25;
+    while (accum >= ACTION_DT) {
+        forward_puffernet(net, env->observations, env->actions);
+        c_step(env);
+        accum -= ACTION_DT;
+    }
+}
+
 #ifdef __EMSCRIPTEN__
 typedef struct {
     DroneEnv* env;
@@ -38,8 +50,7 @@ void emscriptenStep(void* e) {
     if (IsKeyPressed(KEY_SPACE)) {
         setup_task(args->env, (args->env->task + 1) % NUM_TASKS);
     }
-    forward_puffernet(args->net, args->env->observations, args->env->actions);
-    c_step(args->env);
+    step_realtime(args->env, args->net);
     c_render(args->env);
 }
 #endif
@@ -73,8 +84,7 @@ int main(int argc, char** argv) {
 
     while (!WindowShouldClose()) {
         if (IsKeyPressed(KEY_SPACE)) setup_task(env, (env->task + 1) % NUM_TASKS);
-        forward_puffernet(net, env->observations, env->actions);
-        c_step(env);
+        step_realtime(env, net);
         c_render(env);
     }
 
