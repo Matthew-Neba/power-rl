@@ -378,7 +378,7 @@ static inline void move_drone(Drone* drone, float* actions) {
 
 // observations
 
-void compute_drone_observations(Drone* agent, int task_id, float* observations) {
+void compute_drone_observations(Drone* agent, float* observations) {
     int idx = 0;
     Quat q = agent->state.quat;
     Quat q_inv = quat_inverse(q);

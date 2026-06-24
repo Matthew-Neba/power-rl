@@ -16,7 +16,7 @@ typedef struct {
     float alpha_hover;
     float alpha_shaping;
     float alpha_omega;
-    float radius;
+    float sphere_radius;
 } HoverConfig;
 
 typedef struct {
@@ -145,13 +145,13 @@ static void hover_reset(DroneEnv* env, Drone* agent, int idx) {
 
 static void sphere_reset(DroneEnv* env, Drone* agent, int idx) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
-    Vec3 slot = sphere_slot(idx, env->num_agents, cfg->radius);
+    Vec3 slot = sphere_slot(idx, env->num_agents, cfg->sphere_radius);
     hover_reset_to(env, agent, idx, slot, cfg->target_dist);
 }
 
 static void cube_reset(DroneEnv* env, Drone* agent, int idx) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
-    Vec3 slot = cube_slot(idx, env->num_agents, cfg->radius);
+    Vec3 slot = cube_slot(idx, env->num_agents, cfg->sphere_radius);
     hover_reset_to(env, agent, idx, slot, cfg->target_dist);
 }
 
