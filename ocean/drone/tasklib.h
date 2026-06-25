@@ -66,3 +66,11 @@ void task_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) 
         default: hover_log(env, agent, idx, log, cache); break;
     }
 }
+
+// Normalized per-agent performance (~[0,1]) for the current episode — ADR's metric.
+float task_perf(DroneEnv* env, int idx) {
+    switch (env->task) {
+        case TASK_RACE: return race_perf(env, idx);
+        default: return hover_perf(env, idx);
+    }
+}

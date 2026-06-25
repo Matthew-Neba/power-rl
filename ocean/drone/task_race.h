@@ -186,6 +186,12 @@ static bool race_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     return out_of_bounds(agent->state.pos, RACE_OOB_SCALE) || agent->episode_length >= cfg->horizon;
 }
 
+static float race_perf(DroneEnv* env, int idx) {
+    RaceConfig* cfg = (RaceConfig*)env->task_config;
+    RaceState* state = (RaceState*)env->task_state;
+    return fminf((float)state->rings_passed[idx] / (float)cfg->max_rings, 1.0f);
+}
+
 static void race_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;

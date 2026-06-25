@@ -185,6 +185,10 @@ static bool hover_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     return cache->dist > (cfg->target_dist + 1.0f) || agent->episode_length >= cfg->horizon;
 }
 
+static float hover_perf(DroneEnv* env, int idx) {
+    return ((HoverState*)env->task_state)->perf[idx];
+}
+
 static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;

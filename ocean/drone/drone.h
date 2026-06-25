@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "dronelib.h"
+#include "adr.h"
 
 #define HORIZON 2048
 
@@ -61,6 +62,10 @@ struct DroneEnv {
     Drone* agents;
     Log log;
 
+    // per-agent ADR boundary-probe tag for this episode (-1 = not probing)
+    int* adr_param;
+    int* adr_side;
+
     TaskType task;
     void* task_config;
     void* task_state;
@@ -78,17 +83,23 @@ void compute_observations(DroneEnv* env) {
         compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE);
 }
 
-void reset_agent_base(Drone* agent, unsigned int* rng) {
+void reset_agent_base(DroneEnv* env, int idx) {
+    Drone* agent = &env->agents[idx];
     Target* target = agent->target;
     memset(agent, 0, sizeof(Drone));
     agent->target = target;
-    init_drone(agent, rng, 0.05f);
+
+    float factors[NUM_DR_PARAMS];
+    adr_sample(&env->rng, factors, &env->adr_param[idx], &env->adr_side[idx]);
+    init_drone(agent, &env->rng, factors);
 }
 
 void init(DroneEnv* env) {
     env->agents = (Drone*)calloc(env->num_agents, sizeof(Drone));
     for (int i = 0; i < env->num_agents; i++)
         env->agents[i].target = (Target*)calloc(1, sizeof(Target));
+    env->adr_param = (int*)calloc(env->num_agents, sizeof(int));
+    env->adr_side = (int*)calloc(env->num_agents, sizeof(int));
     env->log = (Log){0};
     env->tick = 0;
 }
@@ -107,7 +118,7 @@ void c_reset(DroneEnv* env) {
 
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
-        reset_agent_base(agent, &env->rng);
+        reset_agent_base(env, i);
         task_reset(env, agent, i);
         agent->prev_pos = agent->state.pos;
     }
@@ -143,7 +154,8 @@ void c_step(DroneEnv* env) {
 
         if (done) {
             add_log(env, i, &cache);
-            reset_agent_base(agent, &env->rng);
+            adr_record(env->adr_param[i], env->adr_side[i], task_perf(env, i));
+            reset_agent_base(env, i);
             task_reset(env, agent, i);
             agent->prev_pos = agent->state.pos;
         }
@@ -160,6 +172,8 @@ void c_close(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++)
         free(env->agents[i].target);
     free(env->agents);
+    free(env->adr_param);
+    free(env->adr_side);
 
     if (env->client != NULL) c_close_client(env->client);
 }

@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 
     init(env);
+    adr_init(0.05f, 0.0f, 0.0f, 0.0f, 0.0f, 0);  // static 5% DR for the demo (no probing)
     setup_task(env, task);
 
     Weights* weights = load_weights("resources/drone/drone_weights.bin");

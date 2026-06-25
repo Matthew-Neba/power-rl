@@ -109,6 +109,15 @@ typedef struct {
     float k_mot;
 } Params;
 
+// Ordered list of domain-randomized params. This enum is the contract between the
+// ADR frontier (which carries a per-index width) and init_drone (which applies a
+// per-index multiplicative factor). Keep the order in sync with apply in init_drone.
+typedef enum {
+    DR_ARM_LEN, DR_MASS, DR_IXX, DR_IYY, DR_IZZ,
+    DR_K_THRUST, DR_K_ANG_DAMP, DR_K_DRAG, DR_B_DRAG, DR_K_MOT,
+    NUM_DR_PARAMS
+} DrParam;
+
 typedef struct {
     State state;
     Params params;
@@ -239,21 +248,24 @@ static inline float rpm_min_for_centered_hover(const Params* p) {
     return min_rpm;
 }
 
-static inline void init_drone(Drone* drone, unsigned int* rng, float dr) {
-    drone->params.arm_len = BASE_ARM_LEN * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.mass = BASE_MASS * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.ixx = BASE_IXX * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.iyy = BASE_IYY * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.izz = BASE_IZZ * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.k_thrust = BASE_K_THRUST * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.k_ang_damp = BASE_K_ANG_DAMP * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.k_drag = BASE_K_DRAG * rndf(1.0f - dr, 1.0f + dr, rng);
-    drone->params.b_drag = BASE_B_DRAG * rndf(1.0f - dr, 1.0f + dr, rng);
+// factors[NUM_DR_PARAMS] are multiplicative scales (1.0 = nominal) chosen by the
+// caller (adr_sample). Randomization lives in the caller; init_drone is deterministic
+// given factors. Gravity stays a fixed small jitter, outside the ADR frontier.
+static inline void init_drone(Drone* drone, unsigned int* rng, const float* factors) {
+    drone->params.arm_len = BASE_ARM_LEN * factors[DR_ARM_LEN];
+    drone->params.mass = BASE_MASS * factors[DR_MASS];
+    drone->params.ixx = BASE_IXX * factors[DR_IXX];
+    drone->params.iyy = BASE_IYY * factors[DR_IYY];
+    drone->params.izz = BASE_IZZ * factors[DR_IZZ];
+    drone->params.k_thrust = BASE_K_THRUST * factors[DR_K_THRUST];
+    drone->params.k_ang_damp = BASE_K_ANG_DAMP * factors[DR_K_ANG_DAMP];
+    drone->params.k_drag = BASE_K_DRAG * factors[DR_K_DRAG];
+    drone->params.b_drag = BASE_B_DRAG * factors[DR_B_DRAG];
     drone->params.gravity = BASE_GRAVITY * rndf(0.99f, 1.01f, rng);
     drone->params.max_rpm = BASE_MAX_RPM;
     drone->params.max_vel = BASE_MAX_VEL;
     drone->params.max_omega = BASE_MAX_OMEGA;
-    drone->params.k_mot = BASE_K_MOT * rndf(1.0f - dr, 1.0f + dr, rng);
+    drone->params.k_mot = BASE_K_MOT * factors[DR_K_MOT];
 
     float hover = rpm_hover(&drone->params);
     for (int i = 0; i < 4; i++)
