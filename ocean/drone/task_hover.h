@@ -16,6 +16,7 @@ typedef struct {
     float alpha_hover;
     float alpha_shaping;
     float alpha_omega;
+    float alpha_vel;  // ungated penalty on linear speed, damps motion at any distance
     float alpha_action;  // penalty on squared action change between consecutive steps
     float sphere_radius;
     int horizon;
@@ -172,7 +173,8 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
     float curr = hover_potential(cache->dist, cache->vel, cache->omega, cfg);
     float reward = cfg->alpha_hover * curr
                  + cfg->alpha_shaping * (curr - state->prev_potential[idx])
-                 - cfg->alpha_omega * cache->omega;
+                 - cfg->alpha_omega * cache->omega
+                 - cfg->alpha_vel * cache->vel;
     state->prev_potential[idx] = curr;
 
     // Penalize action changes for smooth motor commands. Skip the first step of the episode,
