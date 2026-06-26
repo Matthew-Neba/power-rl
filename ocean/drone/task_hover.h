@@ -16,6 +16,7 @@ typedef struct {
     float alpha_hover;
     float alpha_shaping;
     float alpha_omega;
+    float alpha_action;  // penalty on squared action change between consecutive steps
     float sphere_radius;
     int horizon;
 } HoverConfig;
@@ -27,6 +28,7 @@ typedef struct {
     float* ema_dist;
     float* ema_vel;
     float* ema_omega;
+    float* prev_action;  // last action per agent (4 floats each), for the change penalty
 } HoverState;
 
 // lifecycle
@@ -39,6 +41,7 @@ static void hover_init(DroneEnv* env) {
     state->ema_dist = (float*)calloc(env->num_agents, sizeof(float));
     state->ema_vel = (float*)calloc(env->num_agents, sizeof(float));
     state->ema_omega = (float*)calloc(env->num_agents, sizeof(float));
+    state->prev_action = (float*)calloc(env->num_agents * 4, sizeof(float));
     env->task_state = state;
 }
 
@@ -51,6 +54,7 @@ static void hover_close(DroneEnv* env) {
         free(state->ema_dist);
         free(state->ema_vel);
         free(state->ema_omega);
+        free(state->prev_action);
         free(state);
     }
     free(env->task_config);
@@ -170,6 +174,20 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
                  + cfg->alpha_shaping * (curr - state->prev_potential[idx])
                  - cfg->alpha_omega * cache->omega;
     state->prev_potential[idx] = curr;
+
+    // Penalize action changes for smooth motor commands. Skip the first step of the episode,
+    // where prev_action is stale from the previous episode (episode_length == 1 here).
+    float* action = &env->actions[4 * idx];
+    float* prev_action = &state->prev_action[4 * idx];
+    if (agent->episode_length > 1) {
+        float da = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            float d = action[k] - prev_action[k];
+            da += d * d;
+        }
+        reward -= cfg->alpha_action * da;
+    }
+    for (int k = 0; k < 4; k++) prev_action[k] = action[k];
 
     float score = hover_score(cache->dist, cache->vel, cache->omega);
     state->score[idx] += score;
