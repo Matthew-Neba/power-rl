@@ -21,6 +21,7 @@ typedef struct {
 
 static struct {
     AdrParam p[NUM_DR_PARAMS];
+    float w_floor;  // always-on baseline half-width; ADR may grow above it, never below
     float p_probe;  // probability an agent is a boundary probe this episode
     float t_lo;     // contract a boundary whose mean perf falls below this
     float t_hi;     // expand a boundary whose mean perf rises above this
@@ -36,11 +37,13 @@ static const char* ADR_LOG_KEYS[NUM_DR_PARAMS] = {
 
 static inline void adr_init(float seed_w, float p_probe, float t_lo, float t_hi,
                             float step, int on) {
+    // seed_w is the always-on floor: every param starts here and ADR may only grow above it.
     for (int i = 0; i < NUM_DR_PARAMS; i++) {
         g_adr.p[i].w = seed_w;
         g_adr.p[i].n_lo = 0;
         g_adr.p[i].n_hi = 0;
     }
+    g_adr.w_floor = seed_w;
     g_adr.p_probe = p_probe;
     g_adr.t_lo = t_lo;
     g_adr.t_hi = t_hi;
@@ -85,5 +88,5 @@ static inline void adr_record(int probe_param, int probe_side, float perf) {
     *n = 0;
 
     if (mean > g_adr.t_hi) p->w = fminf(ADR_W_MAX, p->w + g_adr.step);
-    else if (mean < g_adr.t_lo) p->w = fmaxf(0.0f, p->w - g_adr.step);
+    else if (mean < g_adr.t_lo) p->w = fmaxf(g_adr.w_floor, p->w - g_adr.step);
 }
