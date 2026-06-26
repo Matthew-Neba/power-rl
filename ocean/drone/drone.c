@@ -18,7 +18,7 @@ static void setup_task(DroneEnv* env, int task) {
         env->task_config = cfg;
     } else {
         HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
-        cfg->target_dist = 5.0f;
+        cfg->target_dist = 1.0f;
         cfg->sphere_radius = 4.0f;
         cfg->horizon = 1024;
         env->task_config = cfg;
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
 
     Weights* weights = load_weights("resources/drone/drone_weights.bin");
     int logit_sizes[4] = {1, 1, 1, 1};
-    PufferNet* net = make_puffernet(weights, env->num_agents, DRONE_OBS_SIZE, 64, 2, logit_sizes, 4);
+    PufferNet* net = make_puffernet(weights, env->num_agents, DRONE_OBS_SIZE, 48, 1, logit_sizes, 4);
 
 #ifdef __EMSCRIPTEN__
     WebRenderArgs args = {.env = env, .net = net};
