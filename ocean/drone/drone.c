@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
 
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
     env->num_agents = 64;
+    env->dr = 0.05f;  // static 5% flat DR for the demo
 
     env->observations = (float*)calloc(env->num_agents * DRONE_OBS_SIZE, sizeof(float));
     env->actions = (float*)calloc(env->num_agents * 4, sizeof(float));
@@ -69,7 +70,6 @@ int main(int argc, char** argv) {
     env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 
     init(env);
-    adr_init(0.05f, 0.0f, 0.0f, 0.0f, 0.0f, 0);  // static 5% DR for the demo (no probing)
     setup_task(env, task);
 
     Weights* weights = load_weights("resources/drone/drone_weights.bin");

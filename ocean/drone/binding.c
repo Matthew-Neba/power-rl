@@ -37,6 +37,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->num_agents = (int)dict_get(kwargs, "num_drones")->value;
 
     env->alpha_dist = dict_get(kwargs, "alpha_dist")->value;
+    env->dr = dict_get(kwargs, "dr")->value;
 
     task_fracs[TASK_HOVER] = dict_get(kwargs, "hover_frac")->value;
     task_fracs[TASK_RACE] = dict_get(kwargs, "race_frac")->value;
@@ -65,17 +66,6 @@ void my_init(Env* env, Dict* kwargs) {
     } else {
         hover_config(env, kwargs);
     }
-
-    // Seed the shared ADR frontier. Idempotent across the 32 env inits at startup;
-    // adr_on=0 freezes the widths at adr_w0 (static DR).
-    adr_init(
-        dict_get(kwargs, "adr_w0")->value,
-        dict_get(kwargs, "adr_p_probe")->value,
-        dict_get(kwargs, "adr_t_lo")->value,
-        dict_get(kwargs, "adr_t_hi")->value,
-        dict_get(kwargs, "adr_step")->value,
-        (int)dict_get(kwargs, "adr_on")->value
-    );
 
     task_init(env);
     init(env);
@@ -150,11 +140,6 @@ void my_log(Log* log, Dict* out) {
         dict_set(out, "flag/oob", task_avg(f->keys[3], f->n));
         dict_set(out, "flag/episode_frac", f->n);
     }
-
-    // ADR robustness frontier: current per-param randomization half-width. Dumped
-    // unconditionally so the keys are present from the first log (no late-key crash).
-    for (int i = 0; i < NUM_DR_PARAMS; i++)
-        dict_set(out, ADR_LOG_KEYS[i], g_adr.p[i].w);
 
     first = 0;
 }

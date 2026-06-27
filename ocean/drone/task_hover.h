@@ -12,8 +12,8 @@ typedef struct {
     float target_dist;
     float alpha_hover;
     float alpha_omega;
-    float alpha_vel;  // ungated penalty on linear speed, damps motion at any distance
-    float alpha_action;  // penalty on squared action change between consecutive steps
+    float alpha_vel;
+    float alpha_action;
     float sphere_radius;
     int horizon;
 } HoverConfig;
@@ -112,7 +112,7 @@ static inline float cube_axis(int i, int side, float radius) {
 }
 
 static inline Vec3 cube_slot(int idx, int num_agents, float radius) {
-    float r = radius * 0.57735027f; // 1/sqrt(3): corners sit on the sphere of `radius`
+    float r = radius * 0.57735027f;
     int side = (int)ceilf(cbrtf((float)num_agents));
     int x = idx % side;
     int y = (idx / side) % side;
@@ -154,20 +154,12 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;
 
-    // Per-step state quality is the true objective: it is exactly the eval metric
-    // (hover_score), bounded in (0, 1], and maximized at the target with zero velocity.
-    // It depends only on the current state -- no delta -- so there is no rate to farm.
     float score = hover_score(cache->dist, cache->vel, cache->omega);
     float reward = cfg->alpha_hover * score;
 
-    // Distance-progress shaping is applied globally in c_step (env->alpha_dist), so it is
-    // deliberately not repeated here. Velocity/angular damping comes mostly from hover_score
-    // (distance-gated); these knobs default to 0 and are optional top-ups.
     reward -= cfg->alpha_vel * cache->vel;
     reward -= cfg->alpha_omega * cache->omega;
 
-    // Penalize action changes for smooth motor commands. Skip the first step of the episode,
-    // where prev_action is stale from the previous episode (episode_length == 1 here).
     float* action = &env->actions[4 * idx];
     float* prev_action = &state->prev_action[4 * idx];
     if (agent->episode_length > 1) {
@@ -191,10 +183,6 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
 static bool hover_done(DroneEnv* env, Drone* agent, int idx, StepCache* cache) {
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     return cache->dist > (cfg->target_dist + 1.0f) || agent->episode_length >= cfg->horizon;
-}
-
-static float hover_perf(DroneEnv* env, int idx) {
-    return ((HoverState*)env->task_state)->perf[idx];
 }
 
 static void hover_log(DroneEnv* env, Drone* agent, int idx, Log* log, StepCache* cache) {

@@ -11,7 +11,6 @@
 #include <string.h>
 
 #include "dronelib.h"
-#include "adr.h"
 
 #define HORIZON 2048
 
@@ -62,16 +61,15 @@ struct DroneEnv {
     Drone* agents;
     Log log;
 
-    // per-agent ADR boundary-probe tag for this episode (-1 = not probing)
-    int* adr_param;
-    int* adr_side;
-
     TaskType task;
     void* task_config;
     void* task_state;
 
     // shared reward primitive
     float alpha_dist;
+
+    // domain randomisation
+    float dr;
 
     Client* client;
 };
@@ -89,17 +87,13 @@ void reset_agent_base(DroneEnv* env, int idx) {
     memset(agent, 0, sizeof(Drone));
     agent->target = target;
 
-    float factors[NUM_DR_PARAMS];
-    adr_sample(&env->rng, factors, &env->adr_param[idx], &env->adr_side[idx]);
-    init_drone(agent, &env->rng, factors);
+    init_drone(agent, &env->rng, env->dr);
 }
 
 void init(DroneEnv* env) {
     env->agents = (Drone*)calloc(env->num_agents, sizeof(Drone));
     for (int i = 0; i < env->num_agents; i++)
         env->agents[i].target = (Target*)calloc(1, sizeof(Target));
-    env->adr_param = (int*)calloc(env->num_agents, sizeof(int));
-    env->adr_side = (int*)calloc(env->num_agents, sizeof(int));
     env->log = (Log){0};
     env->tick = 0;
 }
@@ -154,7 +148,6 @@ void c_step(DroneEnv* env) {
 
         if (done) {
             add_log(env, i, &cache);
-            adr_record(env->adr_param[i], env->adr_side[i], task_perf(env, i));
             reset_agent_base(env, i);
             task_reset(env, agent, i);
             agent->prev_pos = agent->state.pos;
@@ -167,13 +160,11 @@ void c_step(DroneEnv* env) {
 void c_close_client(Client* client);
 
 void c_close(DroneEnv* env) {
-    task_close(env); // null-safe: close helpers guard on task_state
+    task_close(env);
 
     for (int i = 0; i < env->num_agents; i++)
         free(env->agents[i].target);
     free(env->agents);
-    free(env->adr_param);
-    free(env->adr_side);
 
     if (env->client != NULL) c_close_client(env->client);
 }
