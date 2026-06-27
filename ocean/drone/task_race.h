@@ -14,7 +14,6 @@
 typedef struct {
     int max_rings;
     float ring_reward;
-    float alpha_omega;
     int horizon;
 } RaceConfig;
 
@@ -166,7 +165,8 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
 
-    float reward = -cfg->alpha_omega * cache->omega;
+    // Angular-rate penalty is now shared shaping, applied in c_step.
+    float reward = 0.0f;
 
     int result = check_ring(agent, &state->ring_buffer[state->ring_idx[idx]]);
     if (result == 1) {

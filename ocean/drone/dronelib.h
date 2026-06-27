@@ -113,6 +113,7 @@ typedef struct {
     State state;
     Params params;
     Vec3 prev_pos;
+    float prev_action[4];  // last action, for the shared action-change penalty
     Target* target;
 
     float episode_return;
