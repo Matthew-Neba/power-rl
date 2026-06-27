@@ -11,6 +11,7 @@
 typedef struct {
     float target_dist;
     float alpha_hover;
+    float alpha_dist;
     float sphere_radius;
     int horizon;
 } HoverConfig;
@@ -150,6 +151,7 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
 
     float score = hover_score(cache->dist, cache->vel, cache->omega);
     float reward = cfg->alpha_hover * score;
+    reward += cfg->alpha_dist * (cache->prev_dist - cache->dist);
 
     state->score[idx] += score;
     state->perf[idx] = 0.98f * state->perf[idx] + 0.02f * score;

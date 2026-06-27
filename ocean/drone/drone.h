@@ -65,11 +65,10 @@ struct DroneEnv {
     void* task_config;
     void* task_state;
 
-    // shared reward shaping (applied in c_step across all tasks)
-    float alpha_dist;    // distance-progress shaping
-    float alpha_vel;     // ungated penalty on linear speed
-    float alpha_omega;   // ungated penalty on angular rate
-    float alpha_action;  // penalty on squared action change between steps
+    // shared reward shaping
+    float alpha_vel;
+    float alpha_omega;
+    float alpha_action;
 
     // domain randomisation
     float dr;
@@ -141,7 +140,6 @@ void c_step(DroneEnv* env) {
         };
 
         float reward = task_reward(env, agent, i, &cache);
-        reward += env->alpha_dist * (cache.prev_dist - cache.dist);
         reward -= env->alpha_vel * cache.vel;
         reward -= env->alpha_omega * cache.omega;
 

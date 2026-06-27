@@ -16,6 +16,7 @@ static void hover_config(DroneEnv* env, Dict* kwargs) {
     HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
     cfg->target_dist = dict_get(kwargs, "hover_target_dist")->value;
     cfg->alpha_hover = dict_get(kwargs, "alpha_hover")->value;
+    cfg->alpha_dist = dict_get(kwargs, "hover_alpha_dist")->value;
     cfg->sphere_radius = dict_get(kwargs, "sphere_radius")->value;
     cfg->horizon = (int)dict_get(kwargs, "hover_horizon")->value;
     env->task_config = cfg;
@@ -25,6 +26,7 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
     RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
     cfg->max_rings = (int)dict_get(kwargs, "max_rings")->value;
     cfg->ring_reward = dict_get(kwargs, "ring_reward")->value;
+    cfg->alpha_dist = dict_get(kwargs, "race_alpha_dist")->value;
     cfg->horizon = (int)dict_get(kwargs, "race_horizon")->value;
     env->task_config = cfg;
 }
@@ -32,7 +34,6 @@ static void race_config(DroneEnv* env, Dict* kwargs) {
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = (int)dict_get(kwargs, "num_drones")->value;
 
-    env->alpha_dist = dict_get(kwargs, "alpha_dist")->value;
     env->alpha_vel = dict_get(kwargs, "alpha_vel")->value;
     env->alpha_omega = dict_get(kwargs, "alpha_omega")->value;
     env->alpha_action = dict_get(kwargs, "alpha_action")->value;
