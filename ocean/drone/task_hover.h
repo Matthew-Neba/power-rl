@@ -10,11 +10,7 @@
 
 typedef struct {
     float target_dist;
-    float hover_dist;
-    float hover_omega;
-    float hover_vel;
     float alpha_hover;
-    float alpha_shaping;
     float alpha_omega;
     float alpha_vel;  // ungated penalty on linear speed, damps motion at any distance
     float alpha_action;  // penalty on squared action change between consecutive steps
@@ -23,7 +19,6 @@ typedef struct {
 } HoverConfig;
 
 typedef struct {
-    float* prev_potential;
     float* score;
     float* perf;
     float* ema_dist;
@@ -36,7 +31,6 @@ typedef struct {
 
 static void hover_init(DroneEnv* env) {
     HoverState* state = (HoverState*)calloc(1, sizeof(HoverState));
-    state->prev_potential = (float*)calloc(env->num_agents, sizeof(float));
     state->score = (float*)calloc(env->num_agents, sizeof(float));
     state->perf = (float*)calloc(env->num_agents, sizeof(float));
     state->ema_dist = (float*)calloc(env->num_agents, sizeof(float));
@@ -49,7 +43,6 @@ static void hover_init(DroneEnv* env) {
 static void hover_close(DroneEnv* env) {
     HoverState* state = (HoverState*)env->task_state;
     if (state != NULL) {
-        free(state->prev_potential);
         free(state->score);
         free(state->perf);
         free(state->ema_dist);
@@ -73,18 +66,6 @@ static inline Vec3 random_ball_offset(unsigned int* rng, float radius) {
     return scalmul3(dir, radius * cbrtf(rndf(0.0f, 1.0f, rng)));
 }
 
-// Progress potential for the delta/shaping reward. Linear in distance with a flat
-// deadzone inside hover_dist of the target: the slope is a constant -1/target_dist in
-// the far field and zero at the setpoint. A constant slope means the shaping reward per
-// unit closing speed is the same everywhere, so there is no velocity-reward spike at the
-// target. (The old reciprocal potential's slope blew up to -10/m at dist=0, paying ~0.2
-// per m/s of closing speed right at the setpoint -- a spring that stiffens as you arrive,
-// which made the drone slam through the target and ring around it.)
-static inline float hover_progress(float dist, HoverConfig* cfg) {
-    float d_eff = fmaxf(0.0f, dist - cfg->hover_dist);
-    return -d_eff / cfg->target_dist;
-}
-
 static inline float hover_score(float dist, float vel, float omega) {
     float d = dist / HOVER_SCORE_DIST_SCALE;
     float v = vel / HOVER_SCORE_VEL_SCALE;
@@ -94,7 +75,6 @@ static inline float hover_score(float dist, float vel, float omega) {
 }
 
 static void hover_reset_to(DroneEnv* env, Drone* agent, int idx, Vec3 target, float spawn_dist) {
-    HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;
 
     agent->target->pos = target;
@@ -116,7 +96,6 @@ static void hover_reset_to(DroneEnv* env, Drone* agent, int idx, Vec3 target, fl
     state->ema_dist[idx] = dist;
     state->ema_vel[idx] = vel;
     state->ema_omega[idx] = omega;
-    state->prev_potential[idx] = hover_progress(dist, cfg);
 }
 
 static inline Vec3 sphere_slot(int idx, int num_agents, float radius) {
@@ -181,15 +160,9 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
     float score = hover_score(cache->dist, cache->vel, cache->omega);
     float reward = cfg->alpha_hover * score;
 
-    // Progress shaping: delta of the linear potential. Dense far-field guidance toward the
-    // target with a constant, bounded gradient -- keeps the useful "reward for closing
-    // distance" signal without the near-target spike that drove the oscillation.
-    float phi = hover_progress(cache->dist, cfg);
-    reward += cfg->alpha_shaping * (phi - state->prev_potential[idx]);
-    state->prev_potential[idx] = phi;
-
-    // Damping: ungated penalties on linear/angular speed so the approach settles
-    // (critically damped) instead of ringing around the target.
+    // Distance-progress shaping is applied globally in c_step (env->alpha_dist), so it is
+    // deliberately not repeated here. Velocity/angular damping comes mostly from hover_score
+    // (distance-gated); these knobs default to 0 and are optional top-ups.
     reward -= cfg->alpha_vel * cache->vel;
     reward -= cfg->alpha_omega * cache->omega;
 

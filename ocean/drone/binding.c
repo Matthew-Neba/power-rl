@@ -15,11 +15,7 @@ static float task_fracs[NUM_TASKS];
 static void hover_config(DroneEnv* env, Dict* kwargs) {
     HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
     cfg->target_dist = dict_get(kwargs, "hover_target_dist")->value;
-    cfg->hover_dist = dict_get(kwargs, "hover_dist")->value;
-    cfg->hover_omega = dict_get(kwargs, "hover_omega")->value;
-    cfg->hover_vel = dict_get(kwargs, "hover_vel")->value;
     cfg->alpha_hover = dict_get(kwargs, "alpha_hover")->value;
-    cfg->alpha_shaping = dict_get(kwargs, "alpha_shaping")->value;
     cfg->alpha_omega = dict_get(kwargs, "hover_alpha_omega")->value;
     cfg->alpha_vel = dict_get(kwargs, "hover_alpha_vel")->value;
     cfg->alpha_action = dict_get(kwargs, "hover_alpha_action")->value;
