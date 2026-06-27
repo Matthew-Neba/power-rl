@@ -6,7 +6,7 @@
 
 #define HOVER_SCORE_DIST_SCALE 0.01f
 #define HOVER_SCORE_VEL_SCALE 0.01f
-#define HOVER_SCORE_OMEGA_SCALE 0.1f
+#define HOVER_SCORE_OMEGA_SCALE 0.01f
 
 typedef struct {
     float target_dist;
