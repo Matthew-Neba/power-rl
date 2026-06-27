@@ -73,11 +73,16 @@ static inline Vec3 random_ball_offset(unsigned int* rng, float radius) {
     return scalmul3(dir, radius * cbrtf(rndf(0.0f, 1.0f, rng)));
 }
 
-static inline float hover_potential(float dist, float vel, float omega, HoverConfig* cfg) {
-    float d = 1.0f / (1.0f + dist / cfg->hover_dist);
-    float v = 1.0f / (1.0f + vel / cfg->hover_vel);
-    float w = 1.0f / (1.0f + omega / cfg->hover_omega);
-    return d * (0.7f + 0.15f * v + 0.15f * w);
+// Progress potential for the delta/shaping reward. Linear in distance with a flat
+// deadzone inside hover_dist of the target: the slope is a constant -1/target_dist in
+// the far field and zero at the setpoint. A constant slope means the shaping reward per
+// unit closing speed is the same everywhere, so there is no velocity-reward spike at the
+// target. (The old reciprocal potential's slope blew up to -10/m at dist=0, paying ~0.2
+// per m/s of closing speed right at the setpoint -- a spring that stiffens as you arrive,
+// which made the drone slam through the target and ring around it.)
+static inline float hover_progress(float dist, HoverConfig* cfg) {
+    float d_eff = fmaxf(0.0f, dist - cfg->hover_dist);
+    return -d_eff / cfg->target_dist;
 }
 
 static inline float hover_score(float dist, float vel, float omega) {
@@ -111,7 +116,7 @@ static void hover_reset_to(DroneEnv* env, Drone* agent, int idx, Vec3 target, fl
     state->ema_dist[idx] = dist;
     state->ema_vel[idx] = vel;
     state->ema_omega[idx] = omega;
-    state->prev_potential[idx] = hover_potential(dist, vel, omega, cfg);
+    state->prev_potential[idx] = hover_progress(dist, cfg);
 }
 
 static inline Vec3 sphere_slot(int idx, int num_agents, float radius) {
@@ -170,12 +175,23 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
     HoverConfig* cfg = (HoverConfig*)env->task_config;
     HoverState* state = (HoverState*)env->task_state;
 
-    float curr = hover_potential(cache->dist, cache->vel, cache->omega, cfg);
-    float reward = cfg->alpha_hover * curr
-                 + cfg->alpha_shaping * (curr - state->prev_potential[idx])
-                 - cfg->alpha_omega * cache->omega
-                 - cfg->alpha_vel * cache->vel;
-    state->prev_potential[idx] = curr;
+    // Per-step state quality is the true objective: it is exactly the eval metric
+    // (hover_score), bounded in (0, 1], and maximized at the target with zero velocity.
+    // It depends only on the current state -- no delta -- so there is no rate to farm.
+    float score = hover_score(cache->dist, cache->vel, cache->omega);
+    float reward = cfg->alpha_hover * score;
+
+    // Progress shaping: delta of the linear potential. Dense far-field guidance toward the
+    // target with a constant, bounded gradient -- keeps the useful "reward for closing
+    // distance" signal without the near-target spike that drove the oscillation.
+    float phi = hover_progress(cache->dist, cfg);
+    reward += cfg->alpha_shaping * (phi - state->prev_potential[idx]);
+    state->prev_potential[idx] = phi;
+
+    // Damping: ungated penalties on linear/angular speed so the approach settles
+    // (critically damped) instead of ringing around the target.
+    reward -= cfg->alpha_vel * cache->vel;
+    reward -= cfg->alpha_omega * cache->omega;
 
     // Penalize action changes for smooth motor commands. Skip the first step of the episode,
     // where prev_action is stale from the previous episode (episode_length == 1 here).
@@ -191,7 +207,6 @@ static float hover_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache
     }
     for (int k = 0; k < 4; k++) prev_action[k] = action[k];
 
-    float score = hover_score(cache->dist, cache->vel, cache->omega);
     state->score[idx] += score;
     state->perf[idx] = 0.98f * state->perf[idx] + 0.02f * score;
     state->ema_dist[idx] = 0.99f * state->ema_dist[idx] + 0.01f * cache->dist;
