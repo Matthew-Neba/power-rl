@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "dronelib.h"
+#include "physics.h"
 
 #define HORIZON 2048
 
@@ -59,6 +60,7 @@ struct DroneEnv {
 
     int tick;
     Drone* agents;
+    Paramsv* params_soa;
     Log log;
 
     TaskType task;
@@ -90,12 +92,16 @@ void reset_agent_base(DroneEnv* env, int idx) {
     agent->target = target;
 
     init_drone(agent, &env->rng, env->dr);
+    store_params(env->params_soa, idx, &agent->params);
 }
 
 void init(DroneEnv* env) {
     env->agents = (Drone*)calloc(env->num_agents, sizeof(Drone));
     for (int i = 0; i < env->num_agents; i++)
         env->agents[i].target = (Target*)calloc(1, sizeof(Target));
+
+    env->params_soa = init_physics(env->num_agents);
+
     env->log = (Log){0};
     env->tick = 0;
 }
@@ -125,11 +131,13 @@ void c_reset(DroneEnv* env) {
 void c_step(DroneEnv* env) {
     env->tick = (env->tick + 1) % HORIZON;
 
+    for (int i = 0; i < env->num_agents; i++)
+        env->agents[i].prev_pos = env->agents[i].state.pos;
+
+    move_drones(env->agents, env->actions, env->params_soa, env->num_agents);
+
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
-
-        agent->prev_pos = agent->state.pos;
-        move_drone(agent, &env->actions[4 * i]);
         agent->episode_length++;
 
         StepCache cache = {
@@ -179,6 +187,7 @@ void c_close(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++)
         free(env->agents[i].target);
     free(env->agents);
+    free(env->params_soa);
 
     if (env->client != NULL) c_close_client(env->client);
 }
