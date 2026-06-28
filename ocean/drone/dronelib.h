@@ -99,6 +99,12 @@ typedef struct {
     float max_vel;
     float max_omega;
     float k_mot;
+
+    float inv_mass;
+    float inv_ixx;
+    float inv_iyy;
+    float inv_izz;
+    float inv_k_mot;
 } Params;
 
 typedef struct {
@@ -211,6 +217,12 @@ static inline void init_drone(Drone* drone, unsigned int* rng, float dr) {
     drone->params.max_vel = BASE_MAX_VEL;
     drone->params.max_omega = BASE_MAX_OMEGA;
     drone->params.k_mot = BASE_K_MOT * rndf(1.0f - dr, 1.0f + dr, rng);
+
+    drone->params.inv_mass = 1.0f / drone->params.mass;
+    drone->params.inv_ixx = 1.0f / drone->params.ixx;
+    drone->params.inv_iyy = 1.0f / drone->params.iyy;
+    drone->params.inv_izz = 1.0f / drone->params.izz;
+    drone->params.inv_k_mot = 1.0f / drone->params.k_mot;
 
     float hover = rpm_hover(&drone->params);
     for (int i = 0; i < 4; i++)

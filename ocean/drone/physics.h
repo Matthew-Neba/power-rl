@@ -43,6 +43,11 @@ typedef struct {
     vf max_vel;
     vf max_omega;
     vf k_mot;
+    vf inv_mass;
+    vf inv_ixx;
+    vf inv_iyy;
+    vf inv_izz;
+    vf inv_k_mot;
 } Paramsv;
 
 typedef struct {
@@ -83,14 +88,6 @@ static inline void vquat_normalize(Quatv* q) {
     q->z /= n;
 }
 
-static inline Vec3v vquat_rotate(Quatv q, Vec3v v) {
-    Quatv qv = (Quatv){(vf){0}, v.x, v.y, v.z};
-    Quatv tmp = vquat_mul(q, qv);
-    Quatv q_conj = (Quatv){q.w, -q.x, -q.y, -q.z};
-    Quatv res = vquat_mul(tmp, q_conj);
-    return (Vec3v){res.x, res.y, res.z};
-}
-
 static inline vf vclampf(vf v, vf lo, vf hi) {
     return __builtin_elementwise_min(__builtin_elementwise_max(v, lo), hi);
 }
@@ -122,27 +119,33 @@ static inline Paramsv* init_physics(int num_agents) {
 static inline void store_params(Paramsv* params_soa, int idx, const Params* pa) {
     Paramsv* p = &params_soa[idx / DRONE_LANES];
     int l = idx % DRONE_LANES;
-    p->mass[l] = pa->mass; p->ixx[l] = pa->ixx; p->iyy[l] = pa->iyy; p->izz[l] = pa->izz;
-    p->arm_len[l] = pa->arm_len; p->k_thrust[l] = pa->k_thrust; p->k_ang_damp[l] = pa->k_ang_damp;
-    p->k_drag[l] = pa->k_drag; p->b_drag[l] = pa->b_drag; p->gravity[l] = pa->gravity;
-    p->max_rpm[l] = pa->max_rpm; p->max_vel[l] = pa->max_vel; p->max_omega[l] = pa->max_omega;
+    p->mass[l] = pa->mass;
+    p->ixx[l] = pa->ixx;
+    p->iyy[l] = pa->iyy;
+    p->izz[l] = pa->izz;
+    p->arm_len[l] = pa->arm_len;
+    p->k_thrust[l] = pa->k_thrust;
+    p->k_ang_damp[l] = pa->k_ang_damp;
+    p->k_drag[l] = pa->k_drag;
+    p->b_drag[l] = pa->b_drag;
+    p->gravity[l] = pa->gravity;
+    p->max_rpm[l] = pa->max_rpm;
+    p->max_vel[l] = pa->max_vel;
+    p->max_omega[l] = pa->max_omega;
     p->k_mot[l] = pa->k_mot;
+    p->inv_mass[l] = pa->inv_mass;
+    p->inv_ixx[l] = pa->inv_ixx;
+    p->inv_iyy[l] = pa->inv_iyy;
+    p->inv_izz[l] = pa->inv_izz;
+    p->inv_k_mot[l] = pa->inv_k_mot;
 }
 
 // physics
 
-static inline void compute_derivatives(Statev* state, const Paramsv* params, vf* actions,
+static inline void compute_derivatives(Statev* state, const Paramsv* params, const vf* target_rpms,
                                        StateDerivativev* d) {
-    vf min_rpm = vrpm_min_for_centered_hover(params);
-
-    vf target_rpms[4];
-    for (int i = 0; i < 4; i++) {
-        vf u = (actions[i] + 1.0f) * 0.5f;
-        target_rpms[i] = min_rpm + u * (params->max_rpm - min_rpm);
-    }
-
     for (int i = 0; i < 4; i++)
-        d->rpm_dot[i] = (1.0f / params->k_mot) * (target_rpms[i] - state->rpms[i]);
+        d->rpm_dot[i] = params->inv_k_mot * (target_rpms[i] - state->rpms[i]);
 
     vf T[4];
     for (int i = 0; i < 4; i++) {
@@ -150,19 +153,25 @@ static inline void compute_derivatives(Statev* state, const Paramsv* params, vf*
         T[i] = params->k_thrust * rpm * rpm;
     }
 
-    Vec3v F_prop = vquat_rotate(state->quat, (Vec3v){(vf){0}, (vf){0}, T[0] + T[1] + T[2] + T[3]});
+    vf Tsum = T[0] + T[1] + T[2] + T[3];
+    Quatv q = state->quat;
+    Vec3v F_prop = {
+        Tsum * 2.0f * (q.x * q.z + q.w * q.y),
+        Tsum * 2.0f * (q.y * q.z - q.w * q.x),
+        Tsum * (q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z),
+    };
 
     d->vel = state->vel;
     d->v_dot = (Vec3v){
-        (F_prop.x - params->b_drag * state->vel.x) / params->mass,
-        (F_prop.y - params->b_drag * state->vel.y) / params->mass,
-        ((F_prop.z - params->b_drag * state->vel.z) / params->mass) - params->gravity,
+        (F_prop.x - params->b_drag * state->vel.x) * params->inv_mass,
+        (F_prop.y - params->b_drag * state->vel.y) * params->inv_mass,
+        ((F_prop.z - params->b_drag * state->vel.z) * params->inv_mass) - params->gravity,
     };
 
     Quatv omega_q = (Quatv){(vf){0}, state->omega.x, state->omega.y, state->omega.z};
     d->q_dot = vscalmul_quat(vquat_mul(state->quat, omega_q), 0.5f);
 
-    vf af = params->arm_len / sqrtf(2.0f);
+    vf af = params->arm_len * 0.70710678f; // 1/sqrt(2)
     Vec3v tau_prop = {
         af * ((T[2] + T[3]) - (T[0] + T[1])),
         af * ((T[1] + T[2]) - (T[0] + T[3])),
@@ -180,9 +189,9 @@ static inline void compute_derivatives(Statev* state, const Paramsv* params, vf*
     };
 
     d->w_dot = (Vec3v){
-        (tau_prop.x + tau_aero.x + tau_iner.x) / params->ixx,
-        (tau_prop.y + tau_aero.y + tau_iner.y) / params->iyy,
-        (tau_prop.z + tau_aero.z + tau_iner.z) / params->izz,
+        (tau_prop.x + tau_aero.x + tau_iner.x) * params->inv_ixx,
+        (tau_prop.y + tau_aero.y + tau_iner.y) * params->inv_iyy,
+        (tau_prop.z + tau_aero.z + tau_iner.z) * params->inv_izz,
     };
 }
 
@@ -196,17 +205,17 @@ static inline void step(Statev* s, StateDerivativev* d, float dt, Statev* out) {
     vquat_normalize(&out->quat);
 }
 
-static inline void rk4_step(Statev* state, const Paramsv* params, vf* actions, float dt) {
+static inline void rk4_step(Statev* state, const Paramsv* params, const vf* target_rpms, float dt) {
     StateDerivativev k1, k2, k3, k4;
     Statev tmp;
 
-    compute_derivatives(state, params, actions, &k1);
+    compute_derivatives(state, params, target_rpms, &k1);
     step(state, &k1, dt * 0.5f, &tmp);
-    compute_derivatives(&tmp, params, actions, &k2);
+    compute_derivatives(&tmp, params, target_rpms, &k2);
     step(state, &k2, dt * 0.5f, &tmp);
-    compute_derivatives(&tmp, params, actions, &k3);
+    compute_derivatives(&tmp, params, target_rpms, &k3);
     step(state, &k3, dt, &tmp);
-    compute_derivatives(&tmp, params, actions, &k4);
+    compute_derivatives(&tmp, params, target_rpms, &k4);
 
     float dt6 = dt / 6.0f;
 
@@ -283,8 +292,15 @@ static inline void move_drones(Drone* agents, float* act, const Paramsv* params_
         pack_block(agents, act, base, lanes, &s, actions);
         const Paramsv* p = &params_soa[base / DRONE_LANES];
 
+        vf min_rpm = vrpm_min_for_centered_hover(p);
+        vf target_rpms[4];
+        for (int k = 0; k < 4; k++) {
+            vf u = (actions[k] + 1.0f) * 0.5f;
+            target_rpms[k] = min_rpm + u * (p->max_rpm - min_rpm);
+        }
+
         for (int sub = 0; sub < ACTION_SUBSTEPS; sub++) {
-            rk4_step(&s, p, actions, DT);
+            rk4_step(&s, p, target_rpms, DT);
             vclamp3(&s.vel, -p->max_vel, p->max_vel);
             vclamp3(&s.omega, -p->max_omega, p->max_omega);
             for (int k = 0; k < 4; k++)
