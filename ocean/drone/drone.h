@@ -81,8 +81,9 @@ struct DroneEnv {
 #include "tasklib.h"
 
 void compute_observations(DroneEnv* env) {
+    bool is_race = (env->task == TASK_RACE);
     for (int i = 0; i < env->num_agents; i++)
-        compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE);
+        compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE, is_race);
 }
 
 void reset_agent_base(DroneEnv* env, int idx) {

@@ -42,7 +42,7 @@
 #define RING_RADIUS 0.5f
 #define V_TARGET 0.05f
 
-#define DRONE_OBS_SIZE 19
+#define DRONE_OBS_SIZE 21
 
 // Core Parameters
 #define DT 0.002f // 500 Hz
@@ -237,7 +237,7 @@ static inline void init_drone(Drone* drone, unsigned int* rng, float dr) {
 
 // observations
 
-void compute_drone_observations(Drone* agent, float* observations) {
+void compute_drone_observations(Drone* agent, float* observations, bool is_race) {
     int idx = 0;
     Quat q = agent->state.quat;
     Quat q_inv = quat_inverse(q);
@@ -272,4 +272,7 @@ void compute_drone_observations(Drone* agent, float* observations) {
     observations[idx++] = normal_body.x;
     observations[idx++] = normal_body.y;
     observations[idx++] = normal_body.z;
+
+    observations[idx++] = is_race ? 0.0f : 1.0f;
+    observations[idx++] = is_race ? 1.0f : 0.0f;
 }
