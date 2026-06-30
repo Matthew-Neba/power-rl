@@ -565,7 +565,8 @@ void c_render(DroneEnv* env) {
     int y = 10;
     DrawText(TextFormat("Task: %s", task_name(env->task)), 10, y, 20, WHITE);
     y += 25;
-    DrawText(TextFormat("Tick: %d / %d", env->tick, HORIZON), 10, y, 20, WHITE);
+    DrawText(TextFormat("Step: %d / %d", env->agents[client->selected_drone].episode_length,
+                        task_horizon(env)), 10, y, 20, WHITE);
     y += 25;
     DrawText(TextFormat("FPS: %d (W/S to adjust)", client->target_fps), 10, y, 18, WHITE);
     y += 22;

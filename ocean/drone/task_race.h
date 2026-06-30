@@ -96,20 +96,20 @@ static inline void center_rings(Target* rings, int n) {
     for (int i = 0; i < n; i++) rings[i].pos = sub3(rings[i].pos, mid);
 }
 
-static inline int check_ring(Drone* drone, Target* ring) {
-    float prev_dot = dot3(sub3(drone->prev_pos, ring->pos), ring->normal);
-    float new_dot = dot3(sub3(drone->state.pos, ring->pos), ring->normal);
+static inline int check_ring(Vec3 pos, Vec3 prev_pos, Target* ring) {
+    float prev_dot = dot3(sub3(prev_pos, ring->pos), ring->normal);
+    float new_dot = dot3(sub3(pos, ring->pos), ring->normal);
 
     bool valid_dir = (prev_dot < 0.0f && new_dot > 0.0f);
     bool invalid_dir = (prev_dot > 0.0f && new_dot < 0.0f);
 
     if (valid_dir || invalid_dir) {
-        Vec3 dir = sub3(drone->state.pos, drone->prev_pos);
+        Vec3 dir = sub3(pos, prev_pos);
         float denom = dot3(ring->normal, dir);
         if (fabsf(denom) < 1e-9f) return 0;
 
         float t = -prev_dot / denom;
-        Vec3 intersection = add3(drone->prev_pos, scalmul3(dir, t));
+        Vec3 intersection = add3(prev_pos, scalmul3(dir, t));
         float d = norm3(sub3(intersection, ring->pos));
 
         // margins scale with radius
@@ -166,10 +166,9 @@ static float race_reward(DroneEnv* env, Drone* agent, int idx, StepCache* cache)
     RaceConfig* cfg = (RaceConfig*)env->task_config;
     RaceState* state = (RaceState*)env->task_state;
 
-    // Distance-progress shaping toward the active gate; speed/omega/action penalties are shared (c_step).
     float reward = cfg->alpha_dist * (cache->prev_dist - cache->dist);
 
-    int result = check_ring(agent, &state->ring_buffer[state->ring_idx[idx]]);
+    int result = check_ring(agent->state.pos, agent->prev_pos, &state->ring_buffer[state->ring_idx[idx]]);
     if (result == 1) {
         state->rings_passed[idx]++;
         state->ring_idx[idx] = (state->ring_idx[idx] + 1) % cfg->max_rings;

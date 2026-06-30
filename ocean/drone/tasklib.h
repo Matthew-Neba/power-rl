@@ -15,6 +15,13 @@ const char* task_name(TaskType task) {
     return "?";
 }
 
+int task_horizon(DroneEnv* env) {
+    switch (env->task) {
+        case TASK_RACE: return ((RaceConfig*)env->task_config)->horizon;
+        default: return ((HoverConfig*)env->task_config)->horizon;
+    }
+}
+
 void task_init(DroneEnv* env) {
     switch (env->task) {
         case TASK_RACE: race_init(env); break;

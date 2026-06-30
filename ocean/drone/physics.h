@@ -112,40 +112,7 @@ static inline vf vrpm_min_for_centered_hover(const Paramsv* p) {
     return __builtin_elementwise_min(__builtin_elementwise_max(min_rpm, (vf){0}), p->max_rpm);
 }
 
-// setup
-
-static inline Paramsv* init_physics(int num_agents) {
-    int num_blocks = (num_agents + DRONE_LANES - 1) / DRONE_LANES;
-    Paramsv* params_soa = (Paramsv*)aligned_alloc(32, num_blocks * sizeof(Paramsv));
-    memset(params_soa, 0, num_blocks * sizeof(Paramsv));
-    return params_soa;
-}
-
-static inline void store_params(Paramsv* params_soa, int idx, const Params* pa) {
-    Paramsv* p = &params_soa[idx / DRONE_LANES];
-    int l = idx % DRONE_LANES;
-    p->mass[l] = pa->mass;
-    p->ixx[l] = pa->ixx;
-    p->iyy[l] = pa->iyy;
-    p->izz[l] = pa->izz;
-    p->arm_len[l] = pa->arm_len;
-    p->k_thrust[l] = pa->k_thrust;
-    p->k_ang_damp[l] = pa->k_ang_damp;
-    p->k_drag[l] = pa->k_drag;
-    p->b_drag[l] = pa->b_drag;
-    p->gravity[l] = pa->gravity;
-    p->max_rpm[l] = pa->max_rpm;
-    p->max_vel[l] = pa->max_vel;
-    p->max_omega[l] = pa->max_omega;
-    p->k_mot[l] = pa->k_mot;
-    p->inv_mass[l] = pa->inv_mass;
-    p->inv_ixx[l] = pa->inv_ixx;
-    p->inv_iyy[l] = pa->inv_iyy;
-    p->inv_izz[l] = pa->inv_izz;
-    p->inv_k_mot[l] = pa->inv_k_mot;
-}
-
-// physics
+// dynamics
 
 static inline void compute_derivatives(Statev* state, const Paramsv* params, const vf* target_rpms,
                                        StateDerivativev* d) {
@@ -251,80 +218,130 @@ static inline void rk4_step(Statev* state, const Paramsv* params, const vf* targ
     state->omega.y += (k1.w_dot.y + 2.0f * k2.w_dot.y + 2.0f * k3.w_dot.y + k4.w_dot.y) * dt6;
     state->omega.z += (k1.w_dot.z + 2.0f * k2.w_dot.z + 2.0f * k3.w_dot.z + k4.w_dot.z) * dt6;
 
-    for (int i = 0; i < 4; i++)
-        state->rpms[i] +=
-            (k1.rpm_dot[i] + 2.0f * k2.rpm_dot[i] + 2.0f * k3.rpm_dot[i] + k4.rpm_dot[i]) * dt6;
+    for (int i = 0; i < 4; i++) {
+        state->rpms[i] += (k1.rpm_dot[i] + 2.0f * k2.rpm_dot[i] + 2.0f * k3.rpm_dot[i] + k4.rpm_dot[i]) * dt6;
+    }
 
     vquat_normalize(&state->quat);
 }
 
-// pack / unpack
+// soa access
 
 static inline void set3(Vec3v* v, int l, Vec3 a) { v->x[l] = a.x; v->y[l] = a.y; v->z[l] = a.z; }
 static inline Vec3 get3(const Vec3v* v, int l) { return (Vec3){v->x[l], v->y[l], v->z[l]}; }
 static inline void setq(Quatv* q, int l, Quat a) { q->w[l] = a.w; q->x[l] = a.x; q->y[l] = a.y; q->z[l] = a.z; }
 static inline Quat getq(const Quatv* q, int l) { return (Quat){q->w[l], q->x[l], q->y[l], q->z[l]}; }
 
-static inline void pack_block(Drone* agents, float* act, int base, int lanes, Statev* s,
-                              vf actions[4]) {
-    for (int l = 0; l < DRONE_LANES; l++) {
-        int idx = base + (l < lanes ? l : 0);
-        State* st = &agents[idx].state;
-        float* a = &act[4 * idx];
-        clamp4(a, -1.0f, 1.0f);
-        for (int k = 0; k < 4; k++) actions[k][l] = a[k];
+// engine
 
-        set3(&s->pos, l, st->pos);
-        set3(&s->vel, l, st->vel);
-        set3(&s->omega, l, st->omega);
-        setq(&s->quat, l, st->quat);
-        for (int k = 0; k < 4; k++) s->rpms[k][l] = st->rpms[k];
-    }
+typedef struct {
+    int num_drones;
+    Statev* state;
+    Paramsv* params;
+    int integrator;
+} Physics;
+
+static inline void physics_init(Physics* phys, int num_drones, int integrator) {
+    int num_blocks = (num_drones + DRONE_LANES - 1) / DRONE_LANES;
+    phys->num_drones = num_drones;
+    phys->integrator = integrator;
+
+    phys->params = (Paramsv*)aligned_alloc(32, num_blocks * sizeof(Paramsv));
+    memset(phys->params, 0, num_blocks * sizeof(Paramsv));
+
+    phys->state = (Statev*)aligned_alloc(32, num_blocks * sizeof(Statev));
+    memset(phys->state, 0, num_blocks * sizeof(Statev));
+    for (int b = 0; b < num_blocks; b++)
+        for (int l = 0; l < DRONE_LANES; l++)
+            phys->state[b].quat.w[l] = 1.0f;
 }
 
-// Scatter the lane vectors back into the agents (real lanes only).
-static inline void unpack_block(Drone* agents, int base, int lanes, const Statev* s) {
-    for (int l = 0; l < lanes; l++) {
-        State* st = &agents[base + l].state;
-        st->pos = get3(&s->pos, l);
-        st->vel = get3(&s->vel, l);
-        st->omega = get3(&s->omega, l);
-        st->quat = getq(&s->quat, l);
-        for (int k = 0; k < 4; k++) st->rpms[k] = s->rpms[k][l];
-    }
+static inline void physics_close(Physics* phys) {
+    free(phys->params);
+    free(phys->state);
 }
 
-// step
+static inline void physics_set_drone(Physics* phys, int i, const Params* p, const State* st) {
+    int b = i / DRONE_LANES;
+    int l = i % DRONE_LANES;
 
-static inline void move_drones(Drone* agents, float* act, const Paramsv* params_soa,
-                               int num_agents, int integrator) {
-    for (int base = 0; base < num_agents; base += DRONE_LANES) {
-        int lanes = num_agents - base;
+    Paramsv* pv = &phys->params[b];
+    pv->mass[l] = p->mass;
+    pv->ixx[l] = p->ixx;
+    pv->iyy[l] = p->iyy;
+    pv->izz[l] = p->izz;
+    pv->arm_len[l] = p->arm_len;
+    pv->k_thrust[l] = p->k_thrust;
+    pv->k_ang_damp[l] = p->k_ang_damp;
+    pv->k_drag[l] = p->k_drag;
+    pv->b_drag[l] = p->b_drag;
+    pv->gravity[l] = p->gravity;
+    pv->max_rpm[l] = p->max_rpm;
+    pv->max_vel[l] = p->max_vel;
+    pv->max_omega[l] = p->max_omega;
+    pv->k_mot[l] = p->k_mot;
+    pv->inv_mass[l] = p->inv_mass;
+    pv->inv_ixx[l] = p->inv_ixx;
+    pv->inv_iyy[l] = p->inv_iyy;
+    pv->inv_izz[l] = p->inv_izz;
+    pv->inv_k_mot[l] = p->inv_k_mot;
+
+    Statev* sv = &phys->state[b];
+    set3(&sv->pos, l, st->pos);
+    set3(&sv->vel, l, st->vel);
+    setq(&sv->quat, l, st->quat);
+    set3(&sv->omega, l, st->omega);
+    for (int k = 0; k < 4; k++) sv->rpms[k][l] = st->rpms[k];
+}
+
+static inline State physics_get_state(const Physics* phys, int i) {
+    const Statev* sv = &phys->state[i / DRONE_LANES];
+    int l = i % DRONE_LANES;
+    State st;
+    st.pos = get3(&sv->pos, l);
+    st.vel = get3(&sv->vel, l);
+    st.quat = getq(&sv->quat, l);
+    st.omega = get3(&sv->omega, l);
+    for (int k = 0; k < 4; k++) st.rpms[k] = sv->rpms[k][l];
+    return st;
+}
+
+static inline void physics_step(Physics* phys, float* actions) {
+    for (int base = 0; base < phys->num_drones; base += DRONE_LANES) {
+        int lanes = phys->num_drones - base;
         if (lanes > DRONE_LANES) lanes = DRONE_LANES;
 
-        Statev s;
-        vf actions[4];
-        pack_block(agents, act, base, lanes, &s, actions);
-        const Paramsv* p = &params_soa[base / DRONE_LANES];
+        Statev* s = &phys->state[base / DRONE_LANES];
+        const Paramsv* p = &phys->params[base / DRONE_LANES];
+
+        vf act[4];
+        for (int l = 0; l < DRONE_LANES; l++) {
+            int idx = base + (l < lanes ? l : 0);
+            float* a = &actions[4 * idx];
+            clamp4(a, -1.0f, 1.0f);
+            for (int k = 0; k < 4; k++) act[k][l] = a[k];
+        }
 
         vf min_rpm = vrpm_min_for_centered_hover(p);
         vf target_rpms[4];
         for (int k = 0; k < 4; k++) {
-            vf u = (actions[k] + 1.0f) * 0.5f;
+            vf u = (act[k] + 1.0f) * 0.5f;
             target_rpms[k] = min_rpm + u * (p->max_rpm - min_rpm);
         }
 
         for (int sub = 0; sub < ACTION_SUBSTEPS; sub++) {
-            if (integrator == INTEGRATOR_RK2)
-                rk2_step(&s, p, target_rpms, DT);
-            else
-                rk4_step(&s, p, target_rpms, DT);
-            vclamp3(&s.vel, -p->max_vel, p->max_vel);
-            vclamp3(&s.omega, -p->max_omega, p->max_omega);
-            for (int k = 0; k < 4; k++)
-                s.rpms[k] = vclampf(s.rpms[k], (vf){0}, p->max_rpm);
+            if (phys->integrator == INTEGRATOR_RK2) {
+                rk2_step(s, p, target_rpms, DT);
+            } else {
+                rk4_step(s, p, target_rpms, DT);
+            }
+        
+            vclamp3(&s->vel, -p->max_vel, p->max_vel);
+            vclamp3(&s->omega, -p->max_omega, p->max_omega);
+        
+            for (int k = 0; k < 4; k++) {
+                s->rpms[k] = vclampf(s->rpms[k], (vf){0}, p->max_rpm);
+            }
         }
-
-        unpack_block(agents, base, lanes, &s);
     }
 }

@@ -13,8 +13,6 @@
 #include "dronelib.h"
 #include "physics.h"
 
-#define HORIZON 2048
-
 typedef enum {
     TASK_HOVER = 0,
     TASK_RACE = 1,
@@ -58,23 +56,22 @@ struct DroneEnv {
     int num_agents;
     unsigned int rng;
 
-    int tick;
     Drone* agents;
-    Paramsv* params_soa;
+    Physics physics;
     Log log;
-
+    
     TaskType task;
     void* task_config;
     void* task_state;
-
+    
     // shared reward shaping
     float alpha_vel;
     float alpha_omega;
     float alpha_action;
-
+    
     // domain randomisation
     float dr;
-
+    
     // physics integrator
     int integrator;
 
@@ -83,31 +80,14 @@ struct DroneEnv {
 
 #include "tasklib.h"
 
-void compute_observations(DroneEnv* env) {
-    bool is_race = (env->task == TASK_RACE);
-    for (int i = 0; i < env->num_agents; i++)
-        compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE, is_race);
-}
-
-void reset_agent_base(DroneEnv* env, int idx) {
-    Drone* agent = &env->agents[idx];
-    Target* target = agent->target;
-    memset(agent, 0, sizeof(Drone));
-    agent->target = target;
-
-    init_drone(agent, &env->rng, env->dr);
-    store_params(env->params_soa, idx, &agent->params);
-}
-
 void init(DroneEnv* env) {
     env->agents = (Drone*)calloc(env->num_agents, sizeof(Drone));
     for (int i = 0; i < env->num_agents; i++)
         env->agents[i].target = (Target*)calloc(1, sizeof(Target));
 
-    env->params_soa = init_physics(env->num_agents);
+    physics_init(&env->physics, env->num_agents, env->integrator);
 
     env->log = (Log){0};
-    env->tick = 0;
 }
 
 void add_log(DroneEnv* env, int idx, StepCache* cache) {
@@ -119,31 +99,44 @@ void add_log(DroneEnv* env, int idx, StepCache* cache) {
     task_log(env, agent, idx, &env->log, cache);
 }
 
+void reset_agent(DroneEnv* env, int idx) {
+    Drone* agent = &env->agents[idx];
+    Target* target = agent->target;
+    memset(agent, 0, sizeof(Drone));
+    agent->target = target;
+
+    init_drone(agent, &env->rng, env->dr);
+    task_reset(env, agent, idx);
+    physics_set_drone(&env->physics, idx, &agent->params, &agent->state);
+    agent->prev_pos = agent->state.pos;
+}
+
+void compute_observations(DroneEnv* env) {
+    bool is_race = (env->task == TASK_RACE);
+    for (int i = 0; i < env->num_agents; i++)
+        compute_drone_observations(&env->agents[i], env->observations + i * DRONE_OBS_SIZE, is_race);
+}
+
 void c_reset(DroneEnv* env) {
     task_env_reset(env);
 
-    for (int i = 0; i < env->num_agents; i++) {
-        Drone* agent = &env->agents[i];
-        reset_agent_base(env, i);
-        task_reset(env, agent, i);
-        agent->prev_pos = agent->state.pos;
-    }
+    for (int i = 0; i < env->num_agents; i++)
+        reset_agent(env, i);
 
     compute_observations(env);
 }
 
 void c_step(DroneEnv* env) {
-    env->tick = (env->tick + 1) % HORIZON;
-
     for (int i = 0; i < env->num_agents; i++)
         env->agents[i].prev_pos = env->agents[i].state.pos;
 
-    move_drones(env->agents, env->actions, env->params_soa, env->num_agents, env->integrator);
+    physics_step(&env->physics, env->actions);
 
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
         agent->episode_length++;
 
+        agent->state = physics_get_state(&env->physics, i);
         StepCache cache = {
             .prev_dist = norm3(sub3(agent->target->pos, agent->prev_pos)),
             .dist = norm3(sub3(agent->target->pos, agent->state.pos)),
@@ -174,9 +167,7 @@ void c_step(DroneEnv* env) {
 
         if (done) {
             add_log(env, i, &cache);
-            reset_agent_base(env, i);
-            task_reset(env, agent, i);
-            agent->prev_pos = agent->state.pos;
+            reset_agent(env, i);
         }
     }
 
@@ -191,7 +182,7 @@ void c_close(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++)
         free(env->agents[i].target);
     free(env->agents);
-    free(env->params_soa);
+    physics_close(&env->physics);
 
     if (env->client != NULL) c_close_client(env->client);
 }
