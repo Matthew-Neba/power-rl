@@ -39,6 +39,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->alpha_action = dict_get(kwargs, "alpha_action")->value;
     env->dr = dict_get(kwargs, "dr")->value;
 
+    env->integrator = (int)dict_get(kwargs, "use_rk2")->value;
+
     task_fracs[TASK_HOVER] = dict_get(kwargs, "hover_frac")->value;
     task_fracs[TASK_RACE] = dict_get(kwargs, "race_frac")->value;
     task_fracs[TASK_SPHERE] = dict_get(kwargs, "sphere_frac")->value;

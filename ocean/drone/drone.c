@@ -7,6 +7,7 @@
 #include <emscripten.h>
 #endif
 
+// demo config
 static void setup_task(DroneEnv* env, int task) {
     task_close(env);
     env->task = task;

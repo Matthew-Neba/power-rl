@@ -10,6 +10,11 @@
 
 // types
 
+typedef enum {
+    INTEGRATOR_RK4 = 0,
+    INTEGRATOR_RK2 = 1,
+} IntegratorType;
+
 typedef float vf __attribute__((vector_size(sizeof(float) * DRONE_LANES)));
 
 typedef struct {
@@ -205,6 +210,16 @@ static inline void step(Statev* s, StateDerivativev* d, float dt, Statev* out) {
     vquat_normalize(&out->quat);
 }
 
+static inline void rk2_step(Statev* state, const Paramsv* params, const vf* target_rpms, float dt) {
+    StateDerivativev k1, k2;
+    Statev mid;
+
+    compute_derivatives(state, params, target_rpms, &k1);
+    step(state, &k1, dt * 0.5f, &mid);
+    compute_derivatives(&mid, params, target_rpms, &k2);
+    step(state, &k2, dt, state);
+}
+
 static inline void rk4_step(Statev* state, const Paramsv* params, const vf* target_rpms, float dt) {
     StateDerivativev k1, k2, k3, k4;
     Statev tmp;
@@ -282,7 +297,7 @@ static inline void unpack_block(Drone* agents, int base, int lanes, const Statev
 // step
 
 static inline void move_drones(Drone* agents, float* act, const Paramsv* params_soa,
-                               int num_agents) {
+                               int num_agents, int integrator) {
     for (int base = 0; base < num_agents; base += DRONE_LANES) {
         int lanes = num_agents - base;
         if (lanes > DRONE_LANES) lanes = DRONE_LANES;
@@ -300,7 +315,10 @@ static inline void move_drones(Drone* agents, float* act, const Paramsv* params_
         }
 
         for (int sub = 0; sub < ACTION_SUBSTEPS; sub++) {
-            rk4_step(&s, p, target_rpms, DT);
+            if (integrator == INTEGRATOR_RK2)
+                rk2_step(&s, p, target_rpms, DT);
+            else
+                rk4_step(&s, p, target_rpms, DT);
             vclamp3(&s.vel, -p->max_vel, p->max_vel);
             vclamp3(&s.omega, -p->max_omega, p->max_omega);
             for (int k = 0; k < 4; k++)

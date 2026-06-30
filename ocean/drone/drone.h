@@ -75,6 +75,9 @@ struct DroneEnv {
     // domain randomisation
     float dr;
 
+    // physics integrator
+    int integrator;
+
     Client* client;
 };
 
@@ -135,7 +138,7 @@ void c_step(DroneEnv* env) {
     for (int i = 0; i < env->num_agents; i++)
         env->agents[i].prev_pos = env->agents[i].state.pos;
 
-    move_drones(env->agents, env->actions, env->params_soa, env->num_agents);
+    move_drones(env->agents, env->actions, env->params_soa, env->num_agents, env->integrator);
 
     for (int i = 0; i < env->num_agents; i++) {
         Drone* agent = &env->agents[i];
