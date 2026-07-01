@@ -1,12 +1,52 @@
 #include "drone.h"
 #include "puffernet.h"
 #include "render.h"
-#include "task_hover.h"
 #include <time.h>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
+
+// demo config
+static void setup_task(DroneEnv* env, int task) {
+    task_close(env);
+    env->task = task;
+
+    if (task == TASK_RACE) {
+        RaceConfig* cfg = (RaceConfig*)calloc(1, sizeof(RaceConfig));
+        cfg->max_rings = 10;
+        cfg->horizon = 2048;
+        env->task_config = cfg;
+    } else {
+        HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
+        cfg->target_dist = 5.0f;
+        cfg->sphere_radius = 4.0f;
+        cfg->horizon = 1024;
+        env->task_config = cfg;
+    }
+    task_init(env);
+    c_reset(env);
+}
+
+// we render at 60Hz, but drone frames are 100Hz
+static void step_realtime(DroneEnv* env, PufferNet* net) {
+    static double accum = 0.0;
+    accum += GetFrameTime();
+    if (accum > 0.25) accum = 0.25;
+    while (accum >= ACTION_DT) {
+        forward_puffernet(net, env->observations, env->actions);
+        c_step(env);
+        accum -= ACTION_DT;
+    }
+}
+
+static bool tab_swap_pressed(void) {
+    static bool prev_down = false;
+    bool down = IsKeyDown(KEY_TAB);
+    bool edge = down && !prev_down;
+    prev_down = down;
+    return edge;
+}
 
 #ifdef __EMSCRIPTEN__
 typedef struct {
@@ -16,18 +56,20 @@ typedef struct {
 
 void emscriptenStep(void* e) {
     WebRenderArgs* args = (WebRenderArgs*)e;
-    forward_puffernet(args->net, args->env->observations, args->env->actions);
-    c_step(args->env);
+    if (tab_swap_pressed()) setup_task(args->env, (args->env->task + 1) % NUM_TASKS);
+    step_realtime(args->env, args->net);
     c_render(args->env);
 }
 #endif
 
-int main() {
+int main(int argc, char** argv) {
     srand(time(NULL));
 
+    int task = argc > 1 ? atoi(argv[1]) : TASK_RACE;
+
     DroneEnv* env = calloc(1, sizeof(DroneEnv));
-    env->num_agents = 16;
-    env->task = &TASK_HOVER;
+    env->num_agents = 64;
+    env->dr = 0.05f;  // static 5% flat DR for the demo
 
     env->observations = (float*)calloc(env->num_agents * DRONE_OBS_SIZE, sizeof(float));
     env->actions = (float*)calloc(env->num_agents * 4, sizeof(float));
@@ -35,26 +77,11 @@ int main() {
     env->terminals = (float*)calloc(env->num_agents, sizeof(float));
 
     init(env);
-
-    // task config — hardcoded for demo
-    HoverConfig* cfg = (HoverConfig*)calloc(1, sizeof(HoverConfig));
-    cfg->target_dist = 5.0f;
-    cfg->hover_dist = 0.1f;
-    cfg->hover_omega = 0.1f;
-    cfg->hover_vel = 0.1f;
-    cfg->alpha_dist = 0.782192f;
-    cfg->alpha_hover = 0.071445f;
-    cfg->alpha_shaping = 3.9754f;
-    cfg->alpha_omega = 0.00135588f;
-    env->task_config = cfg;
-
-    env->task->init(env);
-
-    c_reset(env);
+    setup_task(env, task);
 
     Weights* weights = load_weights("resources/drone/drone_weights.bin");
     int logit_sizes[4] = {1, 1, 1, 1};
-    PufferNet* net = make_puffernet(weights, env->num_agents, DRONE_OBS_SIZE, 64, 1, logit_sizes, 4);
+    PufferNet* net = make_puffernet(weights, env->num_agents, DRONE_OBS_SIZE, 64, 2, logit_sizes, 4);
 
 #ifdef __EMSCRIPTEN__
     WebRenderArgs args = {.env = env, .net = net};
@@ -64,8 +91,8 @@ int main() {
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
-        forward_puffernet(net, env->observations, env->actions);
-        c_step(env);
+        if (tab_swap_pressed()) setup_task(env, (env->task + 1) % NUM_TASKS);
+        step_realtime(env, net);
         c_render(env);
     }
 
