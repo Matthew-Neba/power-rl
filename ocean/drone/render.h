@@ -447,7 +447,7 @@ void c_render(DroneEnv* env) {
     handle_drone_selection(client, env->num_agents, dt);
     handle_fps_control(client, dt);
 
-    if (IsKeyPressed(KEY_TAB)) {
+    if (IsKeyPressed(KEY_I)) {
         client->inspect_mode = !client->inspect_mode;
         // When entering inspect mode, turn on follow mode by default
         if (client->inspect_mode) {
@@ -640,9 +640,9 @@ void c_render(DroneEnv* env) {
     y += 18;
     DrawText("Mouse wheel: Zoom in/out", 10, y, 16, LIGHTGRAY);
     y += 18;
-    DrawText("Space: Change task", 10, y, 16, LIGHTGRAY);
+    DrawText("Tab: Change task", 10, y, 16, LIGHTGRAY);
     y += 18;
-    DrawText(TextFormat("Tab: Inspect mode [%s]", inspect_mode ? "ON" : "OFF"), 10, y, 16,
+    DrawText(TextFormat("I: Inspect mode [%s]", inspect_mode ? "ON" : "OFF"), 10, y, 16,
              inspect_mode ? PUFF_GREEN : LIGHTGRAY);
 
     EndDrawing();

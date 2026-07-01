@@ -48,7 +48,7 @@ typedef struct {
 
 void emscriptenStep(void* e) {
     WebRenderArgs* args = (WebRenderArgs*)e;
-    if (IsKeyPressed(KEY_SPACE)) {
+    if (IsKeyPressed(KEY_TAB)) {
         setup_task(args->env, (args->env->task + 1) % NUM_TASKS);
     }
     step_realtime(args->env, args->net);
@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
-        if (IsKeyPressed(KEY_SPACE)) setup_task(env, (env->task + 1) % NUM_TASKS);
+        if (IsKeyPressed(KEY_TAB)) setup_task(env, (env->task + 1) % NUM_TASKS);
         step_realtime(env, net);
         c_render(env);
     }
