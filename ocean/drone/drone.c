@@ -40,6 +40,14 @@ static void step_realtime(DroneEnv* env, PufferNet* net) {
     }
 }
 
+static bool tab_swap_pressed(void) {
+    static bool prev_down = false;
+    bool down = IsKeyDown(KEY_TAB);
+    bool edge = down && !prev_down;
+    prev_down = down;
+    return edge;
+}
+
 #ifdef __EMSCRIPTEN__
 typedef struct {
     DroneEnv* env;
@@ -48,9 +56,7 @@ typedef struct {
 
 void emscriptenStep(void* e) {
     WebRenderArgs* args = (WebRenderArgs*)e;
-    if (IsKeyPressed(KEY_TAB)) {
-        setup_task(args->env, (args->env->task + 1) % NUM_TASKS);
-    }
+    if (tab_swap_pressed()) setup_task(args->env, (args->env->task + 1) % NUM_TASKS);
     step_realtime(args->env, args->net);
     c_render(args->env);
 }
@@ -85,7 +91,7 @@ int main(int argc, char** argv) {
     SetTargetFPS(60);
 
     while (!WindowShouldClose()) {
-        if (IsKeyPressed(KEY_TAB)) setup_task(env, (env->task + 1) % NUM_TASKS);
+        if (tab_swap_pressed()) setup_task(env, (env->task + 1) % NUM_TASKS);
         step_realtime(env, net);
         c_render(env);
     }
