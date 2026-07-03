@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <string.h>
 // For the trajectory recorder we want full obs so the log is useful.
+#define NETHACK_USE_CHARS   1
 #define NETHACK_USE_BLSTATS 1
 #define NETHACK_USE_MESSAGE 1
 #define NETHACK_USE_COLORS  1
@@ -278,7 +279,7 @@ int main(int argc, char** argv) {
         c_close(&env);
         free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
     } else {
-        int max_steps = (argc >= 2) ? atoi(argv[1]) : 50;
+        int max_steps = (argc >= 2) ? atoi(argv[1]) : 100000;
         run_interactive(max_steps);
     }
     return 0;

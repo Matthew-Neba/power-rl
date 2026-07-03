@@ -155,23 +155,31 @@ isn't already.
 
 ---
 
-## Observation (compile-time selectable, default = chars only)
+## Observation (compile-time selectable, default = glyph crop + blstats)
 
 Each enabled field reserves a slice of a single flat `ByteTensor`
-observation buffer. Override defaults with `-DNETHACK_USE_<FIELD>=1` in
+observation buffer. Override defaults with `-DNETHACK_USE_<FIELD>=0/1` in
 build.sh's `EXTRA_CFLAGS`.
 
 | Field        | Default | Bytes/element | Total (one env)              |
 |--------------|--------:|--------------:|------------------------------|
-| `chars`      |    1    | 1             | 1,659                        |
+| `chars`      |    0    | 1             | 1,659                        |
 | `colors`     |    0    | 1             | 1,659                        |
 | `specials`   |    0    | 1             | 1,659                        |
-| `glyphs`     |    0    | 2 (le i16)    | 3,318                        |
-| `blstats`    |    0    | 4 (i32, trunc)| 108                          |
+| `glyphs`     |    1    | 2 (le i16)    | 882 (21x21 crop), 3,318 full |
+| `blstats`    |    1    | 4 (i32, trunc)| 108                          |
 | `message`    |    0    | 1             | 256                          |
 | `inv`        |    0    | 1 (letters+oclasses) | 110                   |
 
-`OBS_SIZE` is the sum of enabled fields.
+`OBS_SIZE` is the sum of enabled fields (default 990).
+
+Glyphs are packed as a `NETHACK_GLYPH_CROP`^2 (default 21x21) egocentric
+window centered on the agent, padded with `NO_GLYPH` (5976) outside the
+map. Set `-DNETHACK_GLYPH_CROP=0` for the full 21x79 grid. The default
+layout is what the custom CUDA encoder in `src/ocean.cu` expects
+(glyph embedding -> 2 convs, blstats normalized/expanded -> linear,
+concat -> projection); it is gradient-checked by
+`tests/test_nethack_encoder.py`.
 
 ## Action space (18 actions)
 

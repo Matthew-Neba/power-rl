@@ -11,6 +11,8 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <dirent.h>
+#include <signal.h>
 #include "profile.h"
 
 #ifndef SYS_memfd_create
@@ -82,7 +84,8 @@ extern void       nle_fr_destroy(void*);
 // ---------------------------------------------------------------------------
 // Compile-time observation selection
 // ---------------------------------------------------------------------------
-// Override any of these with -DNETHACK_USE_<FIELD>=0/1. Defaults: chars only.
+// Override any of these with -DNETHACK_USE_<FIELD>=0/1. Defaults: glyph crop
+// + blstats (what the custom CUDA encoder in src/ocean.cu expects).
 // Each enabled field reserves its own slice of the ByteTensor observation
 // buffer; disabled fields are not allocated, not bound, and NLE does not
 // write to them (NLE's fill_obs guards every field with `if (ptr) ...`).
@@ -91,7 +94,7 @@ extern void       nle_fr_destroy(void*);
 //   chars     uint8     1
 //   colors    uint8     1
 //   specials  uint8     1
-//   glyphs    int16     2  (packed as little-endian)
+//   glyphs    int16     2  (packed as little-endian; cropped, see below)
 //   blstats   int64     4  (truncated to int32 to save space)
 //   message   uint8     1
 //   inv_letters / inv_oclasses  uint8  1  (size NLE_INVENTORY_SIZE)
@@ -101,7 +104,7 @@ extern void       nle_fr_destroy(void*);
 // observation a flat ByteTensor.
 
 #ifndef NETHACK_USE_CHARS
-#define NETHACK_USE_CHARS    1
+#define NETHACK_USE_CHARS    0
 #endif
 #ifndef NETHACK_USE_COLORS
 #define NETHACK_USE_COLORS   0
@@ -110,16 +113,29 @@ extern void       nle_fr_destroy(void*);
 #define NETHACK_USE_SPECIALS 0
 #endif
 #ifndef NETHACK_USE_GLYPHS
-#define NETHACK_USE_GLYPHS   0
+#define NETHACK_USE_GLYPHS   1
 #endif
 #ifndef NETHACK_USE_BLSTATS
-#define NETHACK_USE_BLSTATS  0
+#define NETHACK_USE_BLSTATS  1
 #endif
 #ifndef NETHACK_USE_MESSAGE
 #define NETHACK_USE_MESSAGE  0
 #endif
 #ifndef NETHACK_USE_INV
 #define NETHACK_USE_INV      0
+#endif
+
+// Egocentric glyph crop: odd side length of a square window centered on the
+// agent, padded with NETHACK_PAD_GLYPH outside the map. 0 = full 21x79 grid.
+#ifndef NETHACK_GLYPH_CROP
+#define NETHACK_GLYPH_CROP 21
+#endif
+// NO_GLYPH == MAX_GLYPH == 5976 in NetHack 3.6.6
+#define NETHACK_PAD_GLYPH 5976
+#if NETHACK_GLYPH_CROP > 0
+#define NETHACK_GLYPH_GRID (NETHACK_GLYPH_CROP * NETHACK_GLYPH_CROP)
+#else
+#define NETHACK_GLYPH_GRID NH_GRID
 #endif
 
 // Auto-dismiss prompts (welcome screen, --More--, yes/no, getline) before
@@ -161,7 +177,7 @@ extern void       nle_fr_destroy(void*);
 #define NETHACK_SZ_CHARS    (NETHACK_USE_CHARS    * NH_GRID)
 #define NETHACK_SZ_COLORS   (NETHACK_USE_COLORS   * NH_GRID)
 #define NETHACK_SZ_SPECIALS (NETHACK_USE_SPECIALS * NH_GRID)
-#define NETHACK_SZ_GLYPHS   (NETHACK_USE_GLYPHS   * NH_GRID * 2)
+#define NETHACK_SZ_GLYPHS   (NETHACK_USE_GLYPHS   * NETHACK_GLYPH_GRID * 2)
 #define NETHACK_SZ_BLSTATS  (NETHACK_USE_BLSTATS  * NLE_BLSTATS_SIZE * 4)
 #define NETHACK_SZ_MESSAGE  (NETHACK_USE_MESSAGE  * NLE_MESSAGE_SIZE)
 #define NETHACK_SZ_INV      (NETHACK_USE_INV      * NLE_INVENTORY_SIZE * 2)
@@ -378,9 +394,54 @@ static void nethack_touch(const char* path) {
     if (fd >= 0) close(fd);
 }
 
+// Recursive remove, depth-capped (vardir trees are at most base/env/save/files).
+static void nethack_rm_rf(const char* path, int depth) {
+    if (depth > 3) return;
+    DIR* d = opendir(path);
+    if (d) {
+        struct dirent* e;
+        char p[4096];
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
+            if (unlink(p) != 0) nethack_rm_rf(p, depth + 1);
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
+
+// Vardirs live under a per-process parent on tmpfs when available, so
+// NetHack's lock/level file I/O never touches real disk. On first use,
+// parents whose owning pid is gone are swept — a crashed or killed run
+// leaks its vardirs (one per env) and degrades the base dir over time.
+static const char* nethack_vardir_base(void) {
+    static char base[256] = "";
+    if (base[0]) return base;
+    const char* root = access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp";
+    DIR* d = opendir(root);
+    if (d) {
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            long pid = 0;
+            if (sscanf(e->d_name, "nle-run-%ld", &pid) != 1 || pid <= 0) continue;
+            if (pid == (long)getpid()) continue;
+            if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;  // owner alive
+            char dead[512];
+            snprintf(dead, sizeof(dead), "%s/%s", root, e->d_name);
+            nethack_rm_rf(dead, 0);
+        }
+        closedir(d);
+    }
+    snprintf(base, sizeof(base), "%s/nle-run-%ld", root, (long)getpid());
+    mkdir(base, 0755);
+    return base;
+}
+
 static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t out_cap) {
     PROF_START(vardir);
-    char tmpl[] = "/tmp/nle-XXXXXX";
+    char tmpl[512];
+    snprintf(tmpl, sizeof(tmpl), "%s/env-XXXXXX", nethack_vardir_base());
     char* dir = mkdtemp(tmpl);
     if (dir == NULL) return -1;
     if ((size_t)snprintf(out_buf, out_cap, "%s", dir) >= out_cap) return -1;
@@ -432,13 +493,9 @@ static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t
 
 static void nethack_rm_vardir(const char* dir) {
     if (dir == NULL || dir[0] == '\0') return;
-    char p[4096];
-    const char* files[] = {"nhdat", "perm", "record", "logfile", "xlogfile", "paniclog", "save"};
-    for (size_t i = 0; i < sizeof(files)/sizeof(files[0]); i++) {
-        snprintf(p, sizeof(p), "%s/%s", dir, files[i]);
-        if (i == 6) rmdir(p); else unlink(p);
-    }
-    rmdir(dir);
+    // Full tree remove: NetHack drops level/lock files beyond the fixed set
+    // we create, and any leftover blocks the rmdir (the old /tmp leak).
+    nethack_rm_rf(dir, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +555,18 @@ static inline long nethack_current_time(const Nethack* env) {
     return env->blstats[NLE_BL_TIME];
 #else
     return env->hook_blstats[NLE_BL_TIME];
+#endif
+}
+
+// Agent position, 0-based and aligned with the glyph grid (NLE writes
+// blstats x as u.ux-1, y as u.uy).
+static inline void nethack_agent_pos(const Nethack* env, int* x, int* y) {
+#if NETHACK_USE_BLSTATS
+    *x = (int)env->blstats[NLE_BL_X];
+    *y = (int)env->blstats[NLE_BL_Y];
+#else
+    *x = (int)env->hook_blstats[NLE_BL_X];
+    *y = (int)env->hook_blstats[NLE_BL_Y];
 #endif
 }
 
@@ -615,7 +684,30 @@ static void nethack_pack_obs(Nethack* env) {
     memcpy(o + NETHACK_OFF_SPECIALS, env->specials, NETHACK_SZ_SPECIALS);
 #endif
 #if NETHACK_USE_GLYPHS
+#if NETHACK_GLYPH_CROP > 0
+    {
+        int cx, cy;
+        nethack_agent_pos(env, &cx, &cy);
+        int half = NETHACK_GLYPH_CROP / 2;
+        short* dst = (short*)(o + NETHACK_OFF_GLYPHS);
+        for (int r = 0; r < NETHACK_GLYPH_CROP; r++) {
+            short* row = dst + r * NETHACK_GLYPH_CROP;
+            int gy = cy - half + r;
+            if (gy < 0 || gy >= NH_ROWS) {
+                for (int c = 0; c < NETHACK_GLYPH_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
+                continue;
+            }
+            int gx0 = cx - half;
+            int c0 = gx0 < 0 ? -gx0 : 0;
+            int c1 = gx0 + NETHACK_GLYPH_CROP > NH_COLS ? NH_COLS - gx0 : NETHACK_GLYPH_CROP;
+            for (int c = 0; c < c0; c++) row[c] = NETHACK_PAD_GLYPH;
+            memcpy(row + c0, env->glyphs + gy * NH_COLS + gx0 + c0, (size_t)(c1 - c0) * sizeof(short));
+            for (int c = c1; c < NETHACK_GLYPH_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
+        }
+    }
+#else
     memcpy(o + NETHACK_OFF_GLYPHS, env->glyphs, NETHACK_SZ_GLYPHS);
+#endif
 #endif
 #if NETHACK_USE_BLSTATS
     // Pack 27 longs as 27 int32s (truncate; NetHack stat values fit in i32).

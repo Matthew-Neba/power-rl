@@ -1,4 +1,4 @@
-// NMMO3 CUDA encoder: multihot, cuDNN conv, embedding, concat, projection
+// Custom CUDA encoders for ocean envs (nmmo3, nethack).
 // Included by pufferlib.cu — requires precision_t, PrecisionTensor, Allocator, puf_mm, etc.
 
 #include "cudnn_conv2d.cu"
@@ -570,6 +570,401 @@ static void* nmmo3_encoder_create_weights(void* self) {
 static void nmmo3_encoder_free_weights(void* weights) { free(weights); }
 static void nmmo3_encoder_free_activations(void* activations) { free(activations); }
 
+// ---- Nethack constants ----
+// Obs layout (must match ocean/nethack/nethack.h defaults):
+//   [0, 2*NH_GRID)  glyphs, int16 LE, NETHACK_GLYPH_CROP^2 egocentric window
+//   [2*NH_GRID, +4*NH_BL_RAW)  blstats, int32 LE
+
+static constexpr int NH_MAP = 21;                  // NETHACK_GLYPH_CROP
+static constexpr int NH_GRID = NH_MAP * NH_MAP;
+static constexpr int NH_GLYPH_VOCAB = 5977;        // MAX_GLYPH + 1 (NetHack 3.6.6)
+static constexpr int NH_EMBED_DIM = 32;
+static constexpr int NH_BL_RAW = 27;               // NLE_BLSTATS_SIZE
+static constexpr int NH_BL_HUNGER = 21, NH_BL_CONDITION = 25;
+static constexpr int NH_BL_FEAT = 25 + 7 + 13;     // scalars + hunger onehot + condition bits
+static constexpr int NH_BL_HID = 64;
+static constexpr int NH_OBS_SIZE = NH_GRID * 2 + NH_BL_RAW * 4;
+static constexpr int NH_C1_IC = NH_EMBED_DIM, NH_C1_OC = 64, NH_C1_K = 5, NH_C1_S = 3;
+static constexpr int NH_C1_OH = 6, NH_C1_OW = 6;
+static constexpr int NH_C2_IC = 64, NH_C2_OC = 64, NH_C2_K = 3, NH_C2_S = 1;
+static constexpr int NH_C2_OH = 4, NH_C2_OW = 4;
+static constexpr int NH_CONV_FLAT = NH_C2_OC * NH_C2_OH * NH_C2_OW;
+static constexpr int NH_CONCAT = NH_CONV_FLAT + NH_BL_HID + NH_BL_FEAT;
+// Fused embed+conv1 table: T[g, tap*OC+oc] = sum_d E[g,d] * W[oc, d, tap].
+// Embedding and conv1 are both linear, so their composition is a per-glyph
+// lookup table rebuilt with one small GEMM whenever the weights change.
+// The 19MB table stays L2-resident; glyph ids become leaves (no input grad).
+static constexpr int NH_TAPS = NH_C1_K * NH_C1_K;
+static constexpr int NH_TROW = NH_TAPS * NH_C1_OC;
+
+// Per-blstat normalization: log1p fields get log1p(max(v,0))*scale, the rest
+// v*scale. Hunger (21) and condition (25) are expanded, not scaled.
+__constant__ float NH_BL_SCALE[NH_BL_RAW] = {
+    1.f/79, 1.f/21,                                  // x, y
+    1.f/25, 1.f/125, 1.f/25, 1.f/25, 1.f/25, 1.f/25, 1.f/25,  // str25 str125 dex con int wis cha
+    0.1f,                                            // score (log)
+    1.f/200, 1.f/200, 1.f/50,                        // hp, hpmax, depth
+    0.1f,                                            // gold (log)
+    1.f/100, 1.f/100, 1.f/10, 1.f/10, 1.f/30,        // ene, enemax, ac, hd, xp level
+    0.1f, 0.1f,                                      // exp points, time (log)
+    0.f,                                             // hunger (expanded)
+    1.f/4, 1.f/10, 1.f/50,                           // cap, dnum, dlevel
+    0.f,                                             // condition (expanded)
+    1.f,                                             // align
+};
+__constant__ int NH_BL_ISLOG[NH_BL_RAW] = {
+    0,0,0,0,0,0,0,0,0, 1, 0,0,0, 1, 0,0,0,0,0, 1,1, 0, 0,0,0, 0, 0,
+};
+
+// ---- Nethack kernels ----
+
+// Decode int16 LE glyph ids into an fp32 index buffer.
+__global__ void nh_decode_kernel(
+    float* __restrict__ idx, const precision_t* __restrict__ obs, int B) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= B * NH_GRID) return;
+    int b = t / NH_GRID, cell = t % NH_GRID;
+    const precision_t* src = obs + (int64_t)b * NH_OBS_SIZE + 2 * cell;
+    int g = (int)to_float(src[0]) | ((int)to_float(src[1]) << 8);
+    idx[t] = (float)max(0, min(g, NH_GLYPH_VOCAB - 1));
+}
+
+// conv1.w (OC, D*TAPS) -> W' (TAPS*OC, D), so T = E @ W'^T lands as
+// T[g, tap*OC+oc] and the gather reads coalesce over oc.
+__global__ void nh_permute_w_kernel(
+    precision_t* __restrict__ wp, const precision_t* __restrict__ w) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= NH_TROW * NH_EMBED_DIM) return;
+    int r = i / NH_EMBED_DIM, d = i % NH_EMBED_DIM;
+    int t = r / NH_C1_OC, oc = r % NH_C1_OC;
+    wp[i] = w[oc * (NH_EMBED_DIM * NH_TAPS) + d * NH_TAPS + t];
+}
+
+__global__ void nh_unpermute_w_kernel(
+    precision_t* __restrict__ wg, const precision_t* __restrict__ wpg) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= NH_TROW * NH_EMBED_DIM) return;
+    int r = i / NH_EMBED_DIM, d = i % NH_EMBED_DIM;
+    int t = r / NH_C1_OC, oc = r % NH_C1_OC;
+    wg[oc * (NH_EMBED_DIM * NH_TAPS) + d * NH_TAPS + t] = wpg[i];
+}
+
+// Fused embed+conv1: out[b,oc,p] = relu(bias[oc] + sum_taps T[g_tap, tap*OC+oc])
+__global__ void nh_fused_conv1_kernel(
+    precision_t* __restrict__ out, const precision_t* __restrict__ T,
+    const precision_t* __restrict__ bias, const float* __restrict__ idx, int B) {
+    constexpr int spatial = NH_C1_OH * NH_C1_OW;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * spatial * NH_C1_OC) return;
+    int oc = i % NH_C1_OC;
+    int p  = (i / NH_C1_OC) % spatial;
+    int b  = i / (NH_C1_OC * spatial);
+    int oh = p / NH_C1_OW, ow = p % NH_C1_OW;
+    const float* gi = idx + (int64_t)b * NH_GRID;
+    float acc = to_float(bias[oc]);
+    #pragma unroll
+    for (int t = 0; t < NH_TAPS; t++) {
+        int cell = (NH_C1_S * oh + t / NH_C1_K) * NH_MAP + NH_C1_S * ow + t % NH_C1_K;
+        acc += to_float(T[(int64_t)(int)gi[cell] * NH_TROW + t * NH_C1_OC + oc]);
+    }
+    out[(int64_t)b * NH_C1_OC * spatial + oc * spatial + p] = from_float(fmaxf(acc, 0.0f));
+}
+
+// Decode int32 LE blstats and expand to NH_BL_FEAT normalized features:
+// 25 scaled scalars, 7 hunger one-hot, 13 condition bits.
+__global__ void nh_blstats_kernel(
+    precision_t* __restrict__ out, const precision_t* __restrict__ obs, int B) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B) return;
+    const precision_t* src = obs + (int64_t)b * NH_OBS_SIZE + 2 * NH_GRID;
+    precision_t* dst = out + (int64_t)b * NH_BL_FEAT;
+    int j = 0, hunger = 0;
+    unsigned int cond = 0;
+    for (int i = 0; i < NH_BL_RAW; i++) {
+        unsigned int u = (unsigned int)(int)to_float(src[4*i])
+                       | ((unsigned int)(int)to_float(src[4*i + 1]) << 8)
+                       | ((unsigned int)(int)to_float(src[4*i + 2]) << 16)
+                       | ((unsigned int)(int)to_float(src[4*i + 3]) << 24);
+        int v = (int)u;
+        if (i == NH_BL_HUNGER) { hunger = max(0, min(v, 6)); continue; }
+        if (i == NH_BL_CONDITION) { cond = u; continue; }
+        float f = NH_BL_ISLOG[i] ? log1pf(fmaxf((float)v, 0.0f)) * NH_BL_SCALE[i]
+                                 : (float)v * NH_BL_SCALE[i];
+        dst[j++] = from_float(f);
+    }
+    for (int h = 0; h < 7; h++) dst[j++] = from_float(h == hunger ? 1.0f : 0.0f);
+    for (int k = 0; k < 13; k++) dst[j++] = from_float((float)((cond >> k) & 1u));
+}
+
+// concat = [conv2 flat (NCHW, contiguous per sample) | bl hidden | bl raw feats]
+__global__ void nh_concat_kernel(
+    precision_t* __restrict__ out, const precision_t* __restrict__ conv_flat,
+    const precision_t* __restrict__ bl_out, const precision_t* __restrict__ bl_feats, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * NH_CONCAT) return;
+    int b = idx / NH_CONCAT, c = idx % NH_CONCAT;
+    precision_t val;
+    if (c < NH_CONV_FLAT)
+        val = conv_flat[b * NH_CONV_FLAT + c];
+    else if (c < NH_CONV_FLAT + NH_BL_HID)
+        val = bl_out[b * NH_BL_HID + (c - NH_CONV_FLAT)];
+    else
+        val = bl_feats[b * NH_BL_FEAT + (c - NH_CONV_FLAT - NH_BL_HID)];
+    out[idx] = val;
+}
+
+// Copy a per-sample slice [offset, offset+n) of a (B, stride) tensor into (B, n).
+__global__ void nh_slice_kernel(
+    precision_t* __restrict__ dst, const precision_t* __restrict__ src,
+    int B, int stride, int offset, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * n) return;
+    dst[idx] = src[(idx / n) * stride + offset + idx % n];
+}
+
+// Fused backward: scatter conv1's output grad into the fp32 table grad.
+// dT[g, tap*OC+oc] += grad[b,oc,p] for every tap under every output position.
+// Chain rule to dE and dW then happens as two small dense GEMMs on dT.
+__global__ void nh_dT_scatter_kernel(
+    float* __restrict__ dT_f, const precision_t* __restrict__ grad,
+    const float* __restrict__ idx, int B) {
+    constexpr int spatial = NH_C1_OH * NH_C1_OW;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * spatial * NH_C1_OC) return;
+    int oc = i % NH_C1_OC;
+    int p  = (i / NH_C1_OC) % spatial;
+    int b  = i / (NH_C1_OC * spatial);
+    float g = to_float(grad[(int64_t)b * NH_C1_OC * spatial + oc * spatial + p]);
+    if (g == 0.0f) return;  // relu-masked: skip all 25 atomics
+    int oh = p / NH_C1_OW, ow = p % NH_C1_OW;
+    const float* gi = idx + (int64_t)b * NH_GRID;
+    #pragma unroll
+    for (int t = 0; t < NH_TAPS; t++) {
+        int cell = (NH_C1_S * oh + t / NH_C1_K) * NH_MAP + NH_C1_S * ow + t % NH_C1_K;
+        atomicAdd(&dT_f[(int64_t)(int)gi[cell] * NH_TROW + t * NH_C1_OC + oc], g);
+    }
+}
+
+// ---- Nethack encoder structs ----
+
+struct NethackEncoderWeights {
+    ConvWeights conv1, conv2;
+    PrecisionTensor embed_w, bl_w, bl_b, proj_w, proj_b;
+    int obs_size, hidden;
+};
+
+struct NethackEncoderActivations {
+    ConvActivations conv1, conv2;
+    PrecisionTensor col2, mm2;             // conv2 im2col scratch
+    PrecisionTensor w_perm, glyph_T;       // fused embed+conv1 table (T = E @ W'^T)
+    PrecisionTensor dT, dw_perm;           // fused backward scratch (train)
+    FloatTensor dT_f;                      // fp32 scatter buffer (train)
+    FloatTensor glyph_idx;                 // decoded glyph ids
+    PrecisionTensor bl_feats, bl_out, bl_grad, concat, out;
+    PrecisionTensor embed_wgrad, bl_wgrad, bl_bgrad, proj_wgrad, proj_bgrad;
+};
+
+static NethackEncoderWeights* nethack_encoder_create(int obs_size, int hidden) {
+    if (obs_size != NH_OBS_SIZE) {
+        fprintf(stderr, "nethack encoder: obs size %d != expected %d "
+            "(env built with different NETHACK_USE_*/NETHACK_GLYPH_CROP flags?)\n",
+            obs_size, NH_OBS_SIZE);
+        exit(1);
+    }
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)calloc(1, sizeof(NethackEncoderWeights));
+    ew->obs_size = obs_size; ew->hidden = hidden;
+    conv_init(&ew->conv1, NH_C1_IC, NH_C1_OC, NH_C1_K, NH_C1_S, NH_MAP, NH_MAP, true);
+    conv_init(&ew->conv2, NH_C2_IC, NH_C2_OC, NH_C2_K, NH_C2_S, NH_C1_OH, NH_C1_OW, false);
+    return ew;
+}
+
+// ---- Nethack encoder interface ----
+
+static PrecisionTensor nethack_encoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
+    NethackEncoderActivations* a = (NethackEncoderActivations*)activations;
+    int B = input.shape[0];
+
+    nh_decode_kernel<<<grid_size(B * NH_GRID), BLOCK_SIZE, 0, stream>>>(
+        a->glyph_idx.data, input.data, B);
+    nh_permute_w_kernel<<<grid_size(NH_TROW * NH_EMBED_DIM), BLOCK_SIZE, 0, stream>>>(
+        a->w_perm.data, ew->conv1.w.data);
+    puf_mm(&ew->embed_w, &a->w_perm, &a->glyph_T, stream);
+    nh_fused_conv1_kernel<<<grid_size(B * NH_C1_OH * NH_C1_OW * NH_C1_OC), BLOCK_SIZE, 0, stream>>>(
+        a->conv1.out.data, a->glyph_T.data, ew->conv1.b.data, a->glyph_idx.data, B);
+    gemm_conv_forward(&ew->conv2.w, &ew->conv2.b, a->conv1.out.data, a->conv2.out.data,
+        a->col2.data, a->mm2.data, B, NH_C2_IC, NH_C1_OH, NH_C1_OW,
+        NH_C2_OC, NH_C2_K, NH_C2_S, NH_C2_OH, NH_C2_OW, false, stream);
+
+    nh_blstats_kernel<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(
+        a->bl_feats.data, input.data, B);
+    puf_mm(&a->bl_feats, &ew->bl_w, &a->bl_out, stream);
+    n3_bias_relu_kernel<<<grid_size(B * NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
+        a->bl_out.data, ew->bl_b.data, B * NH_BL_HID, NH_BL_HID);
+
+    nh_concat_kernel<<<grid_size(B * NH_CONCAT), BLOCK_SIZE, 0, stream>>>(
+        a->concat.data, a->conv2.out.data, a->bl_out.data, a->bl_feats.data, B);
+    puf_mm(&a->concat, &ew->proj_w, &a->out, stream);
+    n3_bias_relu_kernel<<<grid_size(B * ew->hidden), BLOCK_SIZE, 0, stream>>>(
+        a->out.data, ew->proj_b.data, B * ew->hidden, ew->hidden);
+    return a->out;
+}
+
+static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor grad, cudaStream_t stream) {
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
+    NethackEncoderActivations* a = (NethackEncoderActivations*)activations;
+    int B = grad.shape[0], H = ew->hidden;
+
+    n3_relu_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+        grad.data, a->out.data, B * H);
+    bias_grad_kernel<<<H, 256, 0, stream>>>(
+        a->proj_bgrad.data, grad.data, B, H);
+    puf_mm_tn(&grad, &a->concat, &a->proj_wgrad, stream);
+
+    PrecisionTensor grad_concat = {.data = a->concat.data, .shape = {B, NH_CONCAT}};
+    puf_mm_nn(&grad, &ew->proj_w, &grad_concat, stream);
+
+    // Conv branch: concat slice -> conv2 -> conv1 -> embedding map grad
+    nh_slice_kernel<<<grid_size(B * NH_CONV_FLAT), BLOCK_SIZE, 0, stream>>>(
+        a->conv2.grad.data, grad_concat.data, B, NH_CONCAT, 0, NH_CONV_FLAT);
+    n3_conv_bias_grad_nchw<<<NH_C2_OC, 256, 0, stream>>>(
+        a->conv2.bgrad.data, a->conv2.grad.data, B, NH_C2_OC, NH_C2_OH * NH_C2_OW);
+    gemm_conv_backward(&ew->conv2.w, a->conv1.out.data, a->conv2.grad.data,
+        a->conv2.wgrad.data, a->conv1.grad.data,
+        a->col2.data, a->mm2.data, B, NH_C2_IC, NH_C1_OH, NH_C1_OW,
+        NH_C2_OC, NH_C2_K, NH_C2_S, NH_C2_OH, NH_C2_OW, stream);
+    n3_relu_backward_kernel<<<grid_size(B * NH_C1_OC * NH_C1_OH * NH_C1_OW), BLOCK_SIZE, 0, stream>>>(
+        a->conv1.grad.data, a->conv1.out.data, B * NH_C1_OC * NH_C1_OH * NH_C1_OW);
+    n3_conv_bias_grad_nchw<<<NH_C1_OC, 256, 0, stream>>>(
+        a->conv1.bgrad.data, a->conv1.grad.data, B, NH_C1_OC, NH_C1_OH * NH_C1_OW);
+    // Fused conv1+embedding backward: scatter into dT, then split via GEMMs
+    int dT_n = NH_GLYPH_VOCAB * NH_TROW;
+    cudaMemsetAsync(a->dT_f.data, 0, (size_t)dT_n * sizeof(float), stream);
+    nh_dT_scatter_kernel<<<grid_size(B * NH_C1_OH * NH_C1_OW * NH_C1_OC), BLOCK_SIZE, 0, stream>>>(
+        a->dT_f.data, a->conv1.grad.data, a->glyph_idx.data, B);
+    n3_float_to_precision_kernel<<<grid_size(dT_n), BLOCK_SIZE, 0, stream>>>(
+        a->dT.data, a->dT_f.data, dT_n);
+    puf_mm_nn(&a->dT, &a->w_perm, &a->embed_wgrad, stream);   // dE  = dT @ W'
+    puf_mm_tn(&a->dT, &ew->embed_w, &a->dw_perm, stream);     // dW' = dT^T @ E
+    nh_unpermute_w_kernel<<<grid_size(NH_TROW * NH_EMBED_DIM), BLOCK_SIZE, 0, stream>>>(
+        a->conv1.wgrad.data, a->dw_perm.data);
+
+    // Blstats branch (raw-feature slice of concat has no upstream params)
+    nh_slice_kernel<<<grid_size(B * NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
+        a->bl_grad.data, grad_concat.data, B, NH_CONCAT, NH_CONV_FLAT, NH_BL_HID);
+    n3_relu_backward_kernel<<<grid_size(B * NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
+        a->bl_grad.data, a->bl_out.data, B * NH_BL_HID);
+    bias_grad_kernel<<<NH_BL_HID, 256, 0, stream>>>(
+        a->bl_bgrad.data, a->bl_grad.data, B, NH_BL_HID);
+    PrecisionTensor blg = {.data = a->bl_grad.data, .shape = {B, NH_BL_HID}};
+    puf_mm_tn(&blg, &a->bl_feats, &a->bl_wgrad, stream);
+}
+
+static void nethack_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
+    conv_init_weights(&ew->conv1, seed, stream);
+    conv_init_weights(&ew->conv2, seed, stream);
+    puf_normal_init(&ew->embed_w, 1.0f, (*seed)++, stream);
+    puf_kaiming_init(&ew->bl_w, 1.0f, (*seed)++, stream);
+    cudaMemsetAsync(ew->bl_b.data, 0, numel(ew->bl_b.shape) * sizeof(precision_t), stream);
+    puf_kaiming_init(&ew->proj_w, 1.0f, (*seed)++, stream);
+    cudaMemsetAsync(ew->proj_b.data, 0, numel(ew->proj_b.shape) * sizeof(precision_t), stream);
+}
+
+// Param and grad registration orders must match pairwise (muon walks both flat).
+static void nethack_encoder_reg_params(void* w, Allocator* alloc) {
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
+    conv_reg_params(&ew->conv1, alloc);
+    conv_reg_params(&ew->conv2, alloc);
+    ew->embed_w = {.shape = {NH_GLYPH_VOCAB, NH_EMBED_DIM}};
+    ew->bl_w    = {.shape = {NH_BL_HID, NH_BL_FEAT}};
+    ew->bl_b    = {.shape = {NH_BL_HID}};
+    ew->proj_w  = {.shape = {ew->hidden, NH_CONCAT}};
+    ew->proj_b  = {.shape = {ew->hidden}};
+    alloc_register(alloc,&ew->embed_w);
+    alloc_register(alloc,&ew->bl_w);   alloc_register(alloc,&ew->bl_b);
+    alloc_register(alloc,&ew->proj_w); alloc_register(alloc,&ew->proj_b);
+}
+
+static void nethack_encoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
+    NethackEncoderActivations* a = (NethackEncoderActivations*)activations;
+    *a = {};
+    // Conv1 (fused with the embedding via the glyph_T table — no im2col)
+    a->conv1.out   = {.shape = {B_TT * NH_C1_OC * NH_C1_OH * NH_C1_OW}};
+    a->conv1.grad  = {.shape = {B_TT * NH_C1_OC * NH_C1_OH * NH_C1_OW}};
+    a->conv1.wgrad = {.shape = {NH_C1_OC, NH_C1_IC * NH_C1_K * NH_C1_K}};
+    a->conv1.bgrad = {.shape = {NH_C1_OC}};
+    alloc_register(acts,&a->conv1.out); alloc_register(acts,&a->conv1.grad);
+    alloc_register(grads,&a->conv1.wgrad); alloc_register(grads,&a->conv1.bgrad);
+    a->w_perm  = {.shape = {NH_TROW, NH_EMBED_DIM}};
+    a->glyph_T = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
+    a->dT      = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
+    a->dT_f    = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
+    a->dw_perm = {.shape = {NH_TROW, NH_EMBED_DIM}};
+    alloc_register(acts,&a->w_perm); alloc_register(acts,&a->glyph_T);
+    alloc_register(acts,&a->dT);     alloc_register(acts,&a->dT_f);
+    alloc_register(acts,&a->dw_perm);
+    // Conv2
+    a->conv2.out   = {.shape = {B_TT * NH_C2_OC * NH_C2_OH * NH_C2_OW}};
+    a->conv2.grad  = {.shape = {B_TT * NH_C2_OC * NH_C2_OH * NH_C2_OW}};
+    a->conv2.wgrad = {.shape = {NH_C2_OC, NH_C2_IC * NH_C2_K * NH_C2_K}};
+    a->conv2.bgrad = {.shape = {NH_C2_OC}};
+    alloc_register(acts,&a->conv2.out); alloc_register(acts,&a->conv2.grad);
+    alloc_register(grads,&a->conv2.wgrad); alloc_register(grads,&a->conv2.bgrad);
+    a->col2 = {.shape = {B_TT * NH_C2_OH * NH_C2_OW, NH_C2_IC * NH_C2_K * NH_C2_K}};
+    a->mm2  = {.shape = {B_TT * NH_C2_OH * NH_C2_OW, NH_C2_OC}};
+    alloc_register(acts,&a->col2); alloc_register(acts,&a->mm2);
+    a->glyph_idx  = {.shape = {B_TT, NH_GRID}};
+    a->bl_feats   = {.shape = {B_TT, NH_BL_FEAT}};
+    a->bl_out     = {.shape = {B_TT, NH_BL_HID}};
+    a->bl_grad    = {.shape = {B_TT, NH_BL_HID}};
+    a->concat     = {.shape = {B_TT, NH_CONCAT}};
+    a->out        = {.shape = {B_TT, ew->hidden}};
+    alloc_register(acts,&a->glyph_idx);
+    alloc_register(acts,&a->bl_feats);  alloc_register(acts,&a->bl_out);
+    alloc_register(acts,&a->bl_grad);
+    alloc_register(acts,&a->concat);    alloc_register(acts,&a->out);
+    a->embed_wgrad   = {.shape = {NH_GLYPH_VOCAB, NH_EMBED_DIM}};
+    a->bl_wgrad      = {.shape = {NH_BL_HID, NH_BL_FEAT}};
+    a->bl_bgrad      = {.shape = {NH_BL_HID}};
+    a->proj_wgrad    = {.shape = {ew->hidden, NH_CONCAT}};
+    a->proj_bgrad    = {.shape = {ew->hidden}};
+    alloc_register(grads,&a->embed_wgrad);
+    alloc_register(grads,&a->bl_wgrad);   alloc_register(grads,&a->bl_bgrad);
+    alloc_register(grads,&a->proj_wgrad); alloc_register(grads,&a->proj_bgrad);
+}
+
+static void nethack_encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
+    NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
+    NethackEncoderActivations* a = (NethackEncoderActivations*)activations;
+    a->glyph_idx = {.shape = {B, NH_GRID}};
+    a->w_perm    = {.shape = {NH_TROW, NH_EMBED_DIM}};
+    a->glyph_T   = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
+    alloc_register(alloc,&a->glyph_idx);
+    alloc_register(alloc,&a->w_perm); alloc_register(alloc,&a->glyph_T);
+    a->conv1.out = {.shape = {B * NH_C1_OC * NH_C1_OH * NH_C1_OW}};
+    alloc_register(alloc,&a->conv1.out);
+    a->conv2.out = {.shape = {B * NH_C2_OC * NH_C2_OH * NH_C2_OW}};
+    alloc_register(alloc,&a->conv2.out);
+    a->col2 = {.shape = {B * NH_C2_OH * NH_C2_OW, NH_C2_IC * NH_C2_K * NH_C2_K}};
+    a->mm2  = {.shape = {B * NH_C2_OH * NH_C2_OW, NH_C2_OC}};
+    alloc_register(alloc,&a->col2); alloc_register(alloc,&a->mm2);
+    a->bl_feats = {.shape = {B, NH_BL_FEAT}};
+    a->bl_out   = {.shape = {B, NH_BL_HID}};
+    a->concat   = {.shape = {B, NH_CONCAT}};
+    a->out      = {.shape = {B, ew->hidden}};
+    alloc_register(alloc,&a->bl_feats); alloc_register(alloc,&a->bl_out);
+    alloc_register(alloc,&a->concat);   alloc_register(alloc,&a->out);
+}
+
+static void* nethack_encoder_create_weights(void* self) {
+    Encoder* e = (Encoder*)self;
+    return nethack_encoder_create(e->in_dim, e->out_dim);
+}
+static void nethack_encoder_free_weights(void* weights) { free(weights); }
+static void nethack_encoder_free_activations(void* activations) { free(activations); }
+
 // Override encoder vtable for known ocean environments. No-op for unknown envs.
 static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
     if (env_name == "nmmo3") {
@@ -585,6 +980,20 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
             .free_activations = nmmo3_encoder_free_activations,
             .in_dim = enc->in_dim, .out_dim = enc->out_dim,
             .activation_size = sizeof(NMMO3EncoderActivations),
+        };
+    } else if (env_name == "nethack") {
+        *enc = Encoder{
+            .forward = nethack_encoder_forward,
+            .backward = nethack_encoder_backward,
+            .init_weights = nethack_encoder_init_weights,
+            .reg_params = nethack_encoder_reg_params,
+            .reg_train = nethack_encoder_reg_train,
+            .reg_rollout = nethack_encoder_reg_rollout,
+            .create_weights = nethack_encoder_create_weights,
+            .free_weights = nethack_encoder_free_weights,
+            .free_activations = nethack_encoder_free_activations,
+            .in_dim = enc->in_dim, .out_dim = enc->out_dim,
+            .activation_size = sizeof(NethackEncoderActivations),
         };
     }
 }
