@@ -22,7 +22,9 @@
 static inline int div_ceil(int a, int b) { return (a + b - 1) / b; }
 
 static cudnnHandle_t get_cudnn_handle() {
-    static cudnnHandle_t h = nullptr;
+    // thread_local like cublas_get_handle: buffer threads capture rollout
+    // graphs concurrently, and cudnnSetStream on a shared handle would race.
+    static thread_local cudnnHandle_t h = nullptr;
     if (!h) CHECK_CUDNN(cudnnCreate(&h));
     return h;
 }

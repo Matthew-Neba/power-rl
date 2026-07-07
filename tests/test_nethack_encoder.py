@@ -26,7 +26,7 @@ def build():
     cu = os.path.join(HERE, "test_nethack_cuda.cu")
     cmd = [
         "nvcc", "-shared", "-o", LIB, cu, "-I", SRC,
-        "-lcublas", "-lcudnn", "-lcurand",
+        "-lcublas", "-lcublasLt", "-lcudnn", "-lcurand",
         "--compiler-options", "-fPIC", "-Xcompiler", "-O2", "-arch=native",
     ]
     print("building:", " ".join(cmd))

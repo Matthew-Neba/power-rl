@@ -27,7 +27,9 @@ void my_init(Env* env, Dict* kwargs) {
     nethack_read_coef(kwargs, "score_coef",      &env->score_coef);
     nethack_read_coef(kwargs, "descent_coef",    &env->descent_coef);
     nethack_read_coef(kwargs, "scout_coef",      &env->scout_coef);
+    nethack_read_coef(kwargs, "hp_coef",         &env->hp_coef);
     nethack_read_coef(kwargs, "illegal_penalty", &env->illegal_penalty);
+    nethack_read_coef(kwargs, "death_penalty",   &env->death_penalty);
 }
 
 void my_log(Log* log, Dict* out) {
@@ -39,4 +41,15 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "valid_moves", log->valid_moves);
     dict_set(out, "illegal_actions", log->illegal_actions);
     dict_set(out, "new_tiles", log->new_tiles);
+    dict_set(out, "max_depth", log->max_depth);
+    dict_set(out, "prayers", log->prayers);
+    dict_set(out, "prayers_low_hp", log->prayers_low_hp);
+    dict_set(out, "searches", log->searches);
+    dict_set(out, "damage_taken", log->damage_taken);
+    dict_set(out, "game_time", log->game_time);
+    dict_set(out, "max_xp_level", log->max_xp_level);
+    dict_set(out, "death_combat", log->death_combat);
+    dict_set(out, "death_starved", log->death_starved);
+    dict_set(out, "death_other", log->death_other);
+    dict_set(out, "truncated", log->truncated);
 }

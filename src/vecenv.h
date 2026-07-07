@@ -288,7 +288,10 @@ static void* static_omp_threadmanager(void* arg) {
             memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
             memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            #pragma omp parallel for schedule(static) num_threads(num_workers)
+            // guided: load-balances across hybrid P/E cores (~15% on 14900K).
+            // NOT dynamic — libomp's dynamic dispatcher asserts (kmp_dispatch.cpp)
+            // with concurrent teams at small trip counts.
+            #pragma omp parallel for schedule(guided) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
                 c_step(&envs[i]);
             }

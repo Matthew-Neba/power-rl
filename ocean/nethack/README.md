@@ -3,8 +3,8 @@
 C-level NLE binding for the PufferLib RL framework. Each env owns a
 per-env `nle_ctx_t` holding all of NetHack's mutable game state, with a
 private 64 MB memory arena. `libnethack.so` is linked directly (no
-dlopen). Auto-dismiss for prompts, compile-time observation selection,
-reward shaping, multi-threaded OMP stepping.
+dlopen). Auto-dismiss for prompts, fixed 990-byte observation (glyph crop
++ blstats), reward shaping, multi-threaded OMP stepping.
 
 ---
 
@@ -90,7 +90,7 @@ export NETHACKDIR=$(pwd)/vendor/nle/src/build/dat
 # Quick training test (runs on login node if GPU available)
 puffer train nethack \
     --vec.total-agents 64 --vec.num-buffers 1 --vec.num-threads 4 \
-    --train.gpus 1 --train.total-timesteps 1000000 --train.minibatch-size 64
+    --train.gpus 1 --train.total-timesteps 1000000 --train.minibatch-size 4096
 
 # Interactive play
 ./live_view -i
@@ -155,56 +155,76 @@ isn't already.
 
 ---
 
-## Observation (compile-time selectable, default = glyph crop + blstats)
+## Observation (fixed, 990 bytes)
 
-Each enabled field reserves a slice of a single flat `ByteTensor`
-observation buffer. Override defaults with `-DNETHACK_USE_<FIELD>=0/1` in
-build.sh's `EXTRA_CFLAGS`.
+A single flat `ByteTensor` per agent:
 
-| Field        | Default | Bytes/element | Total (one env)              |
-|--------------|--------:|--------------:|------------------------------|
-| `chars`      |    0    | 1             | 1,659                        |
-| `colors`     |    0    | 1             | 1,659                        |
-| `specials`   |    0    | 1             | 1,659                        |
-| `glyphs`     |    1    | 2 (le i16)    | 882 (21x21 crop), 3,318 full |
-| `blstats`    |    1    | 4 (i32, trunc)| 108                          |
-| `message`    |    0    | 1             | 256                          |
-| `inv`        |    0    | 1 (letters+oclasses) | 110                   |
+| Slice     | Offset | Bytes | Encoding                                    |
+|-----------|-------:|------:|---------------------------------------------|
+| `glyphs`  |      0 |   882 | 21x21 egocentric crop, int16 LE per cell     |
+| `blstats` |    882 |   108 | 27 stats, int64 truncated to int32 LE        |
 
-`OBS_SIZE` is the sum of enabled fields (default 990).
+The crop is centered on the agent and padded with `NO_GLYPH` (5976)
+outside the map. This layout is exactly what the custom CUDA encoder in
+`src/ocean.cu` expects (glyph embedding -> 2 convs, blstats
+normalized/expanded -> linear, concat -> projection); it is
+gradient-checked by `tests/test_nethack_encoder.py`. `chars` and
+`message` are additionally bound to side buffers for the standalone
+tools and the prompt heuristic, but never enter the obs tensor.
 
-Glyphs are packed as a `NETHACK_GLYPH_CROP`^2 (default 21x21) egocentric
-window centered on the agent, padded with `NO_GLYPH` (5976) outside the
-map. Set `-DNETHACK_GLYPH_CROP=0` for the full 21x79 grid. The default
-layout is what the custom CUDA encoder in `src/ocean.cu` expects
-(glyph embedding -> 2 convs, blstats normalized/expanded -> linear,
-concat -> projection); it is gradient-checked by
-`tests/test_nethack_encoder.py`.
+Two alternative encoders are selected via `NETHACK_ENCODER` at train
+time (default = conv), both gradient-checked by
+`tests/test_nethack_mixer.py`:
 
-## Action space (18 actions)
+- `patch`: embed(16) -> shared non-overlapping 3x3 patch linear ->
+  flatten || blstats -> projection. Speed parity with the cuDNN conv
+  path with far less machinery (train phase 707 vs 715 ms/epoch at
+  minibatch 8192); single-tap embedding backward. Compile-time knobs
+  NHM_D/NHM_C trade capacity for further speed.
+- `mixer`: patch stem + one norm-free MLP-Mixer block (full-crop
+  token mixing). Trains correctly but ~30% lower SPS than conv —
+  bandwidth-bound elementwise passes; exists for score-per-sample
+  A/B, not speed.
+
+Checkpoints are not interchangeable between encoders, and the CPU
+demo only supports the conv encoder.
+
+## Action space (21 actions)
 
 ```
  0  N            8  N_RUN         16  >  (down)
  1  S            9  S_RUN         17  <  (up)
- 2  W           10  W_RUN
- 3  E           11  E_RUN
- 4  NW          12  NW_RUN
+ 2  W           10  W_RUN        18  kick (^D)
+ 3  E           11  E_RUN        19  search (s)
+ 4  NW          12  NW_RUN       20  pray (M-p)
  5  NE          13  NE_RUN
  6  SW          14  SW_RUN
  7  SE          15  SE_RUN
 ```
 
 The 8 cardinal/intercardinal moves use vi-keys (kjhl ynbu). Long
-"run" versions are uppercase (KJHL YNBU).
+"run" versions are uppercase (KJHL YNBU). Kick prompts "In what
+direction?"; that prompt is left live, so the agent's next action (a
+movement key) answers it — kick-through-a-locked-door is a learnable
+two-step sequence. Search checks adjacent squares once for hidden
+doors/passages (repeated searching raises the find chance, as in the
+real game). Pray's "Are you sure?" confirm is auto-answered 'y'; the
+gods heal low HP and cure starving, but praying too often angers them
+— when to pray is the thing to learn.
 
 ## Reward shaping (config-tunable via nethack.ini)
 
 ```
-reward = score_coef    * (score - prev_score)          # game score delta
-       + descent_coef  * max(0, depth - prev_depth)    # new max depth bonus
+reward = score_coef    * (score - prev_score)           # game score delta
+       + descent_coef  * (new episode-max depth only)   # yo-yo-proof descent bonus
        + scout_coef    * (new_tile_this_level)          # exploration bonus
+       + hp_coef       * (hp - prev_hp)                 # HP potential (dense survival signal)
        + illegal_penalty * (illegal_action)             # sub-prompt penalty
 ```
+
+The terminal step of a game-over (not truncation) carries
+`death_penalty - hp_coef * prev_hp` instead of the shaped terms — the
+HP potential cashes out, so dying at high HP forfeits more.
 
 All coefficients are set in `config/nethack.ini` under `[env]`.
 
@@ -232,8 +252,32 @@ auto-reset after `NETHACK_MAX_EPISODE_STEPS=10000` steps.
 | `valid_moves`      | c_steps where NetHack's turn counter advanced          |
 | `illegal_actions`  | c_steps where the agent triggered a sub-prompt         |
 | `new_tiles`        | Unique tiles entered this episode                      |
+| `max_depth`        | Deepest level reached (depth-at-death under-reports)   |
+| `prayers`          | Prayer actions per episode                             |
+| `prayers_low_hp`   | Prayers issued at <=25% max HP (learned panic button)  |
+| `searches`         | Search actions per episode                             |
+| `damage_taken`     | Sum of HP lost per episode                             |
+| `game_time`        | NetHack turns survived (steps can compress many turns) |
+| `max_xp_level`     | Highest experience level reached                       |
+| `death_combat`     | Fraction of episodes ended by DIED (monsters, traps)   |
+| `death_starved`    | Fraction of episodes ended by STARVING                 |
+| `death_other`      | Fraction ended any other way (drowning, poison, ...)   |
+| `truncated`        | Fraction that hit the 10,000-step cap                  |
 
 ## Standalone tools
+
+The `nethack` binary (from `ocean/nethack/nethack.c`) plays the trained
+policy by default — a CPU puffernet port of the CUDA encoder that loads
+`resources/nethack/nethack_weights.bin` (copy any checkpoint there — the
+hidden size and layer count are inferred from the file):
+
+```bash
+NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack               # policy demo
+NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack 2000 0       # headless, 2000 steps
+NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack random       # random policy
+NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack bench 100000 # steps/sec
+NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack record traj.txt 500
+```
 
 ```bash
 # Live viewer (interactive play)
@@ -246,6 +290,18 @@ NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./live_view --random --steps 500
 NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./live_view --replay path/to/recording.bin
 ```
 
+Build the nethack tool (same flags, swap the source file for live_view):
+```bash
+clang -O2 -I vendor/nle/src/include -I vendor/nle/src/build/include \
+    -I vendor/nle/src/third_party/deboost.context/include \
+    -DDEFAULT_WINDOW_SYS=\"rl\" -DDLB -DNLE_ALLOW_SEEDING \
+    -DNLE_PER_ENV_FILES=1 -DNLE_PER_ENV_FLAGS=1 -DNLE_USE_ARENA_FREE=1 \
+    -DNLE_USE_TILES -DNOCLIPPING -DNOCWD_ASSUMPTIONS -DNOMAIL -DNOTPARMDECL \
+    ocean/nethack/nethack.c -o nethack \
+    -L./vendor/nle/src/build -lnethack -lm -lbz2 -lpthread \
+    -Wl,-rpath=$(pwd)/vendor/nle/src/build
+```
+
 Build live_view from source:
 ```bash
 clang -O2 -I vendor/nle/src/include -I vendor/nle/src/build/include \
@@ -253,7 +309,6 @@ clang -O2 -I vendor/nle/src/include -I vendor/nle/src/build/include \
     -DDEFAULT_WINDOW_SYS=\"rl\" -DDLB -DNLE_ALLOW_SEEDING \
     -DNLE_PER_ENV_FILES=1 -DNLE_PER_ENV_FLAGS=1 -DNLE_USE_ARENA_FREE=1 \
     -DNLE_USE_TILES -DNOCLIPPING -DNOCWD_ASSUMPTIONS -DNOMAIL -DNOTPARMDECL \
-    -DNETHACK_USE_BLSTATS=1 \
     ocean/nethack/live_view.c -o live_view \
     -L./vendor/nle/src/build -lnethack -lm -lbz2 -lpthread \
     -Wl,-rpath=$(pwd)/vendor/nle/src/build

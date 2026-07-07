@@ -1,238 +1,79 @@
+// NetHack env for the pufferlib vecenv. Opinionated, fixed configuration:
+//   obs     = 21x21 egocentric glyph crop (int16 LE) + 27 blstats (int32 LE),
+//             990 bytes — exactly what the custom CUDA encoder in src/ocean.cu
+//             expects. chars/message are kept in side buffers for the
+//             standalone tools but never enter the obs tensor.
+//   actions = 21: 8 compass moves, 8 run-moves, down (>), up (<), kick (^D),
+//             search (s), pray (M-p).
+//   reward  = score delta + descent + scout + illegal penalty + death
+//             penalty, per-env coefs.
+// One Nethack struct per agent; each owns an nle_ctx_t (all per-game NLE
+// state) and a private vardir on tmpfs for NetHack's file I/O.
+// libnethack.so is linked directly at build time.
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include <stdbool.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <dirent.h>
 #include <signal.h>
-#include "profile.h"
+#include "nethack_fs.h"
 
-#ifndef SYS_memfd_create
-#  ifdef __x86_64__
-#    define SYS_memfd_create 319
-#  endif
-#endif
-static inline int nethack_memfd_create(const char* name, unsigned int flags) {
-    return (int)syscall(SYS_memfd_create, name, flags);
-}
-
-// ---------------------------------------------------------------------------
-// NLE minimal API
-// ---------------------------------------------------------------------------
-// All per-env mutable state lives in nle_ctx_t. libnethack.so is linked
-// directly (no dlopen). Each env gets its own nle_ctx_t + private memory
-// arena; a thread-local pointer (current_nle_ctx) anchors field access.
 #define NLE_ALLOW_SEEDING 1
 #include "nleobs.h"
 
 typedef struct nle_ctx nle_ctx_t;
-typedef nle_ctx_t* (*nle_start_fn)(nle_obs*, FILE*, nle_seeds_init_t*, nle_settings*);
-typedef nle_ctx_t* (*nle_step_fn)(nle_ctx_t*, nle_obs*);
-typedef void       (*nle_end_fn)(nle_ctx_t*);
-
-// Fast-reset extension (see vendor/nle/src/src/nle_fast_reset.c).
-typedef void* (*nle_fr_snapshot_fn)(nle_ctx_t*);
-typedef void  (*nle_fr_restore_fn) (nle_ctx_t*, void*);
-typedef void  (*nle_fr_destroy_fn) (void*);
-
-// Direct linkage: libnethack.so symbols are resolved at link time, not via
-// dlopen. The wrapper retains env->fn_* function pointers for ABI stability,
-// but they're assigned from these externs — no runtime symbol lookup.
-#ifdef __cplusplus
-extern "C" {
-#endif
 extern nle_ctx_t* nle_start(nle_obs*, FILE*, nle_seeds_init_t*, nle_settings*);
 extern nle_ctx_t* nle_step(nle_ctx_t*, nle_obs*);
 extern void       nle_end(nle_ctx_t*);
-extern void*      nle_fr_snapshot(nle_ctx_t*);
-extern void       nle_fr_restore(nle_ctx_t*, void*);
-extern void       nle_fr_destroy(void*);
-#ifdef __cplusplus
-}
-#endif
-
-// Build flag: -DNETHACK_FAST_RESET=1 enables the snapshot/restore path.
-// Default is OFF — the fast-reset machinery in
-// vendor/nle/src/src/nle_fast_reset.c is fundamentally unsafe for N>1
-// vecenv: nle_fr_restore memcpys back the SHARED bump-arena
-// (alloc.c:75 — "All envs share one arena") and libnethack.so's
-// .data/.bss segments. Under multi-env, that clobbers other envs' live
-// arena allocations and rewinds the bump pointer past their data,
-// producing 'double free in tcache 2' / 'munmap_chunk()' / SIGSEGV.
-// train_bench at N=64 (which uses slow-only resets via nle_end + nle_start)
-// runs 1M steps clean at 414K agg SPS, so slow-only is plenty fast.
-// To re-enable for single-env benchmarks: build with -DNETHACK_FAST_RESET=1.
-#ifndef NETHACK_FAST_RESET
-#define NETHACK_FAST_RESET 0
-#endif
 
 // ---------------------------------------------------------------------------
-// Geometry constants
+// Fixed configuration
 // ---------------------------------------------------------------------------
 #define NH_ROWS 21
 #define NH_COLS 79
 #define NH_GRID (NH_ROWS * NH_COLS)
 
-// ---------------------------------------------------------------------------
-// Compile-time observation selection
-// ---------------------------------------------------------------------------
-// Override any of these with -DNETHACK_USE_<FIELD>=0/1. Defaults: glyph crop
-// + blstats (what the custom CUDA encoder in src/ocean.cu expects).
-// Each enabled field reserves its own slice of the ByteTensor observation
-// buffer; disabled fields are not allocated, not bound, and NLE does not
-// write to them (NLE's fill_obs guards every field with `if (ptr) ...`).
-//
-// Field widths (bytes per element):
-//   chars     uint8     1
-//   colors    uint8     1
-//   specials  uint8     1
-//   glyphs    int16     2  (packed as little-endian; cropped, see below)
-//   blstats   int64     4  (truncated to int32 to save space)
-//   message   uint8     1
-//   inv_letters / inv_oclasses  uint8  1  (size NLE_INVENTORY_SIZE)
-//
-// `inv` enables both inv_letters and inv_oclasses together (cheap pair).
-// inv_glyphs and inv_strs are deliberately omitted for v1 to keep the
-// observation a flat ByteTensor.
+// Egocentric crop: odd side length, centered on the agent, padded with
+// NO_GLYPH (== MAX_GLYPH == 5976 in NetHack 3.6.6) outside the map.
+#define NETHACK_CROP       21
+#define NETHACK_CROP_GRID  (NETHACK_CROP * NETHACK_CROP)
+#define NETHACK_PAD_GLYPH  5976
 
-#ifndef NETHACK_USE_CHARS
-#define NETHACK_USE_CHARS    0
-#endif
-#ifndef NETHACK_USE_COLORS
-#define NETHACK_USE_COLORS   0
-#endif
-#ifndef NETHACK_USE_SPECIALS
-#define NETHACK_USE_SPECIALS 0
-#endif
-#ifndef NETHACK_USE_GLYPHS
-#define NETHACK_USE_GLYPHS   1
-#endif
-#ifndef NETHACK_USE_BLSTATS
-#define NETHACK_USE_BLSTATS  1
-#endif
-#ifndef NETHACK_USE_MESSAGE
-#define NETHACK_USE_MESSAGE  0
-#endif
-#ifndef NETHACK_USE_INV
-#define NETHACK_USE_INV      0
-#endif
+// Obs tensor layout (byte offsets). Glyphs first, then blstats.
+#define NETHACK_OFF_GLYPHS  0
+#define NETHACK_OFF_BLSTATS (NETHACK_CROP_GRID * 2)
+#define NETHACK_OBS_SIZE    (NETHACK_OFF_BLSTATS + NLE_BLSTATS_SIZE * 4)
 
-// Egocentric glyph crop: odd side length of a square window centered on the
-// agent, padded with NETHACK_PAD_GLYPH outside the map. 0 = full 21x79 grid.
-#ifndef NETHACK_GLYPH_CROP
-#define NETHACK_GLYPH_CROP 21
-#endif
-// NO_GLYPH == MAX_GLYPH == 5976 in NetHack 3.6.6
-#define NETHACK_PAD_GLYPH 5976
-#if NETHACK_GLYPH_CROP > 0
-#define NETHACK_GLYPH_GRID (NETHACK_GLYPH_CROP * NETHACK_GLYPH_CROP)
-#else
-#define NETHACK_GLYPH_GRID NH_GRID
-#endif
-
-// Auto-dismiss prompts (welcome screen, --More--, yes/no, getline) before
-// applying the agent's action, by inspecting misc[]={in_yn_function,
-// in_getlin, xwaitingforspace} on every step. These tiny buffers are
-// always allocated (~48 bytes) regardless of obs-field selection. Cap the
-// dismiss loop at NETHACK_AUTODISMISS_MAX iterations to avoid hanging on
-// pathological prompt chains.
-#ifndef NETHACK_AUTODISMISS
-#define NETHACK_AUTODISMISS 1
-#endif
-#ifndef NETHACK_AUTODISMISS_MAX
-#define NETHACK_AUTODISMISS_MAX 64
-#endif
-
-#ifndef NETHACK_MAX_EPISODE_STEPS
 #define NETHACK_MAX_EPISODE_STEPS 10000
-#endif
+#define NETHACK_AUTODISMISS_MAX   64   // cap on prompt-dismiss keystrokes per step
+#define NETHACK_MAX_DEPTH         64   // scout bitmaps tracked per episode
 
-// Penalty applied to the reward when the agent's action triggers a sub-prompt
-// (illegal/ambiguous action — e.g. "Apply what?" / "What direction?") that
-// we then have to ESC out of. Default -0.01 — small enough that legitimate
-// y/n confirmations during real play don't tank rewards.
-// Per-step reward shaping (compile-time tunable).
-//   reward = (score - prev_score)
-//          + NETHACK_DEPTH_BONUS  if went deeper this step
-//          + NETHACK_SCOUT_BONUS  if entered a previously-unvisited tile
-//          + NETHACK_ILLEGAL_PENALTY  if action triggered a sub-prompt
-#ifndef NETHACK_ILLEGAL_PENALTY
-#define NETHACK_ILLEGAL_PENALTY -0.5f      // -invalid_moves/2 per user spec
-#endif
-#ifndef NETHACK_SCOUT_BONUS
-#define NETHACK_SCOUT_BONUS      0.1f       // for each new tile visited
-#endif
-#ifndef NETHACK_DEPTH_BONUS
-#define NETHACK_DEPTH_BONUS      1.0f       // for each new dungeon level
-#endif
+// nle_obs.misc[] prompt-state flags
+enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 
-#define NETHACK_SZ_CHARS    (NETHACK_USE_CHARS    * NH_GRID)
-#define NETHACK_SZ_COLORS   (NETHACK_USE_COLORS   * NH_GRID)
-#define NETHACK_SZ_SPECIALS (NETHACK_USE_SPECIALS * NH_GRID)
-#define NETHACK_SZ_GLYPHS   (NETHACK_USE_GLYPHS   * NETHACK_GLYPH_GRID * 2)
-#define NETHACK_SZ_BLSTATS  (NETHACK_USE_BLSTATS  * NLE_BLSTATS_SIZE * 4)
-#define NETHACK_SZ_MESSAGE  (NETHACK_USE_MESSAGE  * NLE_MESSAGE_SIZE)
-#define NETHACK_SZ_INV      (NETHACK_USE_INV      * NLE_INVENTORY_SIZE * 2)
-
-#define NETHACK_OFF_CHARS    0
-#define NETHACK_OFF_COLORS   (NETHACK_OFF_CHARS    + NETHACK_SZ_CHARS)
-#define NETHACK_OFF_SPECIALS (NETHACK_OFF_COLORS   + NETHACK_SZ_COLORS)
-#define NETHACK_OFF_GLYPHS   (NETHACK_OFF_SPECIALS + NETHACK_SZ_SPECIALS)
-#define NETHACK_OFF_BLSTATS  (NETHACK_OFF_GLYPHS   + NETHACK_SZ_GLYPHS)
-#define NETHACK_OFF_MESSAGE  (NETHACK_OFF_BLSTATS  + NETHACK_SZ_BLSTATS)
-#define NETHACK_OFF_INV      (NETHACK_OFF_MESSAGE  + NETHACK_SZ_MESSAGE)
-#define NETHACK_OBS_SIZE     (NETHACK_OFF_INV      + NETHACK_SZ_INV)
-
-#if NETHACK_OBS_SIZE == 0
-#error "At least one NETHACK_USE_* field must be enabled."
-#endif
-
-// Compile-time action set selection.
-//   NETHACK_ACTION_SET == 0  (default, 23 actions) — full reduced set:
-//       8 compass + 8 long-compass + > < . s \r ESC ,
-//   NETHACK_ACTION_SET == 1  (18 actions) — drops the "rarely useful"
-//       keystrokes (`>`, `<`, `,`, `\r`, `ESC`) that early-training
-//       random play burns on no-op/menu states. Keeps movement + wait
-//       + search. Helps lift SPS during the high-reset-rate phase.
-#ifndef NETHACK_ACTION_SET
-#define NETHACK_ACTION_SET 0
-#endif
-
-#if NETHACK_ACTION_SET == 1
-#define NETHACK_NUM_ACTIONS 18
+#define NETHACK_NUM_ACTIONS 21
 static const int NETHACK_ACTION_TABLE[NETHACK_NUM_ACTIONS] = {
-    'k','j','h','l','y','u','b','n',
-    'K','J','H','L','Y','U','B','N',
-    '.','s',
+    'k','j','h','l','y','u','b','n',   // N S W E NW NE SW SE
+    'K','J','H','L','Y','U','B','N',   // run variants
+    '>','<',                           // stairs down, up
+    4,                                 // ^D kick (locked doors); asks a direction
+    's',                               // search once (hidden doors/passages)
+    0x80|'p',                          // M-p pray (heals low HP, cures starving)
 };
-#else
-#define NETHACK_NUM_ACTIONS 23
-static const int NETHACK_ACTION_TABLE[NETHACK_NUM_ACTIONS] = {
-    'k','j','h','l','y','u','b','n',
-    'K','J','H','L','Y','U','B','N',
-    '>','<','.','s','\r',27,',',
-};
-#endif
 
+// !status_updates: disable NetHack's status-line renderer (~5% CPU spent
+// sprintf'ing a line nothing reads; blstats come from update_blstats()).
 #define NETHACK_DEFAULT_OPTIONS \
     "name:Agent-mon-hum-neu-mal," \
     "autopickup,color,disclose:+i +a +v +g +c +o," \
     "mention_walls,nobones,nocmdassist,nolegacy,nosparkle," \
     "pickup_burden:unencumbered,pickup_types:$?!/," \
     "runmode:teleport,showexp,showscore,time," \
-    /* exp_039: disable bot() status renderer. The botl.c chain feeds
-     * iflags.status_updates -> bot_via_windowport ->
-     * eval_notify_windowport_field -> anything_to_s -> sprintf, eating
-     * ~5% of user CPU formatting a status line nothing reads. The agent
-     * gets stats via update_blstats() reading u.X / youmonst directly. */ \
     "!status_updates"
 
 typedef struct Log {
@@ -241,9 +82,21 @@ typedef struct Log {
     float episode_return;
     float episode_length;
     float depth;
-    float valid_moves;        // c_steps where the agent's action advanced NetHack's turn counter
-    float illegal_actions;    // c_steps where the agent's action hit a sub-prompt we had to ESC out of
-    float new_tiles;          // unique tiles entered this episode (sums over episodes via Log.n)
+    float valid_moves;        // c_steps where the action advanced NetHack's turn counter
+    float illegal_actions;    // c_steps where the action hit a sub-prompt we ESC'd out of
+    float new_tiles;          // unique tiles entered per episode
+    float max_depth;          // deepest level reached this episode (depth-at-death can under-report)
+    float prayers;            // prayer actions per episode
+    float prayers_low_hp;     // prayers issued at <=25% max HP (learned panic button)
+    float searches;           // search actions per episode
+    float damage_taken;       // sum of HP decreases per episode
+    float game_time;          // NetHack turns survived (run-moves advance many per step)
+    float max_xp_level;       // highest experience level reached
+    // Episode end reason, one-hot per episode (game_end_types in hack.h)
+    float death_combat;       // DIED (monsters, traps)
+    float death_starved;      // STARVING
+    float death_other;        // any other how_done (drowning, poison, quit, ...)
+    float truncated;          // hit NETHACK_MAX_EPISODE_STEPS
     float n;
 } Log;
 
@@ -255,344 +108,147 @@ typedef struct Nethack {
     float* terminals;
     int num_agents;
 
-    // Per-instance dynamic load of libnethack.so.
-    void* dl_handle;
-    int   dl_fd;
-    nle_start_fn fn_start;
-    nle_step_fn  fn_step;
-    nle_end_fn   fn_end;
-    nle_fr_snapshot_fn fn_fr_snapshot;  // NULL if patched lib not present
-    nle_fr_restore_fn  fn_fr_restore;
-    nle_fr_destroy_fn  fn_fr_destroy;
-    void* fr_snapshot;  // populated after first c_reset
-
     // Lazy reset: c_reset sets this flag, c_step performs the actual reset.
     // Guarantees reset and step run on the same OMP thread (NLE's coroutine
-    // captures the stack pointer; resetting on a different thread corrupts it).
+    // captures the stack pointer; resetting on another thread corrupts it).
     int pending_reset;
 
-    // NLE state
     nle_ctx_t* ctx;
     nle_obs obs;
     nle_settings settings;
-    char vardir[4096];
+    char vardir[1024];
 
-    // Backing storage — only fields with USE_* enabled are actually allocated.
-    // Conditionally compile these to save memory.
-#if NETHACK_USE_GLYPHS
+    // NLE-written buffers. glyphs+blstats feed the obs tensor; chars/message
+    // are for the standalone tools and the '?'-prompt heuristic; misc/internal
+    // drive prompt auto-dismissal.
     short          glyphs[NH_GRID];
-#endif
-#if NETHACK_USE_CHARS
-    unsigned char  chars[NH_GRID];
-#endif
-#if NETHACK_USE_COLORS
-    unsigned char  colors[NH_GRID];
-#endif
-#if NETHACK_USE_SPECIALS
-    unsigned char  specials[NH_GRID];
-#endif
-#if NETHACK_USE_BLSTATS
     long           blstats[NLE_BLSTATS_SIZE];
-#endif
-#if NETHACK_USE_MESSAGE
+    unsigned char  chars[NH_GRID];
     unsigned char  message[NLE_MESSAGE_SIZE];
-#endif
-#if NETHACK_USE_INV
-    unsigned char  inv_letters[NLE_INVENTORY_SIZE];
-    unsigned char  inv_oclasses[NLE_INVENTORY_SIZE];
-#endif
+    int            misc[NLE_MISC_SIZE];
+    int            internal[NLE_INTERNAL_SIZE];
 
-    // Always-allocated hook buffers (independent of obs selection).
-    // misc/internal: prompt-state flags for auto-dismiss
-    // blstats: lets us read NLE_BL_TIME to count valid moves
-    // message: scanned for '?' to catch single-key prompts (direction, item)
-    //          that NLE does not expose via the misc[] flags.
-    int           hook_misc[NLE_MISC_SIZE];
-    int           hook_internal[NLE_INTERNAL_SIZE];
-    long          hook_blstats[NLE_BLSTATS_SIZE];
-    unsigned char hook_message[NLE_MESSAGE_SIZE];
+    // Per-dungeon-level exploration bitmaps, cleared once per episode. Indexed
+    // by depth so revisiting a level cannot re-earn scout reward (branch
+    // levels sharing a depth share a bitmap; slight under-count, acceptable).
+    unsigned char visited[NETHACK_MAX_DEPTH][(NH_GRID + 7) / 8];
 
-    long episode_start_time;
     long episode_valid_moves;
     long episode_illegal_actions;
-    long episode_new_tiles;       // unique tiles entered this episode
-
-    // Exploration bitmap for the current dungeon level. Cleared on
-    // dungeon-level change. One bit per (row, col); 21*79 = 1659 bits,
-    // round up to 208 bytes.
-    unsigned char visited[(NH_GRID + 7) / 8];
-    int  visited_level;            // dungeon level the bitmap corresponds to
-
-    int tick;
+    long episode_new_tiles;
+    long episode_prayers;
+    long episode_prayers_low_hp;
+    long episode_searches;
+    long episode_damage;
     long prev_score;
+    long prev_hp;
+    long prev_time;
     int prev_depth;
+    int episode_max_depth;
+    int episode_max_xp;
     float episode_return;
     int episode_length;
     unsigned int rng;   // required by vecenv.h (seeded with env index)
 
-    // ----- Per-instance reward shaping coefficients -----
-    // Each reward term is independently toggleable: set its coef to 0.0 to
-    // disable. Set from kwargs in my_init (binding.c). Plumb through
-    // `[env]` in config/nethack.ini → CLI `--env.<key>` flags.
-    //
-    // reward = score_coef    * (score - prev_score)               [always >=0]
-    //        + descent_coef  * max(0, depth - prev_depth)         [descent only]
-    //        + scout_coef    * (1 if new tile this step else 0)
-    //        + illegal_pen   * (1 if action triggered sub-prompt else 0)
-    // Defaults below are also the fallbacks when the kwargs key is missing
-    // (so the build still runs if config/nethack.ini hasn't been updated).
-    float score_coef;       // default 0.01f  (R_SCORE)
-    float descent_coef;     // default 1.0f   (R_DESCENT)
-    float scout_coef;       // default NETHACK_SCOUT_BONUS (legacy)
-    float illegal_penalty;  // default NETHACK_ILLEGAL_PENALTY (legacy, negative)
+    // Reward shaping coefficients, all independently toggleable (0 = off).
+    // Set from kwargs in binding.c via `[env]` keys in config/nethack.ini.
+    //   reward = score_coef   * (score - prev_score)
+    //          + descent_coef * (depth - episode_max_depth), new maxima only
+    //          + scout_coef   * (1 if new tile on this level this episode)
+    //          + hp_coef      * (hp - prev_hp)   (potential; heals reward, damage costs)
+    //          + illegal_penalty * (1 if action triggered a sub-prompt)
+    // The death step carries no shaping (NLE zeroes blstats when the game
+    // ends, so the terms would read garbage); it carries death_penalty plus
+    // the HP potential cash-out (-hp_coef * prev_hp — dying at high HP
+    // forfeits more). Truncation at the step cap carries neither.
+    float score_coef;
+    float descent_coef;
+    float scout_coef;
+    float hp_coef;
+    float illegal_penalty;
+    float death_penalty;
 
-    // Per-env explicit RNG seed for nle_start. Without this, NetHack uses
-    // its own internal seeding and some seeds hit infinite loops in level
-    // generation (mklev/topologize). Seed bases known to work at N=32/64/96:
-    // 0x111, 0x222, 0xCAFEBEEF.  Set via NETHACK_SEED_BASE env var or default.
+    // Explicit per-env seeds for nle_start; NetHack's own seeding can hit
+    // infinite loops in level generation (mklev/topologize).
     unsigned long seed_a;
     unsigned long seed_b;
 } Nethack;
 
 // ---------------------------------------------------------------------------
-// Shared libnethack: DIRECT LINKAGE. No dlopen, no dlsym. The library is
-// linked at build time (-lnethack); all envs share the same code and use
-// per-env nle_ctx_t* for state. The migration in vendor/nle/src/* moved
-// every per-game global into nle_ctx_t, so a single shared library
-// supports N envs natively.
-// ---------------------------------------------------------------------------
-static int nethack_load_lib(Nethack* env) {
-    PROF_INIT_IF_NEEDED();
-    PROF_START(reload);
-    // No dlopen — symbols are resolved at link time. Just assign the
-    // function pointers so the rest of the wrapper code (env->fn_step etc.)
-    // continues to work unchanged.
-    env->dl_handle = (void*)1;  // non-NULL sentinel: "library is available"
-    env->dl_fd     = 0;
-    env->fn_start  = &nle_start;
-    env->fn_step   = &nle_step;
-    env->fn_end    = &nle_end;
-    env->fn_fr_snapshot = &nle_fr_snapshot;
-    env->fn_fr_restore  = &nle_fr_restore;
-    env->fn_fr_destroy  = &nle_fr_destroy;
-    PROF_END(reload, PROF_RESET_RELOAD);
-    return 0;
-}
-
-static void nethack_unload_lib(Nethack* env) {
-    // No per-env dlclose; the library handle is process-wide.
-    env->dl_handle = NULL;
-    env->dl_fd = 0;
-    env->fn_start = NULL; env->fn_step = NULL; env->fn_end = NULL;
-}
-
-// ---------------------------------------------------------------------------
-// Per-instance vardir (NetHack expects nhdat + a few touched files)
-// ---------------------------------------------------------------------------
-static void nethack_touch(const char* path) {
-    int fd = open(path, O_CREAT | O_WRONLY, 0644);
-    if (fd >= 0) close(fd);
-}
-
-// Recursive remove, depth-capped (vardir trees are at most base/env/save/files).
-static void nethack_rm_rf(const char* path, int depth) {
-    if (depth > 3) return;
-    DIR* d = opendir(path);
-    if (d) {
-        struct dirent* e;
-        char p[4096];
-        while ((e = readdir(d)) != NULL) {
-            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-            snprintf(p, sizeof(p), "%s/%s", path, e->d_name);
-            if (unlink(p) != 0) nethack_rm_rf(p, depth + 1);
-        }
-        closedir(d);
-    }
-    rmdir(path);
-}
-
-// Vardirs live under a per-process parent on tmpfs when available, so
-// NetHack's lock/level file I/O never touches real disk. On first use,
-// parents whose owning pid is gone are swept — a crashed or killed run
-// leaks its vardirs (one per env) and degrades the base dir over time.
-static const char* nethack_vardir_base(void) {
-    static char base[256] = "";
-    if (base[0]) return base;
-    const char* root = access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp";
-    DIR* d = opendir(root);
-    if (d) {
-        struct dirent* e;
-        while ((e = readdir(d)) != NULL) {
-            long pid = 0;
-            if (sscanf(e->d_name, "nle-run-%ld", &pid) != 1 || pid <= 0) continue;
-            if (pid == (long)getpid()) continue;
-            if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;  // owner alive
-            char dead[512];
-            snprintf(dead, sizeof(dead), "%s/%s", root, e->d_name);
-            nethack_rm_rf(dead, 0);
-        }
-        closedir(d);
-    }
-    snprintf(base, sizeof(base), "%s/nle-run-%ld", root, (long)getpid());
-    mkdir(base, 0755);
-    return base;
-}
-
-static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t out_cap) {
-    PROF_START(vardir);
-    char tmpl[512];
-    snprintf(tmpl, sizeof(tmpl), "%s/env-XXXXXX", nethack_vardir_base());
-    char* dir = mkdtemp(tmpl);
-    if (dir == NULL) return -1;
-    if ((size_t)snprintf(out_buf, out_cap, "%s", dir) >= out_cap) return -1;
-
-    char abs_source[4096];
-    if (source_hackdir[0] == '/') {
-        snprintf(abs_source, sizeof(abs_source), "%s", source_hackdir);
-    } else {
-        char cwd[2048];
-        if (getcwd(cwd, sizeof(cwd)) == NULL) return -1;
-        snprintf(abs_source, sizeof(abs_source), "%s/%s", cwd, source_hackdir);
-    }
-
-    char src[4096], dst[4096];
-    snprintf(src, sizeof(src), "%s/nhdat", abs_source);
-    snprintf(dst, sizeof(dst), "%s/nhdat", dir);
-
-    // Fail-fast: verify the source nhdat actually exists before creating the
-    // symlink. symlink(2) succeeds for dangling links, so without this check
-    // a broken NETHACKDIR (or a cwd-shifted relative default) surfaces 100ms
-    // later as a libnethack panic in init_dungeons("Cannot open dungeon
-    // description - 'dungeon'..."), which looks like a concurrency crash but
-    // is actually a config error. See exp_033_cluster_az/REDIAG.md.
-    char resolved[4096];
-    char cwd_dbg[2048] = "(unknown)";
-    getcwd(cwd_dbg, sizeof(cwd_dbg));
-    if (realpath(src, resolved) == NULL || access(resolved, R_OK) != 0) {
-        fprintf(stderr,
-                "nethack: NETHACKDIR is misconfigured.\n"
-                "  Expected to find nhdat at: %s\n"
-                "  (source_hackdir=\"%s\", cwd=\"%s\")\n"
-                "  realpath/access failed: %s\n"
-                "  Set NETHACKDIR to an ABSOLUTE path pointing at a directory\n"
-                "  containing nhdat (e.g. <repo>/vendor/nle/nethackdir).\n",
-                src, source_hackdir, cwd_dbg, strerror(errno));
-        exit(1);
-    }
-    if (symlink(src, dst) != 0) return -1;
-    const char* touched[] = {"perm", "record", "logfile", "xlogfile"};
-    for (size_t i = 0; i < 4; i++) {
-        snprintf(dst, sizeof(dst), "%s/%s", dir, touched[i]);
-        nethack_touch(dst);
-    }
-    snprintf(dst, sizeof(dst), "%s/save", dir);
-    mkdir(dst, 0755);
-    PROF_END(vardir, PROF_RESET_VARDIR);
-    return 0;
-}
-
-static void nethack_rm_vardir(const char* dir) {
-    if (dir == NULL || dir[0] == '\0') return;
-    // Full tree remove: NetHack drops level/lock files beyond the fixed set
-    // we create, and any leftover blocks the rmdir (the old /tmp leak).
-    nethack_rm_rf(dir, 1);
-}
-
-// ---------------------------------------------------------------------------
-// Bind obs pointers — only enabled fields, others stay NULL so NLE skips them
+// NLE plumbing
 // ---------------------------------------------------------------------------
 static void nethack_bind_obs(Nethack* env) {
     nle_obs* o = &env->obs;
     memset(o, 0, sizeof(*o));
-#if NETHACK_USE_CHARS
-    o->chars = env->chars;
-#endif
-#if NETHACK_USE_COLORS
-    o->colors = env->colors;
-#endif
-#if NETHACK_USE_SPECIALS
-    o->specials = env->specials;
-#endif
-#if NETHACK_USE_GLYPHS
-    o->glyphs = env->glyphs;
-#endif
-#if NETHACK_USE_BLSTATS
-    o->blstats = env->blstats;
-#endif
-#if NETHACK_USE_MESSAGE
-    o->message = env->message;
-#endif
-#if NETHACK_USE_INV
-    o->inv_letters  = env->inv_letters;
-    o->inv_oclasses = env->inv_oclasses;
-#endif
-    // Always bind misc/internal so the hook can read prompt-state flags
-    // independent of which obs fields the user selected. blstats/message are
-    // only bound to hook_* when the user opted them OUT of the obs tensor —
-    // otherwise they are already bound to env->{blstats,message} above.
-    o->misc     = env->hook_misc;
-    o->internal = env->hook_internal;
-#if !NETHACK_USE_BLSTATS
-    o->blstats  = env->hook_blstats;
-#endif
-#if !NETHACK_USE_MESSAGE
-    o->message  = env->hook_message;
-#endif
+    o->glyphs   = env->glyphs;
+    o->blstats  = env->blstats;
+    o->chars    = env->chars;
+    o->message  = env->message;
+    o->misc     = env->misc;
+    o->internal = env->internal;
 }
 
-// Pointers we can always read for the hook, regardless of NETHACK_USE_*.
-static inline const unsigned char* nethack_msg(const Nethack* env) {
-#if NETHACK_USE_MESSAGE
-    return env->message;
-#else
-    return env->hook_message;
-#endif
+// True when the current message ends with '?' — catches single-key prompts
+// NLE doesn't expose via misc[] ("In what direction...?"). Real game messages
+// ("It's a wall.") don't end in '?'.
+static int nethack_msg_is_prompt(const Nethack* env) {
+    const unsigned char* m = env->message;
+    if (!m[0]) return 0;
+    int e = 0;
+    while (e < NLE_MESSAGE_SIZE && m[e]) e++;
+    while (e > 0 && m[e-1] == ' ') e--;
+    return e > 0 && m[e-1] == '?';
 }
 
-// Read NetHack's current turn counter regardless of which obs fields are bound.
-static inline long nethack_current_time(const Nethack* env) {
-#if NETHACK_USE_BLSTATS
-    return env->blstats[NLE_BL_TIME];
-#else
-    return env->hook_blstats[NLE_BL_TIME];
-#endif
+static int nethack_msg_contains(const Nethack* env, const char* needle) {
+    char buf[NLE_MESSAGE_SIZE + 1];
+    memcpy(buf, env->message, NLE_MESSAGE_SIZE);
+    buf[NLE_MESSAGE_SIZE] = '\0';
+    return strstr(buf, needle) != NULL;
 }
 
-// Agent position, 0-based and aligned with the glyph grid (NLE writes
-// blstats x as u.ux-1, y as u.uy).
-static inline void nethack_agent_pos(const Nethack* env, int* x, int* y) {
-#if NETHACK_USE_BLSTATS
-    *x = (int)env->blstats[NLE_BL_X];
-    *y = (int)env->blstats[NLE_BL_Y];
-#else
-    *x = (int)env->hook_blstats[NLE_BL_X];
-    *y = (int)env->hook_blstats[NLE_BL_Y];
-#endif
-}
-
-// Auto-dismiss: while NLE reports an active prompt (welcome/--More--/yn/getlin),
-// inject the appropriate dismiss keystroke until the game is back at the
-// main command prompt. counter_id distinguishes the calling site so the
-// profiler can attribute fn_step calls correctly. Returns # fn_step calls made.
-static int nethack_drain_prompts_cat(Nethack* env, ProfCounterId fn_step_counter) {
-    int n = 0;
-#if NETHACK_AUTODISMISS
-    for (int i = 0; i < NETHACK_AUTODISMISS_MAX; i++) {
-        int xwait = env->hook_misc[2];
-        int yn    = env->hook_misc[0];
-        int gl    = env->hook_misc[1];
-        if (!xwait && !yn && !gl) break;
-        if (xwait)      { env->obs.action = '\r'; PROF_COUNT(PROF_XWAIT_DRAIN, 1); }
-        else if (yn)    { env->obs.action = 27;   PROF_COUNT(PROF_MISC_YN_ESC, 1); }
-        else /* gl */   { env->obs.action = '\r'; PROF_COUNT(PROF_MISC_GETLIN_ESC, 1); }
-        env->ctx = env->fn_step(env->ctx, &env->obs);
-        n++;
-        PROF_COUNT(PROF_FN_STEPS_TOTAL, 1);
-        PROF_COUNT(fn_step_counter, 1);
-        if (env->obs.done) break;
+// Auto-dismiss passive prompts (welcome screen, --More--, getline) until the
+// game is back at the main command prompt.
+static void nethack_drain_prompts(Nethack* env) {
+    for (int i = 0; i < NETHACK_AUTODISMISS_MAX && !env->obs.done; i++) {
+        int yn = env->misc[NETHACK_MISC_YN];
+        if (!yn && !env->misc[NETHACK_MISC_GETLIN] && !env->misc[NETHACK_MISC_XWAIT]) break;
+        env->obs.action = yn ? 27 : '\r';
+        env->ctx = nle_step(env->ctx, &env->obs);
     }
-#endif
-    return n;
+}
+
+// The agent's key can land the game in a sub-prompt it can't answer itself
+// ("Really attack?", "In what direction?", --More--). yn prompts commit the
+// agent's choice with 'y' — EXCEPT the dlvl-1 up-stairs confirm ("Beware,
+// there will be no return! Still climb?"), where 'y' ends the game as
+// ESCAPED; that one and everything else is dismissed with ESC. Returns 1 if
+// the action triggered a sub-prompt (the illegal_penalty condition).
+static int nethack_handle_prompts(Nethack* env) {
+    // Direction prompts ("In what direction?" after kick) are answerable:
+    // leave them live — the agent's next key is consumed as the direction.
+    // They arrive via yn_function, so this must precede the yn auto-answer.
+    if (env->misc[NETHACK_MISC_YN] && nethack_msg_contains(env, "n what direction"))
+        return 0;
+    // The pray confirm is a deliberate action's own prompt, not an illegal
+    // sub-prompt: commit it below but exempt it from the penalty.
+    int praying = env->misc[NETHACK_MISC_YN] && nethack_msg_contains(env, "to pray");
+    int illegal = !praying && (env->misc[NETHACK_MISC_YN] || env->misc[NETHACK_MISC_GETLIN]
+               || nethack_msg_is_prompt(env));
+    if (!illegal && !praying) {
+        if (env->misc[NETHACK_MISC_XWAIT]) nethack_drain_prompts(env);
+        return 0;
+    }
+    for (int i = 0; i < NETHACK_AUTODISMISS_MAX && !env->obs.done; i++) {
+        int yn = env->misc[NETHACK_MISC_YN];
+        if (!yn && !env->misc[NETHACK_MISC_GETLIN] && !env->misc[NETHACK_MISC_XWAIT]
+            && !nethack_msg_is_prompt(env)) break;
+        int commit = yn && !nethack_msg_contains(env, "no return");
+        env->obs.action = commit ? 'y' : 27;
+        env->ctx = nle_step(env->ctx, &env->obs);
+    }
+    if (illegal) env->episode_illegal_actions++;
+    return illegal;
 }
 
 static void nethack_init_settings(Nethack* env) {
@@ -606,40 +262,28 @@ static void nethack_init_settings(Nethack* env) {
     } else {
         strncpy(env->settings.hackdir, env->vardir, sizeof(env->settings.hackdir) - 1);
     }
-    env->settings.scoreprefix[0] = '\0';
     env->settings.spawn_monsters = 1;
-    env->settings.ttyrecname[0] = '\0';
     strncpy(env->settings.options, NETHACK_DEFAULT_OPTIONS, sizeof(env->settings.options) - 1);
-    env->settings.wizkit[0] = '\0';
 }
 
 void init(Nethack* env) {
     env->ctx = NULL;
-    env->tick = 0;
     env->prev_score = 0;
     env->prev_depth = 1;
     env->episode_return = 0.0f;
     env->episode_length = 0;
     env->vardir[0] = '\0';
-    env->dl_handle = NULL; env->dl_fd = 0;
-    env->fn_fr_snapshot = NULL;
-    env->fn_fr_restore = NULL;
-    env->fn_fr_destroy = NULL;
-    env->fr_snapshot = NULL;
 
-    // Default reward shaping coefficients. Overridable from kwargs in my_init
-    // (binding.c) before any reset/step occurs. If a binding chooses not to
-    // populate these (e.g. standalone train_bench, replay_view), the defaults
-    // below preserve the legacy compile-time behavior for descent + scout +
-    // illegal, and use R_SCORE=0.01 per ocean/nethack/REWARDS.md.
+    // Defaults used when a binding doesn't pass kwargs (standalone tools).
     env->score_coef      = 0.01f;
-    env->descent_coef    = NETHACK_DEPTH_BONUS;     // 1.0f
-    env->scout_coef      = NETHACK_SCOUT_BONUS;     // 0.1f
-    env->illegal_penalty = NETHACK_ILLEGAL_PENALTY; // -0.5f
+    env->descent_coef    = 1.0f;
+    env->scout_coef      = 0.1f;
+    env->hp_coef         = 0.0f;
+    env->illegal_penalty = -0.5f;
+    env->death_penalty   = -1.0f;
 
-    // Pick per-env seeds derived from env->rng (vecenv sets this to env index)
-    // and a process-wide base. Same construction train_bench uses at N=64,
-    // which avoids the upstream mklev hang.
+    // Per-env seeds derived from env->rng (vecenv sets it to the env index)
+    // and a process-wide base overridable via NETHACK_SEED_BASE.
     unsigned long base = 0xCAFEBEEFUL;
     const char* sb = getenv("NETHACK_SEED_BASE");
     if (sb) {
@@ -649,229 +293,178 @@ void init(Nethack* env) {
     }
     env->seed_a = base + (unsigned long)env->rng;
     env->seed_b = (base ^ 0x9E3779B97F4A7C15UL) + (unsigned long)env->rng;
-    // Don't load_lib here — c_reset will do it on first call. Avoids a
-    // redundant ~180 ms dlopen+nle_start before the user even resets.
+    // nle_start is deferred to the first c_reset (~180 ms per env).
     nethack_init_settings(env);
     nethack_bind_obs(env);
 }
 
 void c_close(Nethack* env) {
-    if (env->fr_snapshot && env->fn_fr_destroy) {
-        env->fn_fr_destroy(env->fr_snapshot);
-        env->fr_snapshot = NULL;
-    }
-    if (env->ctx != NULL && env->fn_end) {
-        env->fn_end(env->ctx);
+    if (env->ctx != NULL) {
+        nle_end(env->ctx);
         env->ctx = NULL;
     }
-    nethack_unload_lib(env);
     nethack_rm_vardir(env->vardir);
     env->vardir[0] = '\0';
 }
 
 // ---------------------------------------------------------------------------
-// Observation packing: copy enabled fields into the flat ByteTensor buffer
+// Obs packing: egocentric glyph crop + blstats truncated to int32
 // ---------------------------------------------------------------------------
 static void nethack_pack_obs(Nethack* env) {
-    unsigned char* o = env->observations;
-#if NETHACK_USE_CHARS
-    memcpy(o + NETHACK_OFF_CHARS, env->chars, NETHACK_SZ_CHARS);
-#endif
-#if NETHACK_USE_COLORS
-    memcpy(o + NETHACK_OFF_COLORS, env->colors, NETHACK_SZ_COLORS);
-#endif
-#if NETHACK_USE_SPECIALS
-    memcpy(o + NETHACK_OFF_SPECIALS, env->specials, NETHACK_SZ_SPECIALS);
-#endif
-#if NETHACK_USE_GLYPHS
-#if NETHACK_GLYPH_CROP > 0
-    {
-        int cx, cy;
-        nethack_agent_pos(env, &cx, &cy);
-        int half = NETHACK_GLYPH_CROP / 2;
-        short* dst = (short*)(o + NETHACK_OFF_GLYPHS);
-        for (int r = 0; r < NETHACK_GLYPH_CROP; r++) {
-            short* row = dst + r * NETHACK_GLYPH_CROP;
-            int gy = cy - half + r;
-            if (gy < 0 || gy >= NH_ROWS) {
-                for (int c = 0; c < NETHACK_GLYPH_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
-                continue;
-            }
-            int gx0 = cx - half;
-            int c0 = gx0 < 0 ? -gx0 : 0;
-            int c1 = gx0 + NETHACK_GLYPH_CROP > NH_COLS ? NH_COLS - gx0 : NETHACK_GLYPH_CROP;
-            for (int c = 0; c < c0; c++) row[c] = NETHACK_PAD_GLYPH;
-            memcpy(row + c0, env->glyphs + gy * NH_COLS + gx0 + c0, (size_t)(c1 - c0) * sizeof(short));
-            for (int c = c1; c < NETHACK_GLYPH_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
+    int cx = (int)env->blstats[NLE_BL_X];   // 0-based, aligned with glyphs
+    int cy = (int)env->blstats[NLE_BL_Y];
+    int half = NETHACK_CROP / 2;
+    short* dst = (short*)(env->observations + NETHACK_OFF_GLYPHS);
+    for (int r = 0; r < NETHACK_CROP; r++) {
+        short* row = dst + r * NETHACK_CROP;
+        int gy = cy - half + r;
+        if (gy < 0 || gy >= NH_ROWS) {
+            for (int c = 0; c < NETHACK_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
+            continue;
         }
+        int gx0 = cx - half;
+        int c0 = gx0 < 0 ? -gx0 : 0;
+        int c1 = gx0 + NETHACK_CROP > NH_COLS ? NH_COLS - gx0 : NETHACK_CROP;
+        for (int c = 0; c < c0; c++) row[c] = NETHACK_PAD_GLYPH;
+        memcpy(row + c0, env->glyphs + gy * NH_COLS + gx0 + c0, (size_t)(c1 - c0) * sizeof(short));
+        for (int c = c1; c < NETHACK_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
     }
-#else
-    memcpy(o + NETHACK_OFF_GLYPHS, env->glyphs, NETHACK_SZ_GLYPHS);
-#endif
-#endif
-#if NETHACK_USE_BLSTATS
-    // Pack 27 longs as 27 int32s (truncate; NetHack stat values fit in i32).
-    int32_t* dst = (int32_t*)(o + NETHACK_OFF_BLSTATS);
-    for (int i = 0; i < NLE_BLSTATS_SIZE; i++) dst[i] = (int32_t)env->blstats[i];
-#endif
-#if NETHACK_USE_MESSAGE
-    memcpy(o + NETHACK_OFF_MESSAGE, env->message, NETHACK_SZ_MESSAGE);
-#endif
-#if NETHACK_USE_INV
-    memcpy(o + NETHACK_OFF_INV,                          env->inv_letters,  NLE_INVENTORY_SIZE);
-    memcpy(o + NETHACK_OFF_INV + NLE_INVENTORY_SIZE,     env->inv_oclasses, NLE_INVENTORY_SIZE);
-#endif
+    unsigned char* bl = env->observations + NETHACK_OFF_BLSTATS;
+    for (int i = 0; i < NLE_BLSTATS_SIZE; i++) {
+        uint32_t v = (uint32_t)(int32_t)env->blstats[i];
+        bl[4*i + 0] = (unsigned char)(v & 0xffu);
+        bl[4*i + 1] = (unsigned char)((v >> 8) & 0xffu);
+        bl[4*i + 2] = (unsigned char)((v >> 16) & 0xffu);
+        bl[4*i + 3] = (unsigned char)((v >> 24) & 0xffu);
+    }
 }
 
-static void nethack_add_log(Nethack* env) {
+// how = nle_obs.how_done when the game ended (0=DIED, 3=STARVING, ...),
+// -1 when the episode was truncated at the step cap.
+static void nethack_add_log(Nethack* env, int how) {
     env->log.perf            += (float)env->prev_score;
     env->log.score           += (float)env->prev_score;
     env->log.depth           += (float)env->prev_depth;
     env->log.valid_moves     += (float)env->episode_valid_moves;
     env->log.illegal_actions += (float)env->episode_illegal_actions;
     env->log.new_tiles       += (float)env->episode_new_tiles;
+    env->log.max_depth       += (float)env->episode_max_depth;
+    env->log.prayers         += (float)env->episode_prayers;
+    env->log.prayers_low_hp  += (float)env->episode_prayers_low_hp;
+    env->log.searches        += (float)env->episode_searches;
+    env->log.damage_taken    += (float)env->episode_damage;
+    env->log.game_time       += (float)env->prev_time;
+    env->log.max_xp_level    += (float)env->episode_max_xp;
     env->log.episode_return  += env->episode_return;
     env->log.episode_length  += env->episode_length;
+    if (how == -1)     env->log.truncated      += 1.0f;
+    else if (how == 0) env->log.death_combat   += 1.0f;
+    else if (how == 3) env->log.death_starved  += 1.0f;
+    else               env->log.death_other    += 1.0f;
     env->log.n               += 1.0f;
 }
 
-// Per-episode bookkeeping reset (counters, exploration bitmap, obs pack).
-// Called by both the slow and fast c_reset paths.
-static void nethack_reset_bookkeeping(Nethack* env) {
-    env->tick = 0;
-    env->prev_score = 0;
-#if NETHACK_USE_BLSTATS
-    env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
-#else
-    env->prev_depth = 1;
-#endif
-    env->episode_return = 0.0f;
-    env->episode_length = 0;
-    env->episode_start_time = nethack_current_time(env);
-    env->episode_valid_moves = 0;
-    env->episode_illegal_actions = 0;
-    env->episode_new_tiles = 0;
-    memset(env->visited, 0, sizeof(env->visited));
-    env->visited_level = 0;
-    env->rewards[0] = 0.0f;
-    env->terminals[0] = 0.0f;
-    PROF_START(reset_obs_pack);
-    nethack_pack_obs(env);
-    PROF_END(reset_obs_pack, PROF_OBS_PACK);
-}
+// End the previous game (if any), start a fresh one, drain the welcome
+// prompts, zero the episode bookkeeping. Concurrent resets across envs are
+// safe: first-init paths in the vendored NLE are CAS-guarded idempotent and
+// per-game state lives on nle_ctx_t.
+static void nethack_do_reset(Nethack* env) {
 
-// Slow path: dlopen + nle_start + drain welcome. Called on first c_reset
-// (and on every reset when NETHACK_FAST_RESET is disabled).
-//
-// The previous process-wide nethack_slow_reset_mu is removed.
-// All named hazards it guarded are now safe under concurrent c_reset:
-//   - choose_windows / windowprocs: idempotent CAS-guarded first-init-wins
-//     in vendor/nle/src/src/windows.c.
-//   - dlb_init / dlb_libs[]: idempotent CAS-guarded first-init-wins in
-//     vendor/nle/src/src/dlb.c.
-//   - nle_baseline: lazily allocated empty `struct nle_dungeon_save` whose
-//     save/load functions are no-ops; even a
-//     concurrent double-calloc only leaks one zero-filled blob.
-//   - init_artifacts memset of artidisco[]: artidisco is now per-env on
-//     nle_ctx_t (see previous commit).
-//   - All "many libnethack `.data` globals" called out in the original
-//     comment: now fully migrated. Every write reached from nle_start -> init_nle ->
-//     mainloop -> unixmain -> moveloop -> init_nethack / u_init /
-//     init_dungeons / init_objects / init_artifacts now targets a
-//     current_nle_ctx->s_* field (or a same-value-every-time process-shared
-//     register that is idempotent across envs).
-//
-// Removing the mutex restores concurrent reset: with N envs spread across
-// pthread workers, env i's c_reset no longer serializes against env j's.
-static void nethack_slow_reset(Nethack* env) {
-    PROF_START(nle_end);
-    if (env->ctx != NULL && env->fn_end) {
-        env->fn_end(env->ctx);
+    if (env->ctx != NULL) {
+        nle_end(env->ctx);
         env->ctx = NULL;
     }
-    if (env->dl_handle != NULL) {
-        nethack_unload_lib(env);
-    }
-    PROF_END(nle_end, PROF_RESET_NLE_END);
 
-    if (nethack_load_lib(env) != 0) {
-        fprintf(stderr, "nethack: failed to reload libnethack on reset\n");
-        return;
-    }
     nethack_bind_obs(env);
-    env->obs.action = 0;
-    env->obs.done = 0;
-    env->obs.in_normal_game = 0;
-    env->obs.how_done = 0;
+    env->obs.how_done = -2;   // only really_done() sets it; abnormal end -> death_other
 
-    if (env->fn_start == NULL) {
-        fprintf(stderr, "nethack: fn_start is NULL — load_lib failed\n");
-        return;
-    }
-    PROF_START(nle_start);
-    // Advance the per-env LCG so each reset gets a fresh seed. Without
-    // explicit seeds, NetHack's internal randomness can land on level-gen
-    // seeds that infinite-loop in mklev/topologize. The LCG constants
-    // (Numerical Recipes / MMIX) are the same as train_bench.
+    // Advance the per-env LCG (Numerical Recipes / MMIX constants) so each
+    // reset gets a fresh, known-safe seed.
     env->seed_a = env->seed_a * 6364136223846793005UL + 1442695040888963407UL;
     env->seed_b = env->seed_b * 6364136223846793005UL + 1442695040888963407UL;
     nle_seeds_init_t seeds;
     memset(&seeds, 0, sizeof(seeds));
     seeds.seeds[0] = env->seed_a;
     seeds.seeds[1] = env->seed_b;
-    seeds.reseed = 0;
-    env->ctx = env->fn_start(&env->obs, NULL, &seeds, &env->settings);
-    PROF_END(nle_start, PROF_RESET_NLE_START);
+    env->ctx = nle_start(&env->obs, NULL, &seeds, &env->settings);
 
-    PROF_START(reset_drain);
-    nethack_drain_prompts_cat(env, PROF_FN_STEPS_RESET_DRAIN);
-    PROF_END(reset_drain, PROF_RESET_DRAIN);
-}
+    nethack_drain_prompts(env);
 
-static void nethack_do_reset(Nethack* env) {
-    PROF_INIT_IF_NEEDED();
-    PROF_START(reset_total);
-    PROF_COUNT(PROF_C_RESETS, 1);
-
-#if NETHACK_FAST_RESET
-    if (env->fr_snapshot && env->fn_fr_restore) {
-        env->fn_fr_restore(env->ctx, env->fr_snapshot);
-        nethack_bind_obs(env);
-        env->obs.done = 0;
-        env->obs.in_normal_game = 0;
-        env->obs.how_done = 0;
-        nethack_reset_bookkeeping(env);
-        PROF_END(reset_total, PROF_C_RESET_TOTAL);
-        return;
-    }
-#endif
-
-    nethack_slow_reset(env);
-
-#if NETHACK_FAST_RESET
-    if (env->fn_fr_snapshot && env->fr_snapshot == NULL && env->ctx) {
-        env->fr_snapshot = env->fn_fr_snapshot(env->ctx);
-        if (env->fr_snapshot == NULL) {
-            fprintf(stderr, "nethack: nle_fr_snapshot returned NULL; "
-                            "fast-reset will fall back to slow path\n");
-        }
-    } else if (env->fn_fr_snapshot == NULL && env->fr_snapshot == NULL) {
-        static int warned = 0;
-        if (!warned) {
-            fprintf(stderr, "nethack: NETHACK_FAST_RESET=1 but loaded "
-                            "libnethack.so does not export nle_fr_snapshot; "
-                            "falling back to slow path\n");
-            warned = 1;
-        }
-    }
-#endif
-
-    nethack_reset_bookkeeping(env);
-    PROF_END(reset_total, PROF_C_RESET_TOTAL);
+    env->prev_score = 0;
+    env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
+    env->prev_hp = env->blstats[NLE_BL_HP];
+    env->prev_time = env->blstats[NLE_BL_TIME];
+    env->episode_max_depth = env->prev_depth;
+    env->episode_max_xp = (int)env->blstats[NLE_BL_XP];
+    env->episode_return = 0.0f;
+    env->episode_length = 0;
+    env->episode_valid_moves = 0;
+    env->episode_illegal_actions = 0;
+    env->episode_new_tiles = 0;
+    env->episode_prayers = 0;
+    env->episode_prayers_low_hp = 0;
+    env->episode_searches = 0;
+    env->episode_damage = 0;
+    memset(env->visited, 0, sizeof(env->visited));
+    env->rewards[0] = 0.0f;
+    env->terminals[0] = 0.0f;
+    nethack_pack_obs(env);
 }
 
 void c_reset(Nethack* env) {
     env->pending_reset = 1;
+}
+
+// reward = score delta + one-shot descent bonus + first-visit scout bonus
+// + illegal penalty. Never evaluated on the terminal step: NLE zeroes blstats
+// when the game ends, so the terms would read garbage there (the score-delta
+// term would claw back the episode's entire score reward). The terminal step
+// gets death_penalty instead (see c_step).
+static float nethack_shaped_reward(Nethack* env, int illegal) {
+    long score = env->blstats[NLE_BL_SCORE];
+    int depth = (int)env->blstats[NLE_BL_DEPTH];
+    long px = env->blstats[NLE_BL_X];
+    long py = env->blstats[NLE_BL_Y];
+
+    float r = env->score_coef * (float)(score - env->prev_score);
+
+    // Descent: paid only on new episode-max depth. The per-transition form
+    // was yo-yo farmable (down-up-down re-earned); the max form is potential-
+    // based (phi = deepest level reached) and never taxes retreating up.
+    if (depth > env->episode_max_depth) {
+        r += env->descent_coef * (float)(depth - env->episode_max_depth);
+        env->episode_max_depth = depth;
+    }
+
+    // HP potential: heals give back what damage took away; net signal is the
+    // dense precursor of combat death. Cash-out on the death step claws back
+    // the remaining potential.
+    long hp = env->blstats[NLE_BL_HP];
+    r += env->hp_coef * (float)(hp - env->prev_hp);
+    if (hp < env->prev_hp) env->episode_damage += env->prev_hp - hp;
+    env->prev_hp = hp;
+    env->prev_time = env->blstats[NLE_BL_TIME];
+    int xp = (int)env->blstats[NLE_BL_XP];
+    if (xp > env->episode_max_xp) env->episode_max_xp = xp;
+
+    // Scout: first visit to a tile of this dungeon level this episode.
+    // Per-level bitmaps persist across level changes, so stair yo-yo
+    // cannot re-earn the bonus.
+    if (px >= 0 && px < NH_COLS && py >= 0 && py < NH_ROWS) {
+        int d = depth < 1 ? 0 : (depth > NETHACK_MAX_DEPTH ? NETHACK_MAX_DEPTH - 1 : depth - 1);
+        int bit = (int)py * NH_COLS + (int)px;
+        unsigned char mask = (unsigned char)(1 << (bit & 7));
+        if (!(env->visited[d][bit >> 3] & mask)) {
+            env->visited[d][bit >> 3] |= mask;
+            r += env->scout_coef;
+            env->episode_new_tiles++;
+        }
+    }
+
+    if (illegal) r += env->illegal_penalty;
+    env->prev_score = score;
+    env->prev_depth = depth;
+    return r;
 }
 
 void c_step(Nethack* env) {
@@ -879,167 +472,41 @@ void c_step(Nethack* env) {
         env->pending_reset = 0;
         nethack_do_reset(env);
     }
-    PROF_INIT_IF_NEEDED();
-    PROF_START(c_step_total);
-    PROF_COUNT(PROF_C_STEPS, 1);
-#if NETHACK_PROFILE
-    unsigned long fn_step_calls_before = g_prof.counters[PROF_FN_STEPS_TOTAL];
-#endif
-    int action_idx = (int)env->actions[0];
-    if (action_idx < 0) action_idx = 0;
-    if (action_idx >= NETHACK_NUM_ACTIONS) action_idx = NETHACK_NUM_ACTIONS - 1;
-    env->obs.action = NETHACK_ACTION_TABLE[action_idx];
 
-    long time_before = nethack_current_time(env);
-    PROF_START(agent_fn_step);
-    env->ctx = env->fn_step(env->ctx, &env->obs);
-    PROF_END(agent_fn_step, PROF_AGENT_FN_STEP);
-    PROF_COUNT(PROF_FN_STEPS_TOTAL, 1);
-    PROF_COUNT(PROF_FN_STEPS_AGENT, 1);
+    int a = (int)env->actions[0];
+    if (a < 0 || a >= NETHACK_NUM_ACTIONS) a = 0;
+    env->obs.action = NETHACK_ACTION_TABLE[a];
 
-    // Determine whether the agent's action landed in a sub-prompt:
-    //   (a) misc[] flags (yn / getlin) — strong signal
-    //   (b) message ends with '?' — catches single-key prompts NLE doesn't
-    //       expose via misc, e.g. "In what direction do you want to throw?",
-    //       "Apply what?", "What do you want to wield?". Legitimate game
-    //       messages ("It's a wall.", "You feel...") don't end in '?'.
-    int yn_or_getlin = (env->hook_misc[0] || env->hook_misc[1]);
-    int xwait        = env->hook_misc[2];
-    int msg_is_prompt = 0;
-    const unsigned char* msg = nethack_msg(env);
-    if (msg[0]) {
-        int end = 0;
-        while (end < NLE_MESSAGE_SIZE && msg[end]) end++;
-        // Trim trailing spaces.
-        while (end > 0 && msg[end-1] == ' ') end--;
-        if (end > 0 && msg[end-1] == '?') msg_is_prompt = 1;
+    if (a == 19) env->episode_searches++;
+    if (a == 20) {
+        env->episode_prayers++;
+        long hp = env->blstats[NLE_BL_HP], hpmax = env->blstats[NLE_BL_HPMAX];
+        if (4 * hp <= hpmax) env->episode_prayers_low_hp++;
     }
 
-    int illegal = yn_or_getlin || msg_is_prompt;
-    PROF_START(post_drain);
-    if (illegal) {
-        // Auto-dismiss prompts the agent can't handle:
-        //   yn_function (misc[0]): answer 'y' — commit to the action the agent chose
-        //   getlin (misc[1]): ESC — can't type a string
-        //   --More-- / trailing '?': ESC
-        for (int i = 0; i < NETHACK_AUTODISMISS_MAX; i++) {
-            int is_yn   = env->hook_misc[0];
-            int is_getlin = env->hook_misc[1];
-            int is_xwait  = env->hook_misc[2];
-            int still_prompt = (is_yn || is_getlin || is_xwait);
-            if (!still_prompt) {
-                const unsigned char* m2 = nethack_msg(env);
-                int e = 0; while (e < NLE_MESSAGE_SIZE && m2[e]) e++;
-                while (e > 0 && m2[e-1] == ' ') e--;
-                if (e == 0 || m2[e-1] != '?') break;
-            }
-            env->obs.action = is_yn ? 'y' : 27;  // yn→yes, everything else→ESC
-            env->ctx = env->fn_step(env->ctx, &env->obs);
-            PROF_COUNT(PROF_FN_STEPS_TOTAL, 1);
-            PROF_COUNT(PROF_FN_STEPS_POST_DRAIN, 1);
-            PROF_COUNT(PROF_MSG_PROMPT_ESC, msg_is_prompt && !yn_or_getlin ? 1 : 0);
-            if (env->obs.done) break;
-        }
-        env->episode_illegal_actions++;
-        PROF_COUNT(PROF_ILLEGAL_ACTIONS, 1);
-    } else if (xwait) {
-        nethack_drain_prompts_cat(env, PROF_FN_STEPS_POST_DRAIN);
-    }
-    PROF_END(post_drain, PROF_POST_DRAIN);
-
-    long time_after = nethack_current_time(env);
-    if (time_after > time_before) {
-        env->episode_valid_moves++;
-        PROF_COUNT(PROF_VALID_MOVES, 1);
-    } else {
-        // No time advance: classify why.
-        if (illegal) {
-            PROF_COUNT(PROF_NOADV_PROMPT_DETECTED, 1);
-        } else {
-            // No prompt detected. Did NetHack at least show a message?
-            const unsigned char* m = nethack_msg(env);
-            if (m[0]) PROF_COUNT(PROF_NOADV_HAS_MSG, 1);
-            else      PROF_COUNT(PROF_NOADV_SILENT, 1);
-        }
-    }
-
-    env->tick++;
+    long time_before = env->blstats[NLE_BL_TIME];
+    env->ctx = nle_step(env->ctx, &env->obs);
+    int illegal = nethack_handle_prompts(env);
+    if (env->blstats[NLE_BL_TIME] > time_before) env->episode_valid_moves++;
     env->episode_length++;
 
-    long score = 0; int depth = env->prev_depth;
-    long px = 0, py = 0;
-#if NETHACK_USE_BLSTATS
-    score = env->blstats[NLE_BL_SCORE];
-    depth = (int)env->blstats[NLE_BL_DEPTH];
-    px = env->blstats[NLE_BL_X];
-    py = env->blstats[NLE_BL_Y];
-#else
-    score = env->hook_blstats[NLE_BL_SCORE];
-    depth = (int)env->hook_blstats[NLE_BL_DEPTH];
-    px = env->hook_blstats[NLE_BL_X];
-    py = env->hook_blstats[NLE_BL_Y];
-#endif
-    // ---- Reward shaping (each term independently toggleable) ----
-    // See ocean/nethack/REWARDS.md for the recipe to add more terms.
-    // score-delta term: positive whenever NetHack's score increases (kills,
-    // depth, gold pickup, etc.). Score is monotonic non-decreasing modulo
-    // some rare deaths/penalties; set score_coef=0 to disable entirely.
-    float reward = env->score_coef * (float)(score - env->prev_score);
-
-    // Depth-changed bonus + reset exploration bitmap.
-    if (depth != env->visited_level) {
-        memset(env->visited, 0, sizeof(env->visited));
-        env->visited_level = depth;
-    }
-    // Descent term: one-shot bonus on each new max-depth step (positive only
-    // — we never charge the agent for going back up, so it cannot game the
-    // signal by yo-yo'ing between levels via score-delta on score loss).
-    if (depth > env->prev_depth) reward += env->descent_coef * (float)(depth - env->prev_depth);
-
-    // Scout bonus: reward each new (row,col) entered this level.
-    // px is column (0..79), py is row (0..21). Clamp defensively.
-    if (px >= 0 && px < NH_COLS && py >= 0 && py < NH_ROWS) {
-        int bit_idx = (int)py * NH_COLS + (int)px;
-        unsigned char* b = &env->visited[bit_idx >> 3];
-        unsigned char mask = (unsigned char)(1 << (bit_idx & 7));
-        if (!(*b & mask)) {
-            *b |= mask;
-            reward += env->scout_coef;
-            env->episode_new_tiles++;
-        }
-    }
-
-    if (illegal) reward += env->illegal_penalty;
-    if (!env->obs.done) {
-        env->prev_score = score;
-        env->prev_depth = depth;
-    }
-
+    float reward = env->obs.done
+        ? env->death_penalty - env->hp_coef * (float)env->prev_hp
+        : nethack_shaped_reward(env, illegal);
     env->rewards[0] = reward;
     env->episode_return += reward;
 
-    if (env->obs.done || env->episode_length >= NETHACK_MAX_EPISODE_STEPS) {
-        env->terminals[0] = 1.0f;
-        nethack_add_log(env);
-        PROF_START(obs_pack_done);
-        nethack_pack_obs(env);
-        PROF_END(obs_pack_done, PROF_OBS_PACK);
-        PROF_END(c_step_total, PROF_C_STEP_TOTAL);
-        PROF_FN_STEPS_PER_C_STEP(g_prof.counters[PROF_FN_STEPS_TOTAL] - fn_step_calls_before);
+    int done = env->obs.done || env->episode_length >= NETHACK_MAX_EPISODE_STEPS;
+    env->terminals[0] = done ? 1.0f : 0.0f;   // truncation reported as terminal too
+    if (done) {
+        nethack_add_log(env, env->obs.done ? env->obs.how_done : -1);
         c_reset(env);
-        return;
     }
-    env->terminals[0] = 0.0f;
-    PROF_START(obs_pack);
     nethack_pack_obs(env);
-    PROF_END(obs_pack, PROF_OBS_PACK);
-    PROF_END(c_step_total, PROF_C_STEP_TOTAL);
-    PROF_FN_STEPS_PER_C_STEP(g_prof.counters[PROF_FN_STEPS_TOTAL] - fn_step_calls_before);
 }
 
 void c_render(Nethack* env) {
     printf("\x1b[H\x1b[2J");
-#if NETHACK_USE_CHARS
     for (int r = 0; r < NH_ROWS; r++) {
         for (int c = 0; c < NH_COLS; c++) {
             unsigned char ch = env->chars[r * NH_COLS + c];
@@ -1047,19 +514,10 @@ void c_render(Nethack* env) {
         }
         putchar('\n');
     }
-#else
-    printf("(chars obs disabled)\n");
-#endif
-#if NETHACK_USE_BLSTATS
     printf("HP %ld/%ld  AC %ld  Dlvl %ld  Score %ld  T %ld\n",
            env->blstats[NLE_BL_HP], env->blstats[NLE_BL_HPMAX],
-           env->blstats[NLE_BL_AC],
-           env->blstats[NLE_BL_DEPTH],
-           env->blstats[NLE_BL_SCORE],
-           env->blstats[NLE_BL_TIME]);
-#endif
-#if NETHACK_USE_MESSAGE
+           env->blstats[NLE_BL_AC], env->blstats[NLE_BL_DEPTH],
+           env->blstats[NLE_BL_SCORE], env->blstats[NLE_BL_TIME]);
     printf("Msg: %.*s\n", NLE_MESSAGE_SIZE, env->message);
-#endif
     fflush(stdout);
 }

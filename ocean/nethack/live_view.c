@@ -67,13 +67,13 @@ static const char *ansi_fg[16] = {
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_CLEAR "\x1b[2J\x1b[H"
 
-/* 18-action default action set (NETHACK_ACTION_SET == 1) */
-static const int ACTION_TABLE[18] = {
+/* Matches NETHACK_ACTION_TABLE in nethack.h */
+static const int ACTION_TABLE[21] = {
     'k', 'j', 'h', 'l', 'y', 'u', 'b', 'n',
     'K', 'J', 'H', 'L', 'Y', 'U', 'B', 'N',
-    '.', 's',
+    '>', '<', 4, 's', 0x80|'p',
 };
-#define NUM_ACTIONS 18
+#define NUM_ACTIONS 21
 
 static int make_vardir(const char *src, char *out, size_t cap)
 {
