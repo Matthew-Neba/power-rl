@@ -67,7 +67,9 @@ static const char *ansi_fg[16] = {
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_CLEAR "\x1b[2J\x1b[H"
 
-/* Matches NETHACK_ACTION_TABLE in nethack.h */
+/* Matches NETHACK_ACTION_TABLE in nethack.h, minus the trailing macros
+ * (21 Elbereth, 22 wear, 23 eat) — those are c_step-level key sequences,
+ * not raw keys, and this viewer feeds raw keys. */
 static const int ACTION_TABLE[21] = {
     'k', 'j', 'h', 'l', 'y', 'u', 'b', 'n',
     'K', 'J', 'H', 'L', 'Y', 'U', 'B', 'N',

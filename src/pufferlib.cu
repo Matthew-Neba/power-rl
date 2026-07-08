@@ -1676,6 +1676,11 @@ void train_impl(PuffeRL& pufferl) {
     }
     pufferl.epoch += 1;
 
+    // Refresh encoder-derived weight state (e.g. fused lookup tables) once per
+    // epoch so the coming rollouts read post-update values.
+    if (pufferl.policy.encoder.post_step)
+        pufferl.policy.encoder.post_step(pufferl.weights.encoder, train_stream);
+
     cudaStreamSynchronize(pufferl.default_stream);
 
     if (total_minibatches > 0) {

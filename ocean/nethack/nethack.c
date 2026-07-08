@@ -5,11 +5,11 @@
 #include "../../src/puffernet.h"
 
 // Action index -> printable label for the trajectory log.
-// Matches NETHACK_ACTION_TABLE: k j h l y u b n  K J H L Y U B N  > < ^D s M-p
+// Matches NETHACK_ACTION_TABLE: k j h l y u b n  K J H L Y U B N  > < ^D s M-p E W e
 static const char* NETHACK_ACTION_NAMES[NETHACK_NUM_ACTIONS] = {
     "N","S","W","E","NW","NE","SW","SE",
     "N_RUN","S_RUN","W_RUN","E_RUN","NW_RUN","NE_RUN","SW_RUN","SE_RUN",
-    "DOWN_STAIRS","UP_STAIRS","KICK","SEARCH","PRAY",
+    "DOWN_STAIRS","UP_STAIRS","KICK","SEARCH","PRAY","ELBERETH","WEAR","EAT",
 };
 
 static double now_sec(void) {
@@ -26,7 +26,7 @@ static double now_sec(void) {
 // ---------------------------------------------------------------------------
 #define DEMO_VOCAB   5977
 #define DEMO_EMBED   32
-#define DEMO_BL_FEAT 45
+#define DEMO_BL_FEAT 88   // 25 scalars + hunger 7 + cond 13 + cooldown + prevact 24 + counts 18
 #define DEMO_CONV    1024                       // conv2 out, 64ch x 4x4, NCHW flat
 #define DEMO_CONCAT  (DEMO_CONV + 64 + DEMO_BL_FEAT)
 
@@ -60,24 +60,21 @@ typedef struct {
 // The checkpoint's float count uniquely determines (hidden, layers): all
 // encoder tensors are fixed except proj, and every tensor is a multiple of
 // 8 floats (the dump's 16-byte alignment), so
-//   total = ENC_FIXED + H*(1133 + 1 + A + 1) + L * 3*H*H.
-// A (action count) is also inferred: 21 = current, 20 = pre-pray checkpoints
-// (actions are appended, so old action indices are unchanged).
+//   total = ENC_FIXED + H*(DEMO_CONCAT + 1 + A + 1) + L * 3*H*H.
+// Only the current action count is considered: the v1-bundle obs layout
+// (extra stats segment, 88 bl feats) broke every earlier checkpoint anyway.
 #define DEMO_ENC_FIXED (51200 + 64 + 36864 + 64 + DEMO_VOCAB*DEMO_EMBED + 64*DEMO_BL_FEAT + 64)
 // Ambiguities are possible (e.g. 380768 floats = 64/2/18 = 32/20/19);
 // prefer the fewest layers — real configs have <= 8.
 static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
-    static const int CAND_A[2] = {NETHACK_NUM_ACTIONS, NETHACK_NUM_ACTIONS - 1};
     int best_l = 1 << 30;
-    for (int a = 0; a < 2; a++) {
-        for (int H = 8; H <= 4096; H += 8) {
-            long rem = (long)total - DEMO_ENC_FIXED - (long)H * (DEMO_CONCAT + 1 + CAND_A[a] + 1);
-            long per_layer = 3L * H * H;
-            if (rem <= 0) break;
-            if (rem % per_layer) continue;
-            long L = rem / per_layer;
-            if (L >= 1 && L < best_l) { best_l = (int)L; *hidden = H; *layers = (int)L; *actions = CAND_A[a]; }
-        }
+    for (int H = 8; H <= 4096; H += 8) {
+        long rem = (long)total - DEMO_ENC_FIXED - (long)H * (DEMO_CONCAT + 1 + NETHACK_NUM_ACTIONS + 1);
+        long per_layer = 3L * H * H;
+        if (rem <= 0) break;
+        if (rem % per_layer) continue;
+        long L = rem / per_layer;
+        if (L >= 1 && L < best_l) { best_l = (int)L; *hidden = H; *layers = (int)L; *actions = NETHACK_NUM_ACTIONS; }
     }
     return best_l == 1 << 30 ? -1 : 0;
 }
@@ -139,6 +136,10 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {
     int hunger = bl[21] < 0 ? 0 : (bl[21] > 6 ? 6 : bl[21]);
     for (int h = 0; h < 7; h++) f[j++] = (h == hunger) ? 1.f : 0.f;
     for (int k = 0; k < 13; k++) f[j++] = (float)(((uint32_t)bl[25] >> k) & 1u);
+    const int32_t* ex = (const int32_t*)(obs + NETHACK_OFF_EXTRA);
+    f[j++] = log1pf(fmaxf((float)ex[0], 0.f)) * 0.1f;   // prayer cooldown
+    for (int h = 0; h < NETHACK_NUM_ACTIONS; h++) f[j++] = (h == ex[1]) ? 1.f : 0.f;
+    for (int k = 0; k < NETHACK_NUM_OCLASSES; k++) f[j++] = (float)ex[2 + k] * 0.125f;
 
     float* blout = net->concat + DEMO_CONV;
     _linear(f, net->bl_w, net->bl_b, blout, 1, DEMO_BL_FEAT, 64);
@@ -206,6 +207,13 @@ static void run_demo(long max_steps, int frame_ms) {
         printf("demo: episodes=%.0f  avg_score=%.1f  avg_len=%.0f  avg_depth=%.2f  max_dlvl=%ld\n",
                env.log.n, env.log.score / env.log.n, env.log.episode_length / env.log.n,
                env.log.depth / env.log.n, max_dlvl);
+        printf("areas: mines=%.2f  minetown=%.2f  deep_mines=%.2f  main_d5=%.2f  sokoban=%.2f\n",
+               env.log.reach_mines / env.log.n, env.log.reach_minetown / env.log.n,
+               env.log.reach_deep_mines / env.log.n, env.log.reach_main_d5 / env.log.n,
+               env.log.reach_sokoban / env.log.n);
+        printf("items: wears=%.2f  eats=%.2f  engraves=%.2f (per episode)\n",
+               env.log.wears / env.log.n, env.log.eats / env.log.n,
+               env.log.engraves / env.log.n);
     }
     c_close(&env);
     free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);

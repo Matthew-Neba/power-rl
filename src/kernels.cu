@@ -301,15 +301,14 @@ void puf_mm_nn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cud
         a->data, b->data, out->data, stream);
 }
 
-// puf_mm_tn for tiny-output/huge-K weight grads (e.g. M,N < 256, K > 100k).
-// cublasGemmEx picks a near-serial kernel for these shapes (a handful of
-// blocks, no split-K); cublasLt's heuristic with a workspace splits the K
-// reduction properly. Semantics identical to puf_mm_tn.
-void puf_mm_tn_splitk(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
-    int M = a->shape[ndim(a->shape)-1];
-    int K = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
-    int N = b->shape[ndim(b->shape)-1];
-
+// cublasGemmExDense through cublasLt's heuristic + workspace. GemmEx picks
+// near-serial kernels for skinny or odd shapes (tiny-output/huge-K weight
+// grads, muon's Newton-Schulz on wide encoder projections); the Lt heuristic
+// split-Ks them properly. Same math, fp32 accumulation either way.
+static inline void cublasLtGemmDense(
+        cublasOperation_t op_a, cublasOperation_t op_b,
+        int M, int N, int K, void* A, void* B, void* C,
+        cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
     static thread_local cublasLtHandle_t lt = nullptr;
     static thread_local void* lt_ws = nullptr;
     static const size_t LT_WS_BYTES = 64 * 1024 * 1024;
@@ -317,16 +316,19 @@ void puf_mm_tn_splitk(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* o
         cublasLtCreate(&lt);
         cudaMalloc(&lt_ws, LT_WS_BYTES);
     }
-    // Row-major C(M,N) = A(K,M)^T @ B(K,N) is column-major C'(N,M) = B'(N,K)^N @ A'(M,K)^T
+    // Row-major C(M,N) = op(A) @ op(B) is column-major C'(N,M) = op(B') @ op(A')
+    int lda = (op_a == CUBLAS_OP_N) ? K : M;
+    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
     cublasLtMatmulDesc_t op;
     cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_PRECISION, CUDA_R_32F);
-    cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &op_b, sizeof(op_b));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &op_a, sizeof(op_a));
     cublasLtMatrixLayout_t la, lb, lc;
-    cublasLtMatrixLayoutCreate(&la, CUBLAS_PRECISION, N, K, N);   // B: col-major (N,K) = row-major (K,N)
-    cublasLtMatrixLayoutCreate(&lb, CUBLAS_PRECISION, M, K, M);   // A: col-major (M,K) = row-major (K,M), transposed
-    cublasLtMatrixLayoutCreate(&lc, CUBLAS_PRECISION, N, M, N);   // C: col-major (N,M) = row-major (M,N)
+    cublasLtMatrixLayoutCreate(&la, CUBLAS_PRECISION,
+        op_b == CUBLAS_OP_N ? N : K, op_b == CUBLAS_OP_N ? K : N, ldb);
+    cublasLtMatrixLayoutCreate(&lb, CUBLAS_PRECISION,
+        op_a == CUBLAS_OP_N ? K : M, op_a == CUBLAS_OP_N ? M : K, lda);
+    cublasLtMatrixLayoutCreate(&lc, CUBLAS_PRECISION, N, M, N);
     cublasLtMatmulPreference_t pref;
     cublasLtMatmulPreferenceCreate(&pref);
     cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
@@ -334,18 +336,25 @@ void puf_mm_tn_splitk(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* o
     cublasLtMatmulHeuristicResult_t heur;
     int nheur = 0;
     cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &heur, &nheur);
-    float alpha = 1.0f, beta = 0.0f;
     if (nheur > 0) {
-        cublasLtMatmul(lt, op, &alpha, b->data, la, a->data, lb, &beta,
-            out->data, lc, out->data, lc, &heur.algo, lt_ws, LT_WS_BYTES, stream);
+        cublasLtMatmul(lt, op, &alpha, B, la, A, lb, &beta,
+            C, lc, C, lc, &heur.algo, lt_ws, LT_WS_BYTES, stream);
     } else {
-        cublasGemmExDense(CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, a->data, b->data, out->data, stream);
+        cublasGemmExDense(op_a, op_b, M, N, K, A, B, C, stream, alpha, beta);
     }
     cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(lc);
     cublasLtMatrixLayoutDestroy(lb);
     cublasLtMatrixLayoutDestroy(la);
     cublasLtMatmulDescDestroy(op);
+}
+
+// puf_mm_tn for tiny-output/huge-K weight grads (e.g. M,N < 256, K > 100k).
+void puf_mm_tn_splitk(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
+    int M = a->shape[ndim(a->shape)-1];
+    int K = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
+    int N = b->shape[ndim(b->shape)-1];
+    cublasLtGemmDense(CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, a->data, b->data, out->data, stream);
 }
 
 static void puf_addmm_nn(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out,

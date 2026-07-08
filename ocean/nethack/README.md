@@ -3,8 +3,9 @@
 C-level NLE binding for the PufferLib RL framework. Each env owns a
 per-env `nle_ctx_t` holding all of NetHack's mutable game state, with a
 private 64 MB memory arena. `libnethack.so` is linked directly (no
-dlopen). Auto-dismiss for prompts, fixed 990-byte observation (glyph crop
-+ blstats), reward shaping, multi-threaded OMP stepping.
+dlopen). Auto-dismiss for prompts, fixed 1070-byte observation (glyph crop
++ blstats + cooldown/prev-action/inventory stats), reward shaping,
+multi-threaded OMP stepping.
 
 ---
 
@@ -155,7 +156,7 @@ isn't already.
 
 ---
 
-## Observation (fixed, 990 bytes)
+## Observation (fixed, 1070 bytes)
 
 A single flat `ByteTensor` per agent:
 
@@ -163,17 +164,27 @@ A single flat `ByteTensor` per agent:
 |-----------|-------:|------:|---------------------------------------------|
 | `glyphs`  |      0 |   882 | 21x21 egocentric crop, int16 LE per cell     |
 | `blstats` |    882 |   108 | 27 stats, int64 truncated to int32 LE        |
+| `extra`   |    990 |    80 | 20 stats, int32 LE (see below)               |
 
 The crop is centered on the agent and padded with `NO_GLYPH` (5976)
-outside the map. This layout is exactly what the custom CUDA encoder in
-`src/ocean.cu` expects (glyph embedding -> 2 convs, blstats
-normalized/expanded -> linear, concat -> projection); it is
-gradient-checked by `tests/test_nethack_encoder.py`. `chars` and
-`message` are additionally bound to side buffers for the standalone
-tools and the prompt heuristic, but never enter the obs tensor.
+outside the map. The extra segment carries 20 env-derived stats: the
+prayer cooldown (`u.ublesscnt`, exported by a vendored NLE patch —
+makes pray timing learnable instead of superstition), the previous
+action index (-1 at episode start; a 64-dim recurrent trunk otherwise
+has to reverse-engineer what it just did from obs deltas), and 18
+per-object-class inventory item counts (stack = 1; tells the policy
+*when* WEAR/EAT are worth pressing — the macros choose the item). This
+layout is exactly what the custom CUDA encoder in `src/ocean.cu`
+expects (glyph embedding -> 2 convs, blstats+extra normalized/expanded
+to 88 features -> linear, concat -> projection); it is gradient-checked
+by `tests/test_nethack_encoder.py`. `chars`, `message`, and
+`inv_glyphs/letters/oclasses` are additionally bound to side buffers
+for the standalone tools, the prompt heuristic, and the item macros,
+but never enter the obs tensor raw (`inv_strs` stays unbound: it alone
+triggers NetHack's doname() string formatting).
 
-Two alternative encoders are selected via `NETHACK_ENCODER` at train
-time (default = conv), both gradient-checked by
+Three alternative encoders are selected via `NETHACK_ENCODER` at train
+time (default = conv), all gradient-checked by
 `tests/test_nethack_mixer.py`:
 
 - `patch`: embed(16) -> shared non-overlapping 3x3 patch linear ->
@@ -181,6 +192,9 @@ time (default = conv), both gradient-checked by
   path with far less machinery (train phase 707 vs 715 ms/epoch at
   minibatch 8192); single-tap embedding backward. Compile-time knobs
   NHM_D/NHM_C trade capacity for further speed.
+- `minpatch`: patch stem + learned token pool (49 spatial tokens ->
+  16) -> flatten || blstats -> projection. Preserves the local symbolic
+  patch primitive while shrinking spatial features from 3136 to 1024.
 - `mixer`: patch stem + one norm-free MLP-Mixer block (full-crop
   token mixing). Trains correctly but ~30% lower SPS than conv —
   bandwidth-bound elementwise passes; exists for score-per-sample
@@ -189,7 +203,7 @@ time (default = conv), both gradient-checked by
 Checkpoints are not interchangeable between encoders, and the CPU
 demo only supports the conv encoder.
 
-## Action space (21 actions)
+## Action space (24 actions)
 
 ```
  0  N            8  N_RUN         16  >  (down)
@@ -197,9 +211,9 @@ demo only supports the conv encoder.
  2  W           10  W_RUN        18  kick (^D)
  3  E           11  E_RUN        19  search (s)
  4  NW          12  NW_RUN       20  pray (M-p)
- 5  NE          13  NE_RUN
- 6  SW          14  SW_RUN
- 7  SE          15  SE_RUN
+ 5  NE          13  NE_RUN       21  engrave Elbereth (macro)
+ 6  SW          14  SW_RUN       22  wear armor (macro)
+ 7  SE          15  SE_RUN       23  eat (macro)
 ```
 
 The 8 cardinal/intercardinal moves use vi-keys (kjhl ynbu). Long
@@ -210,13 +224,37 @@ two-step sequence. Search checks adjacent squares once for hidden
 doors/passages (repeated searching raises the find chance, as in the
 real game). Pray's "Are you sure?" confirm is auto-answered 'y'; the
 gods heal low HP and cure starving, but praying too often angers them
-— when to pray is the thing to learn.
+— when to pray is the thing to learn. Engrave-Elbereth drives the full
+key sequence (`E`, `-` fingertip, "Elbereth", RET) in one env step;
+most melee monsters won't attack while the agent stands on a legible
+Elbereth square, but attacking from it smudges the text — a panic
+button, not a fortress.
+
+Wear and eat are getobj macros: the command's own prompt ("What do you
+want to wear? [bc or ?*]") already lists only the items valid for the
+verb, so the macro answers with a random listed letter and lets the
+game resolve it. Random, not first: an item the game refuses (a second
+cloak, a blocked slot) stays in the list, and a first-letter pick would
+retry it forever. Eat is gated on hunger: pressing it while Satiated is
+a no-op (the game step is skipped entirely) because eating past
+Satiated is NetHack's choke() death — ungated, EAT-happy policies
+choke themselves in a handful of presses. Corpses are never eaten:
+floor offers ("There is a lichen corpse here; eat it?") are declined
+and autopickup'd corpses are filtered out of the candidate list by
+glyph — corpse age is invisible and old or poisonous ones kill.
+Nothing wearable/edible -> no prompt -> clean no-op, no penalty.
+Autopickup is set to `$[%` (gold, armor, food) to feed both macros.
+The wear macro doesn't rank items — a body-armor suit can get worn
+(monks fight worse in suits) and cursed gear sticks; both are rare and
+part of the game. No wield action on purpose: monks fight better
+bare-handed, so a weapon slot would be a trap button.
 
 ## Reward shaping (config-tunable via nethack.ini)
 
 ```
 reward = score_coef    * (score - prev_score)           # game score delta
        + descent_coef  * (new episode-max depth only)   # yo-yo-proof descent bonus
+       + xp_coef       * (new episode-max XL only)      # power progression before descent
        + scout_coef    * (new_tile_this_level)          # exploration bonus
        + hp_coef       * (hp - prev_hp)                 # HP potential (dense survival signal)
        + illegal_penalty * (illegal_action)             # sub-prompt penalty
@@ -234,7 +272,9 @@ After each agent action, the harness inspects `misc[]`
 (`in_yn_function`, `in_getlin`, `xwaitingforspace`) plus a heuristic
 message-ends-in-`?` check:
 
-- `yn_function` prompts: auto-answered `y` (commit to the action)
+- `yn_function` prompts: auto-answered `y` (commit to the action), except
+  the dlvl-1 "no return" climb confirm and "Really attack?" (peacefuls),
+  which are dismissed with ESC
 - `getlin` prompts: auto-dismissed with ESC
 - `--More--` / `xwaitforspace`: auto-dismissed with space/ESC
 
@@ -256,6 +296,9 @@ auto-reset after `NETHACK_MAX_EPISODE_STEPS=10000` steps.
 | `prayers`          | Prayer actions per episode                             |
 | `prayers_low_hp`   | Prayers issued at <=25% max HP (learned panic button)  |
 | `searches`         | Search actions per episode                             |
+| `engraves`         | Elbereth macro actions per episode                     |
+| `wears`            | Wear macro presses that chose an item, per episode     |
+| `eats`             | Eat macro presses that chose an item, per episode      |
 | `damage_taken`     | Sum of HP lost per episode                             |
 | `game_time`        | NetHack turns survived (steps can compress many turns) |
 | `max_xp_level`     | Highest experience level reached                       |
@@ -263,6 +306,11 @@ auto-reset after `NETHACK_MAX_EPISODE_STEPS=10000` steps.
 | `death_starved`    | Fraction of episodes ended by STARVING                 |
 | `death_other`      | Fraction ended any other way (drowning, poison, ...)   |
 | `truncated`        | Fraction that hit the 10,000-step cap                  |
+| `reach_mines`      | Fraction that entered the Gnomish Mines                |
+| `reach_minetown`   | Fraction that reached Mines level 3+ (Minetown band)   |
+| `reach_deep_mines` | Fraction that reached Mines level 5+ (past Minetown)   |
+| `reach_main_d5`    | Fraction that reached depth 5+ in the main dungeon     |
+| `reach_sokoban`    | Fraction that entered Sokoban                          |
 
 ## Standalone tools
 

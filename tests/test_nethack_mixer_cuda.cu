@@ -1,4 +1,4 @@
-// Test harness for the Nethack Mixer encoder — thin wrapper around ocean.cu.
+// Test harness for the Nethack Mixer/Patch encoder — thin wrapper around ocean.cu.
 // Built as a float (PRECISION_FLOAT) shared lib so finite-diff gradient
 // checking is numerically meaningful. See test_nethack_mixer.py.
 #define PRECISION_FLOAT
@@ -16,8 +16,13 @@ static NethackMixerActivations* g_a = nullptr;
 static Allocator g_pa = {}, g_aa = {}, g_ga = {};
 static int g_hidden = 32;
 
-void nhm_init(int B, int hidden, int use_mixer) {
-    setenv("NETHACK_ENCODER", use_mixer ? "mixer" : "patch", 1);
+void nhm_init(int B, int hidden, int mode, int C, int D) {
+    const char* kind = mode == 1 ? "mixer" : mode == 2 ? "minpatch"
+                 : mode == 3 ? "cellflat" : "patch";
+    setenv("NETHACK_ENCODER", kind, 1);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", C); setenv("NETHACK_ENCODER_C", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", D); setenv("NETHACK_ENCODER_D", buf, 1);
     g_hidden = hidden;
     g_enc = {};
     g_enc.in_dim = NH_OBS_SIZE;
@@ -71,6 +76,7 @@ TENSOR_ACC(ch_w1,   ch_w1,   ch_w1g)
 TENSOR_ACC(ch_b1,   ch_b1,   ch_b1g)
 TENSOR_ACC(ch_w2,   ch_w2,   ch_w2g)
 TENSOR_ACC(ch_b2,   ch_b2,   ch_b2g)
+TENSOR_ACC(pool_w,  pool_w,  pool_wgrad)
 TENSOR_ACC(bl_w,    bl_w,    bl_wgrad)
 TENSOR_ACC(bl_b,    bl_b,    bl_bgrad)
 TENSOR_ACC(proj_w,  proj_w,  proj_wgrad)

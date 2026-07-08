@@ -73,6 +73,14 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     u = vals.astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, :27] = ((u >> (8 * k)) & 0xFF).astype(np.float32)
+    # extra stats @ +27*4: prayer cooldown, prev action (-1..23), 18 class counts
+    ex = np.concatenate([
+        rng.integers(0, 1000, size=(B, 1)),
+        rng.integers(-1, 24, size=(B, 1)),
+        rng.integers(0, 6, size=(B, 18)),
+    ], axis=1).astype(np.int64).astype(np.uint32)
+    for k in range(4):
+        obs[:, bl_off + k::4][:, 27:47] = ((ex >> (8 * k)) & 0xFF).astype(np.float32)
     return obs, glyphs
 
 

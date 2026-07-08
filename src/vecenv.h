@@ -256,7 +256,13 @@ static void* static_omp_threadmanager(void* arg) {
     int env_count = vec->buffer_env_counts[buf];
     atomic_int* buffer_states = threading->buffer_states;
     int num_workers = threading->num_threads / vec->buffers;
-    if (num_workers < 1) num_workers = 1;
+    if (num_workers < 1) {
+        num_workers = 1;
+        if (buf == 0)
+            printf("WARNING: num_threads %d < num_buffers %d — "
+                   "each buffer steps single-threaded\n",
+                   threading->num_threads, vec->buffers);
+    }
 
     Env* envs = (Env*)vec->envs;
 

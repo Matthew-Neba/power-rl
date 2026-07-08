@@ -1,4 +1,4 @@
-"""Numeric gradient check for the Nethack Mixer CUDA encoder (src/ocean.cu).
+"""Numeric gradient check for the Nethack Mixer/Patch CUDA encoder (src/ocean.cu).
 
 Same method as test_nethack_encoder.py: builds tests/test_nethack_mixer_cuda.cu
 as a float shared lib and verifies analytic gradients from backward() against
@@ -23,7 +23,8 @@ LIB = os.path.join(HERE, "nethack_mixer_test.so")
 VP = ctypes.c_void_p
 
 PARAMS = ["embed_w", "stem_w", "stem_b", "tok_w1", "tok_b1", "tok_w2", "tok_b2",
-          "ch_w1", "ch_b1", "ch_w2", "ch_b2", "bl_w", "bl_b", "proj_w", "proj_b"]
+          "ch_w1", "ch_b1", "ch_w2", "ch_b2", "pool_w",
+          "bl_w", "bl_b", "proj_w", "proj_b"]
 
 
 def build():
@@ -44,7 +45,7 @@ def load():
             getattr(lib, pre + p).argtypes = [VP]
             getattr(lib, pre + p).restype = None
         getattr(lib, "nhm_numel_" + p).restype = ctypes.c_int
-    lib.nhm_init.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.nhm_init.argtypes = [ctypes.c_int] * 5
     for fn in ["nhm_obs_size", "nhm_grid", "nhm_vocab", "nhm_embed_dim"]:
         getattr(lib, fn).restype = ctypes.c_int
     lib.nhm_forward.argtypes = [VP, VP, ctypes.c_int]
@@ -64,6 +65,14 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     u = vals.astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, :27] = ((u >> (8 * k)) & 0xFF).astype(np.float32)
+    # extra stats: prayer cooldown, prev action (-1..23), 18 class counts
+    ex = np.concatenate([
+        rng.integers(0, 1000, size=(B, 1)),
+        rng.integers(-1, 24, size=(B, 1)),
+        rng.integers(0, 6, size=(B, 18)),
+    ], axis=1).astype(np.int64).astype(np.uint32)
+    for k in range(4):
+        obs[:, bl_off + k::4][:, 27:47] = ((ex >> (8 * k)) & 0xFF).astype(np.float32)
     return obs, glyphs
 
 
@@ -91,17 +100,24 @@ def d2h(p, n):
     return out
 
 
-def run(lib, use_mixer=1):
+def run(lib, variant="mixer", C=64, D=16):
     B, hidden = 4, 24
-    lib.nhm_init(B, hidden, use_mixer)
-    params = PARAMS if use_mixer else [p for p in PARAMS if not p.startswith(("tok_", "ch_"))]
+    mode = {"patch": 0, "mixer": 1, "minpatch": 2, "cellflat": 3}[variant]
+    lib.nhm_init(B, hidden, mode, C, D)
+    params = PARAMS
+    if variant != "mixer":
+        params = [p for p in params if not p.startswith(("tok_", "ch_"))]
+    if variant != "minpatch":
+        params = [p for p in params if p != "pool_w"]
+    if variant == "cellflat":
+        params = [p for p in params if not p.startswith("stem_")]
     obs_size, grid = lib.nhm_obs_size(), lib.nhm_grid()
-    print("variant:", "mixer" if use_mixer else "patch")
+    print(f"variant: {variant} C={C} D={D}")
     print(f"obs_size={obs_size} grid={grid} vocab={lib.nhm_vocab()} embed_dim={lib.nhm_embed_dim()}")
 
     # Residual output layers init at zero; randomize so hidden layers get grads.
     rng = np.random.default_rng(42)
-    for name in (["tok_w2", "ch_w2"] if use_mixer else []):
+    for name in (["tok_w2", "ch_w2"] if variant == "mixer" else []):
         n = getattr(lib, "nhm_numel_" + name)()
         w = (rng.standard_normal(n) * 0.1).astype(np.float32)
         getattr(lib, "nhm_set_" + name)(w.ctypes.data_as(VP))
@@ -178,6 +194,11 @@ if __name__ == "__main__":
     if "--no-build" not in sys.argv:
         build()
     lib = load()
-    ok = run(lib, use_mixer=1)
-    ok = run(lib, use_mixer=0) and ok
+    ok = run(lib, variant="mixer")
+    ok = run(lib, variant="patch") and ok
+    ok = run(lib, variant="minpatch") and ok
+    ok = run(lib, variant="cellflat") and ok
+    ok = run(lib, variant="patch", C=96, D=48) and ok
+    ok = run(lib, variant="patch", C=128, D=32) and ok
+    ok = run(lib, variant="cellflat", D=48) and ok
     print("\nRESULT:", "PASS" if ok else "FAIL")

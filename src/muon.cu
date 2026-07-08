@@ -1,5 +1,29 @@
 #include <nccl.h>
 
+// gram = X^T @ X for tall-skinny X (R,C) with C <= 16 (e.g. d=16 glyph
+// embedding grads): cublas has no good kernel for ld=16 operands (~10x slower
+// than this; at ld=32 cublas wins again). One block per output element,
+// deterministic tree reduce.
+__global__ void muon_gram_small(
+    precision_t* __restrict__ gram, const precision_t* __restrict__ x, int R, int C) {
+    int i = blockIdx.x / C, j = blockIdx.x % C;
+    float acc = 0.0f;
+    for (int k = threadIdx.x; k < R; k += blockDim.x)
+        acc += to_float(x[(int64_t)k * C + i]) * to_float(x[(int64_t)k * C + j]);
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    __shared__ float sdata[32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    if (lane == 0) sdata[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        acc = (lane < (blockDim.x + 31) / 32) ? sdata[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) gram[i * C + j] = from_float(acc);
+    }
+}
+
 __global__ void muon_norm_reduce(float* __restrict__ out, const float* __restrict__ partials, int num_blocks) {
     __shared__ float sdata[256];
     int tid = threadIdx.x;
@@ -206,12 +230,16 @@ void muon_step(Muon* m, FloatTensor weights, PrecisionTensor grads, float max_gr
             for (int i = 0; i < 5; ++i) {
                 PrecisionTensor& src = (i % 2 == 0) ? x : x_buf;
                 PrecisionTensor& dst = (i % 2 == 0) ? x_buf : x;
-                cublasGemmExDense(gram_op_a, gram_op_b, (int)M, (int)M, (int)N,
-                    src.data, src.data, gram.data, stream);
+                if (tall && M <= 16)
+                    muon_gram_small<<<(int)(M * M), 256, 0, stream>>>(
+                        gram.data, src.data, (int)N, (int)M);
+                else
+                    cublasLtGemmDense(gram_op_a, gram_op_b, (int)M, (int)M, (int)N,
+                        src.data, src.data, gram.data, stream);
                 puf_copy(&gram_buf, &gram, stream);
                 puf_addmm_nn(&gram, &gram, &gram_buf, ns_coeffs[i][2], ns_coeffs[i][1], stream);
                 puf_copy(&dst, &src, stream);
-                cublasGemmExDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
+                cublasLtGemmDense(CUBLAS_OP_N, CUBLAS_OP_N, (int)R, (int)C, (int)M,
                     tall ? src.data : gram_buf.data, tall ? gram_buf.data : src.data, dst.data,
                     stream, 1.0f, ns_coeffs[i][0]);
             }
