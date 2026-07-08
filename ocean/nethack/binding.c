@@ -24,7 +24,7 @@ void my_init(Env* env, Dict* kwargs) {
     //   2) Set its default in init()
     //   3) Add a nethack_read_coef line here
     //   4) Add `my_coef = <default>` to [env] in config/nethack.ini
-    nethack_read_coef(kwargs, "score_coef",      &env->score_coef);
+    nethack_read_coef(kwargs, "exp_coef",        &env->exp_coef);
     nethack_read_coef(kwargs, "descent_coef",    &env->descent_coef);
     nethack_read_coef(kwargs, "scout_coef",      &env->scout_coef);
     nethack_read_coef(kwargs, "xp_coef",         &env->xp_coef);
@@ -50,6 +50,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "wears", log->wears);
     dict_set(out, "eats", log->eats);
     dict_set(out, "damage_taken", log->damage_taken);
+    dict_set(out, "reward_saturated", log->reward_saturated);
     dict_set(out, "game_time", log->game_time);
     dict_set(out, "max_xp_level", log->max_xp_level);
     dict_set(out, "death_combat", log->death_combat);

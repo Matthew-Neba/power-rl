@@ -8,8 +8,8 @@
 //   actions = 24: 8 compass moves, 8 run-moves, down (>), up (<), kick (^D),
 //             search (s), pray (M-p), engrave Elbereth (macro: E - Elbereth),
 //             wear armor (macro: W + listed letter), eat (macro: e + letter).
-//   reward  = score delta + descent + scout + illegal penalty + death
-//             penalty, per-env coefs.
+//   reward  = exp log-delta + descent + xp + scout + hp + illegal penalty
+//             + death penalty, per-env coefs. Score is logged, not rewarded.
 // One Nethack struct per agent; each owns an nle_ctx_t (all per-game NLE
 // state) and a private vardir on tmpfs for NetHack's file I/O.
 // libnethack.so is linked directly at build time.
@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <math.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -116,6 +117,7 @@ typedef struct Log {
     float wears;              // wear macro presses that chose an item
     float eats;               // eat macro presses that chose an item
     float damage_taken;       // sum of HP decreases per episode
+    float reward_saturated;   // fraction of steps with |reward| > 1 (trainer clamps there)
     float game_time;          // NetHack turns survived (run-moves advance many per step)
     float max_xp_level;       // highest experience level reached
     // Episode end reason, one-hot per episode (game_end_types in hack.h)
@@ -181,9 +183,11 @@ typedef struct Nethack {
     long episode_eats;
     long episode_damage;
     int prev_action;    // last executed action index, -1 at episode start
-    long prev_score;
+    long prev_score;    // logs only (perf/score metrics); not rewarded
+    long prev_exp;
     long prev_hp;
     long prev_time;
+    long episode_saturated;   // steps with |reward| > 1 (trainer clamp range)
     int prev_depth;
     int episode_max_depth;
     unsigned episode_areas;
@@ -194,7 +198,12 @@ typedef struct Nethack {
 
     // Reward shaping coefficients, all independently toggleable (0 = off).
     // Set from kwargs in binding.c via `[env]` keys in config/nethack.ini.
-    //   reward = score_coef   * (score - prev_score)
+    // Score itself is NOT rewarded: botl_score() = gold + exp + 50*depth, a
+    // fixed mix that overrode these coefs (depth at 50x) and saturated the
+    // trainer's [-1,1] reward clamp on every eventful step. Its one useful
+    // component (exp) is rewarded explicitly below; score stays a log metric.
+    //   reward = exp_coef     * (log1p(exp) - log1p(prev_exp))  (dense per kill,
+    //                            potential-based, tail-compressed, clamp-safe)
     //          + descent_coef * (depth - episode_max_depth), new maxima only
     //          + xp_coef      * (xp level - episode_max_xp), new maxima only
     //          + scout_coef   * (1 if new tile on this level this episode)
@@ -204,7 +213,7 @@ typedef struct Nethack {
     // ends, so the terms would read garbage); it carries death_penalty plus
     // the HP potential cash-out (-hp_coef * prev_hp — dying at high HP
     // forfeits more). Truncation at the step cap carries neither.
-    float score_coef;
+    float exp_coef;
     float descent_coef;
     float xp_coef;
     float scout_coef;
@@ -427,7 +436,7 @@ void init(Nethack* env) {
     env->vardir[0] = '\0';
 
     // Defaults used when a binding doesn't pass kwargs (standalone tools).
-    env->score_coef      = 0.01f;
+    env->exp_coef        = 0.1f;
     env->descent_coef    = 1.0f;
     env->xp_coef         = 0.0f;
     env->scout_coef      = 0.1f;
@@ -525,6 +534,8 @@ static void nethack_add_log(Nethack* env, int how) {
     env->log.wears           += (float)env->episode_wears;
     env->log.eats            += (float)env->episode_eats;
     env->log.damage_taken    += (float)env->episode_damage;
+    env->log.reward_saturated += env->episode_length > 0
+        ? (float)env->episode_saturated / (float)env->episode_length : 0.0f;
     env->log.game_time       += (float)env->prev_time;
     env->log.max_xp_level    += (float)env->episode_max_xp;
     env->log.episode_return  += env->episode_return;
@@ -568,8 +579,9 @@ static void nethack_do_reset(Nethack* env) {
     nethack_drain_prompts(env);
 
     env->prev_score = 0;
-    env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
+    env->prev_exp = env->blstats[NLE_BL_EXP];
     env->prev_hp = env->blstats[NLE_BL_HP];
+    env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
     env->prev_time = env->blstats[NLE_BL_TIME];
     env->episode_max_depth = env->prev_depth;
     env->episode_areas = 0;
@@ -586,6 +598,7 @@ static void nethack_do_reset(Nethack* env) {
     env->episode_wears = 0;
     env->episode_eats = 0;
     env->episode_damage = 0;
+    env->episode_saturated = 0;
     env->prev_action = -1;
     memset(env->visited, 0, sizeof(env->visited));
     env->rewards[0] = 0.0f;
@@ -603,12 +616,16 @@ void c_reset(Nethack* env) {
 // term would claw back the episode's entire score reward). The terminal step
 // gets death_penalty instead (see c_step).
 static float nethack_shaped_reward(Nethack* env, int illegal) {
-    long score = env->blstats[NLE_BL_SCORE];
     int depth = (int)env->blstats[NLE_BL_DEPTH];
     long px = env->blstats[NLE_BL_X];
     long py = env->blstats[NLE_BL_Y];
 
-    float r = env->score_coef * (float)(score - env->prev_score);
+    // Exp points, log-delta (potential phi = log1p(exp)): dense per-kill
+    // signal, tail-compressed so one big kill can't saturate the trainer's
+    // reward clamp the way raw score deltas did.
+    long exp = env->blstats[NLE_BL_EXP];
+    float r = env->exp_coef * (log1pf((float)exp) - log1pf((float)env->prev_exp));
+    env->prev_exp = exp;
 
     // Descent: paid only on new episode-max depth. The per-transition form
     // was yo-yo farmable (down-up-down re-earned); the max form is potential-
@@ -662,7 +679,7 @@ static float nethack_shaped_reward(Nethack* env, int illegal) {
     }
 
     if (illegal) r += env->illegal_penalty;
-    env->prev_score = score;
+    env->prev_score = env->blstats[NLE_BL_SCORE];   // logs only
     env->prev_depth = depth;
     return r;
 }
@@ -706,6 +723,7 @@ void c_step(Nethack* env) {
         : nethack_shaped_reward(env, illegal);
     env->rewards[0] = reward;
     env->episode_return += reward;
+    if (reward > 1.0f || reward < -1.0f) env->episode_saturated++;
 
     int done = env->obs.done || env->episode_length >= NETHACK_MAX_EPISODE_STEPS;
     env->terminals[0] = done ? 1.0f : 0.0f;   // truncation reported as terminal too

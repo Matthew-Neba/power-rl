@@ -252,7 +252,7 @@ bare-handed, so a weapon slot would be a trap button.
 ## Reward shaping (config-tunable via nethack.ini)
 
 ```
-reward = score_coef    * (score - prev_score)           # game score delta
+reward = exp_coef      * dlog1p(exp points)             # dense per-kill, tail-compressed
        + descent_coef  * (new episode-max depth only)   # yo-yo-proof descent bonus
        + xp_coef       * (new episode-max XL only)      # power progression before descent
        + scout_coef    * (new_tile_this_level)          # exploration bonus
@@ -263,6 +263,16 @@ reward = score_coef    * (score - prev_score)           # game score delta
 The terminal step of a game-over (not truncation) carries
 `death_penalty - hp_coef * prev_hp` instead of the shaped terms — the
 HP potential cashes out, so dying at high HP forfeits more.
+
+NetHack's score is deliberately NOT rewarded: `botl_score()` is
+gold + exp + 50*depth, a fixed mix that overrode the coefs above
+(depth at 50x descent_coef) and saturated the trainer's [-1,1] reward
+clamp on every eventful step, silently truncating any term riding on a
+kill or descent. Its useful component (exp) is the explicit `exp_coef`
+term — the log-delta form is potential-based (phi = log1p(exp)) and
+keeps one big kill from hitting the clamp. Score remains the `perf`
+log metric. `reward_saturated` tracks the fraction of steps at |r| > 1;
+it should stay ~0 — if it climbs, a reward term is being clipped again.
 
 All coefficients are set in `config/nethack.ini` under `[env]`.
 
@@ -300,6 +310,7 @@ auto-reset after `NETHACK_MAX_EPISODE_STEPS=10000` steps.
 | `wears`            | Wear macro presses that chose an item, per episode     |
 | `eats`             | Eat macro presses that chose an item, per episode      |
 | `damage_taken`     | Sum of HP lost per episode                             |
+| `reward_saturated` | Fraction of steps with \|reward\| > 1 (trainer clamps) |
 | `game_time`        | NetHack turns survived (steps can compress many turns) |
 | `max_xp_level`     | Highest experience level reached                       |
 | `death_combat`     | Fraction of episodes ended by DIED (monsters, traps)   |
