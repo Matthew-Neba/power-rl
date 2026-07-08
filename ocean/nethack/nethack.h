@@ -8,8 +8,9 @@
 //   actions = 24: 8 compass moves, 8 run-moves, down (>), up (<), kick (^D),
 //             search (s), pray (M-p), engrave Elbereth (macro: E - Elbereth),
 //             wear armor (macro: W + listed letter), eat (macro: e + letter).
-//   reward  = exp log-delta + descent + xp + scout + hp + illegal penalty
-//             + death penalty, per-env coefs. Score is logged, not rewarded.
+//   reward  = gold + exp + descent + xp + scout + hp + illegal penalty
+//             + death penalty, per-env coefs. gold/exp/descent decompose
+//             NetHack's score (see the coef block comment).
 // One Nethack struct per agent; each owns an nle_ctx_t (all per-game NLE
 // state) and a private vardir on tmpfs for NetHack's file I/O.
 // libnethack.so is linked directly at build time.
@@ -17,7 +18,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <math.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -183,8 +183,10 @@ typedef struct Nethack {
     long episode_eats;
     long episode_damage;
     int prev_action;    // last executed action index, -1 at episode start
-    long prev_score;    // logs only (perf/score metrics); not rewarded
+    long prev_score;    // logs only (perf/score metrics); not rewarded directly
     long prev_exp;
+    long prev_gold;
+    long start_gold;    // starting purse; score counts gold net of it, floored at 0
     long prev_hp;
     long prev_time;
     long episode_saturated;   // steps with |reward| > 1 (trainer clamp range)
@@ -198,12 +200,14 @@ typedef struct Nethack {
 
     // Reward shaping coefficients, all independently toggleable (0 = off).
     // Set from kwargs in binding.c via `[env]` keys in config/nethack.ini.
-    // Score itself is NOT rewarded: botl_score() = gold + exp + 50*depth, a
-    // fixed mix that overrode these coefs (depth at 50x) and saturated the
-    // trainer's [-1,1] reward clamp on every eventful step. Its one useful
-    // component (exp) is rewarded explicitly below; score stays a log metric.
-    //   reward = exp_coef     * (log1p(exp) - log1p(prev_exp))  (dense per kill,
-    //                            potential-based, tail-compressed, clamp-safe)
+    // Score is rewarded DECOMPOSED rather than as one score_coef: botl_score()
+    // = gold(net of start, floored at 0) + urexp + 50*(deepest-1), and
+    // urexp accrues 4x uexp on kills and never drops on drain. So
+    // score_coef*dscore == gold_coef*dgold + exp_coef*max(0,duexp)
+    // + 50*score_coef*ddeepest with gold_coef = score_coef, exp_coef =
+    // 4*score_coef — same signal, separable knobs.
+    //   reward = gold_coef    * d(max(0, gold - start_gold))
+    //          + exp_coef     * max(0, exp - prev_exp)   (dense per kill)
     //          + descent_coef * (depth - episode_max_depth), new maxima only
     //          + xp_coef      * (xp level - episode_max_xp), new maxima only
     //          + scout_coef   * (1 if new tile on this level this episode)
@@ -213,6 +217,7 @@ typedef struct Nethack {
     // ends, so the terms would read garbage); it carries death_penalty plus
     // the HP potential cash-out (-hp_coef * prev_hp — dying at high HP
     // forfeits more). Truncation at the step cap carries neither.
+    float gold_coef;
     float exp_coef;
     float descent_coef;
     float xp_coef;
@@ -436,6 +441,7 @@ void init(Nethack* env) {
     env->vardir[0] = '\0';
 
     // Defaults used when a binding doesn't pass kwargs (standalone tools).
+    env->gold_coef       = 0.0f;
     env->exp_coef        = 0.1f;
     env->descent_coef    = 1.0f;
     env->xp_coef         = 0.0f;
@@ -580,6 +586,8 @@ static void nethack_do_reset(Nethack* env) {
 
     env->prev_score = 0;
     env->prev_exp = env->blstats[NLE_BL_EXP];
+    env->prev_gold = env->blstats[NLE_BL_GOLD];
+    env->start_gold = env->prev_gold;
     env->prev_hp = env->blstats[NLE_BL_HP];
     env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
     env->prev_time = env->blstats[NLE_BL_TIME];
@@ -610,22 +618,32 @@ void c_reset(Nethack* env) {
     env->pending_reset = 1;
 }
 
-// reward = score delta + one-shot descent bonus + first-visit scout bonus
-// + illegal penalty. Never evaluated on the terminal step: NLE zeroes blstats
-// when the game ends, so the terms would read garbage there (the score-delta
-// term would claw back the episode's entire score reward). The terminal step
-// gets death_penalty instead (see c_step).
+// reward = gold + exp + one-shot descent/XL bonuses + first-visit scout bonus
+// + HP potential + illegal penalty (see the coef block comment for the exact
+// form). Never evaluated on the terminal step: NLE zeroes blstats when the
+// game ends, so the terms would read garbage there. The terminal step gets
+// death_penalty plus the HP cash-out instead (see c_step).
 static float nethack_shaped_reward(Nethack* env, int illegal) {
     int depth = (int)env->blstats[NLE_BL_DEPTH];
     long px = env->blstats[NLE_BL_X];
     long py = env->blstats[NLE_BL_Y];
 
-    // Exp points, log-delta (potential phi = log1p(exp)): dense per-kill
-    // signal, tail-compressed so one big kill can't saturate the trainer's
-    // reward clamp the way raw score deltas did.
+    // Exp points, positive deltas only: dense per-kill signal. The positive
+    // part mirrors score's urexp, which accrues on gains but never drops on
+    // level drain (losexp touches uexp only).
     long exp = env->blstats[NLE_BL_EXP];
-    float r = env->exp_coef * (log1pf((float)exp) - log1pf((float)env->prev_exp));
+    float r = exp > env->prev_exp ? env->exp_coef * (float)(exp - env->prev_exp) : 0.0f;
     env->prev_exp = exp;
+
+    // Gold, net of the starting purse and floored at 0, exactly as
+    // botl_score() counts it (theft below the starting purse scores nothing).
+    long gold = env->blstats[NLE_BL_GOLD];
+    long g_now = gold - env->start_gold;
+    long g_prev = env->prev_gold - env->start_gold;
+    if (g_now < 0) g_now = 0;
+    if (g_prev < 0) g_prev = 0;
+    r += env->gold_coef * (float)(g_now - g_prev);
+    env->prev_gold = gold;
 
     // Descent: paid only on new episode-max depth. The per-transition form
     // was yo-yo farmable (down-up-down re-earned); the max form is potential-

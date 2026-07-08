@@ -252,7 +252,8 @@ bare-handed, so a weapon slot would be a trap button.
 ## Reward shaping (config-tunable via nethack.ini)
 
 ```
-reward = exp_coef      * dlog1p(exp points)             # dense per-kill, tail-compressed
+reward = gold_coef     * d(gold net of start, floor 0)  # as botl_score counts it
+       + exp_coef      * max(0, d exp points)           # dense per-kill (positive part)
        + descent_coef  * (new episode-max depth only)   # yo-yo-proof descent bonus
        + xp_coef       * (new episode-max XL only)      # power progression before descent
        + scout_coef    * (new_tile_this_level)          # exploration bonus
@@ -264,15 +265,19 @@ The terminal step of a game-over (not truncation) carries
 `death_penalty - hp_coef * prev_hp` instead of the shaped terms — the
 HP potential cashes out, so dying at high HP forfeits more.
 
-NetHack's score is deliberately NOT rewarded: `botl_score()` is
-gold + exp + 50*depth, a fixed mix that overrode the coefs above
-(depth at 50x descent_coef) and saturated the trainer's [-1,1] reward
-clamp on every eventful step, silently truncating any term riding on a
-kill or descent. Its useful component (exp) is the explicit `exp_coef`
-term — the log-delta form is potential-based (phi = log1p(exp)) and
-keeps one big kill from hitting the clamp. Score remains the `perf`
-log metric. `reward_saturated` tracks the fraction of steps at |r| > 1;
-it should stay ~0 — if it climbs, a reward term is being clipped again.
+gold/exp/descent decompose NetHack's score into separable knobs:
+`botl_score()` = gold (net of starting purse, floored at 0) + `u.urexp`
++ 50*(deepest-1), where urexp accrues 4x exp points on kills and never
+drops on level drain (hence the positive-part exp delta). So
+`score_coef * dscore` is reproduced exactly by `gold_coef = score_coef`,
+`exp_coef = 4 * score_coef`, and adding `50 * score_coef` to
+`descent_coef` — same signal, separable knobs. The current config does
+exactly that with the last known-good score run's values (gold 0.125 /
+exp 0.5 / descent 6.305), probe-verified step-for-step against the old
+reward. This deliberately rides the trainer's [-1,1] clamp the way that
+run did: descents and most kills saturate to +1, so `reward_saturated`
+is EXPECTED to be well above zero under this config. Score itself
+remains the `perf` log metric.
 
 All coefficients are set in `config/nethack.ini` under `[env]`.
 

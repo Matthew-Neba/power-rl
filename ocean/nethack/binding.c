@@ -24,6 +24,7 @@ void my_init(Env* env, Dict* kwargs) {
     //   2) Set its default in init()
     //   3) Add a nethack_read_coef line here
     //   4) Add `my_coef = <default>` to [env] in config/nethack.ini
+    nethack_read_coef(kwargs, "gold_coef",       &env->gold_coef);
     nethack_read_coef(kwargs, "exp_coef",        &env->exp_coef);
     nethack_read_coef(kwargs, "descent_coef",    &env->descent_coef);
     nethack_read_coef(kwargs, "scout_coef",      &env->scout_coef);
