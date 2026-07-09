@@ -333,6 +333,10 @@ static inline void cublasLtGemmDense(
     cublasLtMatmulPreferenceCreate(&pref);
     cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
         &LT_WS_BYTES, sizeof(LT_WS_BYTES));
+    // exclude INPLACE split-K (atomics): nondeterministic accumulation order
+    uint32_t red_mask = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE | CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE;
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+        &red_mask, sizeof(red_mask));
     cublasLtMatmulHeuristicResult_t heur;
     int nheur = 0;
     cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &heur, &nheur);

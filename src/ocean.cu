@@ -606,7 +606,39 @@ static constexpr int NH_C1_SP = NH_C1_OH * NH_C1_OW;
 static constexpr int NH_C2_SP = NH_C2_OH * NH_C2_OW;
 static constexpr int NH_C2_KK = NH_C2_IC * NH_C2_K * NH_C2_K;
 static constexpr int NH_SORT_BLOCKS = 256;               // hist grid (smem histograms)
-static constexpr int NH_HOT_T = 7;                       // hot-glyph dT smem slots (7x1600 fp32 = 44.8KB, static smem limit)
+static constexpr int NH_HOT_T = 7;                       // hot-glyph dT smem slots (7x1600 int64 = 89.6KB dynamic smem, opt-in)
+
+// 2^24 fixed-point gradient accumulators: integer atomics are associative, so
+// scatter/bias sums are bit-identical run to run (float atomicAdd ordering is
+// not). Quantization (6e-8) is below fp32 accumulation error at these counts.
+static constexpr float NH_FXP = 16777216.0f;
+__device__ __forceinline__ void nh_fxp_atomic_add(long long* addr, float v) {
+    atomicAdd((unsigned long long*)addr, (unsigned long long)(long long)__float2ll_rn(v * NH_FXP));
+}
+__device__ __forceinline__ float nh_fxp_to_float(long long v) {
+    return (float)((double)v * (1.0 / 16777216.0));
+}
+__global__ void nh_fxp_to_precision_kernel(
+    precision_t* __restrict__ dst, const long long* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = from_float(nh_fxp_to_float(src[idx]));
+}
+
+// Row-sparse variant for glyph-table grads: a minibatch touches only a few
+// hundred of the 5977 rows (counts>0 or hot). Untouched rows skip the int64
+// read; touched rows are re-zeroed in place, replacing a full-table memset.
+// Invariant: src is all-zero between iterations (alloc_create zeroes it once).
+__global__ void nh_fxp_to_precision_rows_kernel(
+    precision_t* __restrict__ dst, long long* __restrict__ src,
+    const int* __restrict__ counts, const int* __restrict__ hot_map,
+    int trow, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int row = idx / trow;
+    if (counts[row] == 0 && hot_map[row] < 0) { dst[idx] = from_float(0.0f); return; }
+    dst[idx] = from_float(nh_fxp_to_float(src[idx]));
+    src[idx] = 0;
+}
 
 // Per-blstat normalization: log1p fields get log1p(max(v,0))*scale, the rest
 // v*scale. Hunger (21) and condition (25) are expanded, not scaled.
@@ -712,17 +744,17 @@ __global__ void nh_wgrad_from_krsc_kernel(
 }
 
 // Fused relu backward + bias grad: masks grad in place against out and
-// accumulates the per-column sum into fp32 bias_acc. Launch via
+// accumulates the per-column sum into fixed-point bias_acc. Launch via
 // nh_colsum_grid so (gridDim*blockDim) % dim == 0: each thread's column is
-// then fixed across its grid-stride, so the sum lives in one register and
-// costs one global atomic. Replaces a strided-column bias_grad_kernel pass
-// (~10x slower at these row counts) plus a separate relu_backward pass over
-// the same tensor.
+// then fixed across its grid-stride, so the sum lives in one register (fixed
+// order -> deterministic) and costs one quantize + global atomic. Replaces a
+// strided-column bias_grad_kernel pass (~10x slower at these row counts)
+// plus a separate relu_backward pass over the same tensor.
 __global__ void nh_relu_bias_bwd_kernel(
     precision_t* __restrict__ grad, const precision_t* __restrict__ out,
-    float* __restrict__ bias_acc, int64_t total, int dim) {
-    extern __shared__ float sdata[];
-    for (int j = threadIdx.x; j < dim; j += blockDim.x) sdata[j] = 0.0f;
+    long long* __restrict__ bias_acc, int64_t total, int dim) {
+    extern __shared__ long long sdata[];
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) sdata[j] = 0;
     __syncthreads();
     int64_t i0 = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t stride = (int64_t)gridDim.x * blockDim.x;
@@ -733,27 +765,27 @@ __global__ void nh_relu_bias_bwd_kernel(
         grad[i] = from_float(g);
         acc += g;
     }
-    if (acc != 0.0f) atomicAdd(&sdata[(int)(i0 % dim)], acc);
+    if (acc != 0.0f) nh_fxp_atomic_add(&sdata[(int)(i0 % dim)], acc);
     __syncthreads();
     for (int j = threadIdx.x; j < dim; j += blockDim.x)
-        if (sdata[j] != 0.0f) atomicAdd(&bias_acc[j], sdata[j]);
+        if (sdata[j] != 0) atomicAdd((unsigned long long*)&bias_acc[j], (unsigned long long)sdata[j]);
 }
 
 // Plain per-column sum (conv2 bias grad from dout2 rows); same launch contract.
 __global__ void nh_col_sum_kernel(
-    float* __restrict__ bias_acc, const precision_t* __restrict__ src,
+    long long* __restrict__ bias_acc, const precision_t* __restrict__ src,
     int64_t total, int dim) {
-    extern __shared__ float sdata[];
-    for (int j = threadIdx.x; j < dim; j += blockDim.x) sdata[j] = 0.0f;
+    extern __shared__ long long sdata[];
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) sdata[j] = 0;
     __syncthreads();
     int64_t i0 = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t stride = (int64_t)gridDim.x * blockDim.x;
     float acc = 0.0f;
     for (int64_t i = i0; i < total; i += stride) acc += to_float(src[i]);
-    if (acc != 0.0f) atomicAdd(&sdata[(int)(i0 % dim)], acc);
+    if (acc != 0.0f) nh_fxp_atomic_add(&sdata[(int)(i0 % dim)], acc);
     __syncthreads();
     for (int j = threadIdx.x; j < dim; j += blockDim.x)
-        if (sdata[j] != 0.0f) atomicAdd(&bias_acc[j], sdata[j]);
+        if (sdata[j] != 0) atomicAdd((unsigned long long*)&bias_acc[j], (unsigned long long)sdata[j]);
 }
 
 static inline int nh_colsum_grid(int64_t total, int dim) {
@@ -763,13 +795,13 @@ static inline int nh_colsum_grid(int64_t total, int dim) {
     return (int)g;
 }
 
-// Cast the packed fp32 bias accumulators to their grad tensors in one launch.
+// Cast the packed fixed-point bias accumulators to their grad tensors in one launch.
 __global__ void nh_bias_flush_kernel(
-    const float* __restrict__ acc,
+    const long long* __restrict__ acc,
     precision_t* __restrict__ d0, int n0, precision_t* __restrict__ d1, int n1,
     precision_t* __restrict__ d2, int n2, precision_t* __restrict__ d3, int n3) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float v = i < n0 + n1 + n2 + n3 ? acc[i] : 0.0f;
+    float v = i < n0 + n1 + n2 + n3 ? nh_fxp_to_float(acc[i]) : 0.0f;
     if (i < n0) d0[i] = from_float(v);
     else if ((i -= n0) < n1) d1[i] = from_float(v);
     else if ((i -= n1) < n2) d2[i] = from_float(v);
@@ -908,16 +940,17 @@ __global__ void nh_hot_select_kernel(
     }
 }
 
-// Scatter conv1's output grad (rows layout) into fp32 dT. Hot glyphs
+// Scatter conv1's output grad (rows layout) into fixed-point dT. Hot glyphs
 // accumulate in smem (consecutive oc lanes -> conflict-free) and flush once
-// per block; the cold tail goes straight to global atomics.
+// per block; the cold tail goes straight to global atomics. Each grad element
+// is quantized once; the taps then add the same integer everywhere.
 __global__ void nh_dT_scatter_kernel(
-    float* __restrict__ dT_f, const precision_t* __restrict__ grad,
+    long long* __restrict__ dT_i, const precision_t* __restrict__ grad,
     const float* __restrict__ idx, const int* __restrict__ hot_map,
     const int* __restrict__ hot_list, const int* __restrict__ hot_n, int B) {
-    __shared__ float acc_s[NH_HOT_T][NH_TROW];
+    extern __shared__ long long acc_s[];   // NH_HOT_T x NH_TROW
     for (int i = threadIdx.x; i < NH_HOT_T * NH_TROW; i += blockDim.x)
-        acc_s[i / NH_TROW][i % NH_TROW] = 0.0f;
+        acc_s[i] = 0;
     __syncthreads();
     int64_t total = (int64_t)B * NH_C1_SP * NH_C1_OC;
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
@@ -927,6 +960,8 @@ __global__ void nh_dT_scatter_kernel(
         int64_t b = i / (NH_C1_OC * NH_C1_SP);
         float g = to_float(grad[i]);
         if (g == 0.0f) continue;  // relu-masked
+        unsigned long long q = (unsigned long long)(long long)__float2ll_rn(g * NH_FXP);
+        if (q == 0) continue;
         int oh = p / NH_C1_OW, ow = p % NH_C1_OW;
         const float* gi = idx + b * NH_GRID;
         #pragma unroll
@@ -934,16 +969,17 @@ __global__ void nh_dT_scatter_kernel(
             int cell = (NH_C1_S * oh + t / NH_C1_K) * NH_MAP + NH_C1_S * ow + t % NH_C1_K;
             int gl = (int)gi[cell];
             int slot = hot_map[gl];
-            if (slot >= 0) atomicAdd(&acc_s[slot][t * NH_C1_OC + oc], g);
-            else atomicAdd(&dT_f[(int64_t)gl * NH_TROW + t * NH_C1_OC + oc], g);
+            if (slot >= 0) atomicAdd((unsigned long long*)&acc_s[slot * NH_TROW + t * NH_C1_OC + oc], q);
+            else atomicAdd((unsigned long long*)&dT_i[(int64_t)gl * NH_TROW + t * NH_C1_OC + oc], q);
         }
     }
     __syncthreads();
     int n = *hot_n;
     for (int i = threadIdx.x; i < n * NH_TROW; i += blockDim.x) {
-        float v = acc_s[i / NH_TROW][i % NH_TROW];
-        if (v != 0.0f)
-            atomicAdd(&dT_f[(int64_t)hot_list[i / NH_TROW] * NH_TROW + i % NH_TROW], v);
+        long long v = acc_s[i];
+        if (v != 0)
+            atomicAdd((unsigned long long*)&dT_i[(int64_t)hot_list[i / NH_TROW] * NH_TROW + i % NH_TROW],
+                      (unsigned long long)v);
     }
 }
 
@@ -965,8 +1001,8 @@ struct NethackEncoderActivations {
     PrecisionTensor dout2, w2p;            // conv2 dout rows + KRSC filter
     PrecisionTensor wgrad_krsc;            // cuDNN filter grad before repack
     PrecisionTensor dT, dw_perm;           // dT table + permuted conv1 wgrad
-    FloatTensor dT_f;                      // fp32 dT scatter staging
-    FloatTensor bias_acc;                  // fp32 bias grads: proj | conv1 | bl | conv2
+    LongTensor dT_i;                       // fixed-point dT scatter staging
+    LongTensor bias_acc;                   // fixed-point bias grads: proj | conv1 | bl | conv2
     IntTensor sort_buf;                    // counts | hot_map | hot_list | hot_n
     FloatTensor glyph_idx;                 // decoded glyph ids
     PrecisionTensor bl_feats, bl_out, bl_grad, concat, out;
@@ -1005,25 +1041,18 @@ static void nh_conv2_cudnn_setup(NethackEncoderWeights* ew, NethackEncoderActiva
     CHECK_CUDNN(cudnnCreateTensorDescriptor(&a->c2_out));
     CHECK_CUDNN(cudnnSetTensor4dDescriptor(a->c2_out, CUDNN_TENSOR_NHWC, dt, B, NH_C2_OC, NH_C2_OH, NH_C2_OW));
 
-    int n;
-    cudnnConvolutionFwdAlgoPerf_t fp;
-    CHECK_CUDNN(cudnnFindConvolutionForwardAlgorithm(h, a->c2_in, ew->c2_filt, ew->c2_conv, a->c2_out, 1, &n, &fp));
-    a->c2_fwd_algo = fp.algo;
+    a->c2_fwd_algo = cudnn_det_fwd_algo(h, a->c2_in, ew->c2_filt, ew->c2_conv, a->c2_out);
     CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(h, a->c2_in, ew->c2_filt, ew->c2_conv, a->c2_out,
         a->c2_fwd_algo, &a->c2_fwd_ws_n));
     if (a->c2_fwd_ws_n) cudaMalloc(&a->c2_fwd_ws, a->c2_fwd_ws_n);
     if (!bwd) return;
 
-    cudnnConvolutionBwdFilterAlgoPerf_t wp;
-    CHECK_CUDNN(cudnnFindConvolutionBackwardFilterAlgorithm(h, a->c2_in, a->c2_out, ew->c2_conv, ew->c2_filt, 1, &n, &wp));
-    a->c2_wgrad_algo = wp.algo;
+    a->c2_wgrad_algo = cudnn_det_wgrad_algo(h, a->c2_in, a->c2_out, ew->c2_conv, ew->c2_filt);
     CHECK_CUDNN(cudnnGetConvolutionBackwardFilterWorkspaceSize(h, a->c2_in, a->c2_out, ew->c2_conv, ew->c2_filt,
         a->c2_wgrad_algo, &a->c2_wgrad_ws_n));
     if (a->c2_wgrad_ws_n) cudaMalloc(&a->c2_wgrad_ws, a->c2_wgrad_ws_n);
 
-    cudnnConvolutionBwdDataAlgoPerf_t dp;
-    CHECK_CUDNN(cudnnFindConvolutionBackwardDataAlgorithm(h, ew->c2_filt, a->c2_out, ew->c2_conv, a->c2_in, 1, &n, &dp));
-    a->c2_dgrad_algo = dp.algo;
+    a->c2_dgrad_algo = cudnn_det_dgrad_algo(h, ew->c2_filt, a->c2_out, ew->c2_conv, a->c2_in);
     CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(h, ew->c2_filt, a->c2_out, ew->c2_conv, a->c2_in,
         a->c2_dgrad_algo, &a->c2_dgrad_ws_n));
     if (a->c2_dgrad_ws_n) cudaMalloc(&a->c2_dgrad_ws, a->c2_dgrad_ws_n);
@@ -1086,10 +1115,10 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     NethackEncoderActivations* a = (NethackEncoderActivations*)activations;
     int B = grad.shape[0], H = ew->hidden;
 
-    // fp32 bias-grad accumulators: [proj H | conv1 64 | bl 64 | conv2 64]
-    float* bacc = a->bias_acc.data;
-    cudaMemsetAsync(bacc, 0, (H + 3 * NH_C1_OC) * sizeof(float), stream);
-    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * H, H), BLOCK_SIZE, H * sizeof(float), stream>>>(
+    // fixed-point bias-grad accumulators: [proj H | conv1 64 | bl 64 | conv2 64]
+    long long* bacc = (long long*)a->bias_acc.data;
+    cudaMemsetAsync(bacc, 0, (H + 3 * NH_C1_OC) * sizeof(long long), stream);
+    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * H, H), BLOCK_SIZE, H * sizeof(long long), stream>>>(
         grad.data, a->out.data, bacc, (int64_t)B * H, H);
     puf_mm_tn_splitk(&grad, &a->concat, &a->proj_wgrad, stream);  // tall-K, tiny output
 
@@ -1100,7 +1129,7 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     // saved input for wgrad; forward's w2p (KRSC) is the filter for dgrad.
     nh_dout_rows_kernel<<<grid_size(B * NH_C2_SP * NH_C2_OC), BLOCK_SIZE, 0, stream>>>(
         a->dout2.data, grad_concat.data, B);
-    nh_col_sum_kernel<<<nh_colsum_grid((int64_t)B * NH_C2_SP * NH_C2_OC, NH_C2_OC), BLOCK_SIZE, NH_C2_OC * sizeof(float), stream>>>(
+    nh_col_sum_kernel<<<nh_colsum_grid((int64_t)B * NH_C2_SP * NH_C2_OC, NH_C2_OC), BLOCK_SIZE, NH_C2_OC * sizeof(long long), stream>>>(
         bacc + H + 2 * NH_C1_OC, a->dout2.data, (int64_t)B * NH_C2_SP * NH_C2_OC, NH_C2_OC);
     cudnnHandle_t cudnn = get_cudnn_handle();
     CHECK_CUDNN(cudnnSetStream(cudnn, stream));
@@ -1115,7 +1144,7 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
         &c_alpha, ew->c2_filt, a->w2p.data, a->c2_out, a->dout2.data,
         ew->c2_conv, a->c2_dgrad_algo, a->c2_dgrad_ws, a->c2_dgrad_ws_n,
         &c_beta, a->c2_in, a->conv1.grad.data));
-    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * NH_C1_SP * NH_C1_OC, NH_C1_OC), BLOCK_SIZE, NH_C1_OC * sizeof(float), stream>>>(
+    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * NH_C1_SP * NH_C1_OC, NH_C1_OC), BLOCK_SIZE, NH_C1_OC * sizeof(long long), stream>>>(
         a->conv1.grad.data, a->conv1.out.data, bacc + H,
         (int64_t)B * NH_C1_SP * NH_C1_OC, NH_C1_OC);
 
@@ -1131,11 +1160,10 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     nh_hist_kernel<<<NH_SORT_BLOCKS, 256, 0, stream>>>(counts, a->glyph_idx.data, N);
     nh_hot_select_kernel<<<1, 1024, 0, stream>>>(hot_map, hot_list, hot_n, counts);
     int dT_n = NH_GLYPH_VOCAB * NH_TROW;
-    cudaMemsetAsync(a->dT_f.data, 0, (size_t)dT_n * sizeof(float), stream);
-    nh_dT_scatter_kernel<<<1024, 256, 0, stream>>>(
-        a->dT_f.data, a->conv1.grad.data, a->glyph_idx.data, hot_map, hot_list, hot_n, B);
-    n3_float_to_precision_kernel<<<grid_size(dT_n), BLOCK_SIZE, 0, stream>>>(
-        a->dT.data, a->dT_f.data, dT_n);
+    nh_dT_scatter_kernel<<<1024, 256, NH_HOT_T * NH_TROW * sizeof(long long), stream>>>(
+        (long long*)a->dT_i.data, a->conv1.grad.data, a->glyph_idx.data, hot_map, hot_list, hot_n, B);
+    nh_fxp_to_precision_rows_kernel<<<grid_size(dT_n), BLOCK_SIZE, 0, stream>>>(
+        a->dT.data, (long long*)a->dT_i.data, counts, hot_map, NH_TROW, dT_n);
     puf_mm_nn(&a->dT, &a->w_perm, &a->embed_wgrad, stream);   // dE  = dT @ W'
     puf_mm_tn(&a->dT, &ew->embed_w, &a->dw_perm, stream);     // dW' = dT^T @ E
     nh_unpermute_w_kernel<<<grid_size(NH_TROW * NH_EMBED_DIM), BLOCK_SIZE, 0, stream>>>(
@@ -1194,14 +1222,22 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     a->w_perm  = {.shape = {NH_TROW, NH_EMBED_DIM}};
     a->glyph_T = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
     a->dT      = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
-    a->dT_f    = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
+    a->dT_i    = {.shape = {NH_GLYPH_VOCAB, NH_TROW}};
     a->dw_perm = {.shape = {NH_TROW, NH_EMBED_DIM}};
     a->sort_buf = {.shape = {2 * NH_GLYPH_VOCAB + NH_HOT_T + 1}};
     a->bias_acc = {.shape = {ew->hidden + 3 * NH_C1_OC}};
     alloc_register(acts,&a->w_perm); alloc_register(acts,&a->glyph_T);
-    alloc_register(acts,&a->dT);     alloc_register(acts,&a->dT_f);
+    alloc_register(acts,&a->dT);     alloc_register(acts,&a->dT_i);
     alloc_register(acts,&a->dw_perm); alloc_register(acts,&a->sort_buf);
     alloc_register(acts,&a->bias_acc);
+    // 89.6KB dynamic smem (int64 hot slots) needs the opt-in cap raise
+    if (cudaFuncSetAttribute(nh_dT_scatter_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            NH_HOT_T * NH_TROW * (int)sizeof(long long)) != cudaSuccess) {
+        fprintf(stderr, "nethack encoder: GPU lacks %zuB smem for dT scatter\n",
+                NH_HOT_T * NH_TROW * sizeof(long long));
+        exit(1);
+    }
     // Conv2 (cuDNN NHWC)
     a->conv2.out   = {.shape = {B_TT * NH_C2_OC * NH_C2_OH * NH_C2_OW}};
     a->conv2.wgrad = {.shape = {NH_C2_OC, NH_C2_IC * NH_C2_K * NH_C2_K}};
@@ -1413,19 +1449,19 @@ __global__ void nhm_untrans_add_kernel(
 // Coalesced bias grad for wide-row tensors ((rows, dim) row-major, dim<=256):
 // grid-stride coalesced reads, smem accumulation, one global atomic per
 // (block, column). The generic bias_grad_kernel strides columns and is ~10x
-// slower at these row counts. acc must be pre-zeroed fp32.
+// slower at these row counts. acc must be pre-zeroed fixed-point.
 __global__ void nhm_bias_grad_kernel(
-    float* __restrict__ acc, const precision_t* __restrict__ grad, int64_t rows, int dim) {
-    extern __shared__ float sdata[];
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) sdata[i] = 0.0f;
+    long long* __restrict__ acc, const precision_t* __restrict__ grad, int64_t rows, int dim) {
+    extern __shared__ long long sdata[];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) sdata[i] = 0;
     __syncthreads();
     int64_t total = rows * dim;
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (int64_t)gridDim.x * blockDim.x)
-        atomicAdd(&sdata[(int)(i % dim)], to_float(grad[i]));
+        nh_fxp_atomic_add(&sdata[(int)(i % dim)], to_float(grad[i]));
     __syncthreads();
     for (int i = threadIdx.x; i < dim; i += blockDim.x)
-        if (sdata[i] != 0.0f) atomicAdd(&acc[i], sdata[i]);
+        if (sdata[i] != 0) atomicAdd((unsigned long long*)&acc[i], (unsigned long long)sdata[i]);
 }
 
 // in place: data[b,t,c] += bias[c] + res[b,t,c]
@@ -1493,13 +1529,13 @@ __global__ void nhm_concat_tail_kernel(
 // same-address contention across warps); registers flush through smem once
 // per block. Cold tail via global atomics.
 __global__ void nhcf_embed_scatter_kernel(
-    float* __restrict__ wg, const precision_t* __restrict__ grad_concat,
+    long long* __restrict__ wg, const precision_t* __restrict__ grad_concat,
     const float* __restrict__ idx, const int* __restrict__ hot_map,
     const int* __restrict__ hot_list, const int* __restrict__ hot_n,
     int B, int concat_dim, int D) {
-    extern __shared__ float acc_s[];   // NH_HOT_T x D
+    extern __shared__ long long acc_s[];   // NH_HOT_T x D
     for (int i = threadIdx.x; i < NH_HOT_T * D; i += blockDim.x)
-        acc_s[i] = 0.0f;
+        acc_s[i] = 0;
     __syncthreads();
     float acc[NH_HOT_T] = {};
     int64_t i0 = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1517,39 +1553,40 @@ __global__ void nhcf_embed_scatter_kernel(
             for (int s = 0; s < NH_HOT_T; s++)
                 if (s == slot) acc[s] += v;
         } else {
-            atomicAdd(&wg[(int64_t)gl * D + i % D], v);
+            nh_fxp_atomic_add(&wg[(int64_t)gl * D + i % D], v);
         }
     }
     int d = (int)(i0 % D);
     #pragma unroll
     for (int s = 0; s < NH_HOT_T; s++)
-        if (acc[s] != 0.0f) atomicAdd(&acc_s[s * D + d], acc[s]);
+        if (acc[s] != 0.0f) nh_fxp_atomic_add(&acc_s[s * D + d], acc[s]);
     __syncthreads();
     int n = *hot_n;
     for (int i = threadIdx.x; i < n * D; i += blockDim.x) {
-        float v = acc_s[i];
-        if (v != 0.0f)
-            atomicAdd(&wg[(int64_t)hot_list[i / D] * D + i % D], v);
+        long long v = acc_s[i];
+        if (v != 0)
+            atomicAdd((unsigned long long*)&wg[(int64_t)hot_list[i / D] * D + i % D],
+                      (unsigned long long)v);
     }
 }
 
-// Scatter the stem grad into fp32 dT, applying the stem relu mask on the fly
-// (the masked grad is never written back — dT and the stem bias grad are its
-// only consumers) and accumulating the stem bias grad. The launch stride is
-// a multiple of C, so each thread's column is fixed and its bias sum lives in
-// a register. Reuses the conv path's hist/hot-select machinery; hot glyphs
-// accumulate in dynamic smem (NH_HOT_T x 9C + C floats; 32.5KB at C=128),
-// cold tail via global atomics.
+// Scatter the stem grad into fixed-point dT, applying the stem relu mask on
+// the fly (the masked grad is never written back — dT and the stem bias grad
+// are its only consumers) and accumulating the stem bias grad. The launch
+// stride is a multiple of C, so each thread's column is fixed and its bias
+// sum lives in a register. Reuses the conv path's hist/hot-select machinery;
+// hot glyphs accumulate in dynamic smem (NH_HOT_T x 9C + C int64; 65.5KB at
+// C=128, opt-in cap raised at reg time), cold tail via global atomics.
 __global__ void nhm_dT_scatter_kernel(
-    float* __restrict__ dT_f, float* __restrict__ bias_acc,
+    long long* __restrict__ dT_i, long long* __restrict__ bias_acc,
     const precision_t* __restrict__ gstem, const precision_t* __restrict__ stem_out,
     const float* __restrict__ idx, const int* __restrict__ hot_map,
     const int* __restrict__ hot_list, const int* __restrict__ hot_n, int B, int C) {
     int trow = NHM_W * C;
-    extern __shared__ float acc_s[];       // NH_HOT_T x trow, then bias_s[C]
-    float* bias_s = acc_s + NH_HOT_T * trow;
+    extern __shared__ long long acc_s[];   // NH_HOT_T x trow, then bias_s[C]
+    long long* bias_s = acc_s + NH_HOT_T * trow;
     for (int i = threadIdx.x; i < NH_HOT_T * trow + C; i += blockDim.x)
-        acc_s[i] = 0.0f;
+        acc_s[i] = 0;
     __syncthreads();
     int64_t i0 = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t stride = (int64_t)gridDim.x * blockDim.x;
@@ -1559,6 +1596,8 @@ __global__ void nhm_dT_scatter_kernel(
         float g = to_float(stem_out[i]) > 0.0f ? to_float(gstem[i]) : 0.0f;
         if (g == 0.0f) continue;
         bias_reg += g;
+        unsigned long long q = (unsigned long long)(long long)__float2ll_rn(g * NH_FXP);
+        if (q == 0) continue;
         int c = i % C;
         int p = (i / C) % NHM_T;
         int64_t b = i / ((int64_t)C * NHM_T);
@@ -1567,19 +1606,20 @@ __global__ void nhm_dT_scatter_kernel(
         for (int w = 0; w < NHM_W; w++) {
             int gl = (int)gi[nhm_cell(p, w)];
             int slot = hot_map[gl];
-            if (slot >= 0) atomicAdd(&acc_s[slot * trow + w * C + c], g);
-            else atomicAdd(&dT_f[(int64_t)gl * trow + w * C + c], g);
+            if (slot >= 0) atomicAdd((unsigned long long*)&acc_s[slot * trow + w * C + c], q);
+            else atomicAdd((unsigned long long*)&dT_i[(int64_t)gl * trow + w * C + c], q);
         }
     }
-    if (bias_reg != 0.0f) atomicAdd(&bias_s[(int)(i0 % C)], bias_reg);
+    if (bias_reg != 0.0f) nh_fxp_atomic_add(&bias_s[(int)(i0 % C)], bias_reg);
     __syncthreads();
     for (int i = threadIdx.x; i < C; i += blockDim.x)
-        if (bias_s[i] != 0.0f) atomicAdd(&bias_acc[i], bias_s[i]);
+        if (bias_s[i] != 0) atomicAdd((unsigned long long*)&bias_acc[i], (unsigned long long)bias_s[i]);
     int n = *hot_n;
     for (int i = threadIdx.x; i < n * trow; i += blockDim.x) {
-        float v = acc_s[i];
-        if (v != 0.0f)
-            atomicAdd(&dT_f[(int64_t)hot_list[i / trow] * trow + i % trow], v);
+        long long v = acc_s[i];
+        if (v != 0)
+            atomicAdd((unsigned long long*)&dT_i[(int64_t)hot_list[i / trow] * trow + i % trow],
+                      (unsigned long long)v);
     }
 }
 
@@ -1608,9 +1648,9 @@ struct NethackMixerActivations {
     int is_train;                           // train forwards rebuild the table
     FloatTensor glyph_idx;
     IntTensor sort_buf;                     // counts | hot_map | hot_list | hot_n
-    FloatTensor bias_acc;   // fp32 bias grads: proj | stem | bl | nhm_bias_grad scratch
+    LongTensor bias_acc;    // fixed-point bias grads: proj | stem | bl | nhm_bias_grad scratch
     PrecisionTensor dT, dw_perm;            // dT table + permuted stem wgrad
-    FloatTensor dT_f;                       // fp32 dT scatter staging
+    LongTensor dT_i;                        // fixed-point dT scatter staging
     PrecisionTensor stem_out, tokT, tok_h, tok_out, mix1, ch_h, mix2;
     PrecisionTensor poolT, pool_out, g_poolT;
     PrecisionTensor bl_feats, bl_out, bl_grad, concat, out;
@@ -1703,21 +1743,21 @@ static void nethack_mixer_backward(void* w, void* activations, PrecisionTensor g
     NethackMixerActivations* a = (NethackMixerActivations*)activations;
     int B = grad.shape[0], H = ew->hidden;
 
-    // fp32 bias-grad accumulators: [proj H | stem C | bl 64 | mixer scratch]
-    float* bacc = a->bias_acc.data;
-    float* bacc_mix = bacc + H + ew->C + NH_BL_HID;
-    cudaMemsetAsync(bacc, 0, (H + ew->C + NH_BL_HID) * sizeof(float), stream);
+    // fixed-point bias-grad accumulators: [proj H | stem C | bl 64 | mixer scratch]
+    long long* bacc = (long long*)a->bias_acc.data;
+    long long* bacc_mix = bacc + H + ew->C + NH_BL_HID;
+    cudaMemsetAsync(bacc, 0, (H + ew->C + NH_BL_HID) * sizeof(long long), stream);
     // mixer-only biases: zero + accumulate coalesced + cast into bgrad
     auto bias_grad = [&](PrecisionTensor& bgrad, precision_t* g, int64_t rows, int dim) {
-        cudaMemsetAsync(bacc_mix, 0, dim * sizeof(float), stream);
-        nhm_bias_grad_kernel<<<1024, 256, dim * sizeof(float), stream>>>(
+        cudaMemsetAsync(bacc_mix, 0, dim * sizeof(long long), stream);
+        nhm_bias_grad_kernel<<<1024, 256, dim * sizeof(long long), stream>>>(
             bacc_mix, g, rows, dim);
-        n3_float_to_precision_kernel<<<grid_size(dim), BLOCK_SIZE, 0, stream>>>(
+        nh_fxp_to_precision_kernel<<<grid_size(dim), BLOCK_SIZE, 0, stream>>>(
             bgrad.data, bacc_mix, dim);
     };
 
     // projection
-    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * H, H), BLOCK_SIZE, H * sizeof(float), stream>>>(
+    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * H, H), BLOCK_SIZE, H * sizeof(long long), stream>>>(
         grad.data, a->out.data, bacc, (int64_t)B * H, H);
     puf_mm_tn_splitk(&grad, &a->concat, &a->proj_wgrad, stream);  // tall-K, tiny output
     PrecisionTensor grad_concat = {.data = a->concat.data, .shape = {B, ew->concat_dim}};
@@ -1733,8 +1773,8 @@ static void nethack_mixer_backward(void* w, void* activations, PrecisionTensor g
         a->bl_grad.data, grad_concat.data, B, ew->concat_dim, ew->flat_dim, NH_BL_HID);
 
     // blstats branch (cellflat has no stem bias: its bl sums reuse that slot)
-    float* bl_acc = ew->use_cellflat ? bacc + H : bacc + H + ew->C;
-    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * NH_BL_HID, NH_BL_HID), BLOCK_SIZE, NH_BL_HID * sizeof(float), stream>>>(
+    long long* bl_acc = ew->use_cellflat ? bacc + H : bacc + H + ew->C;
+    nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * NH_BL_HID, NH_BL_HID), BLOCK_SIZE, NH_BL_HID * sizeof(long long), stream>>>(
         a->bl_grad.data, a->bl_out.data, bl_acc, (int64_t)B * NH_BL_HID, NH_BL_HID);
     PrecisionTensor blg = {.data = a->bl_grad.data, .shape = {B, NH_BL_HID}};
     puf_mm_tn(&blg, &a->bl_feats, &a->bl_wgrad, stream);
@@ -1808,12 +1848,11 @@ static void nethack_mixer_backward(void* w, void* activations, PrecisionTensor g
         int wg_n = NH_GLYPH_VOCAB * ew->D;
         int sg = 1024;
         while ((sg * 256) % ew->D) sg++;   // fixed d per thread (register bias trick)
-        cudaMemsetAsync(a->dT_f.data, 0, (size_t)wg_n * sizeof(float), stream);
-        nhcf_embed_scatter_kernel<<<sg, 256, NH_HOT_T * ew->D * sizeof(float), stream>>>(
-            a->dT_f.data, grad_concat.data, a->glyph_idx.data,
+        nhcf_embed_scatter_kernel<<<sg, 256, NH_HOT_T * ew->D * sizeof(long long), stream>>>(
+            (long long*)a->dT_i.data, grad_concat.data, a->glyph_idx.data,
             hot_map, hot_list, hot_n, B, ew->concat_dim, ew->D);
-        n3_float_to_precision_kernel<<<grid_size(wg_n), BLOCK_SIZE, 0, stream>>>(
-            a->embed_wgrad.data, a->dT_f.data, wg_n);
+        nh_fxp_to_precision_rows_kernel<<<grid_size(wg_n), BLOCK_SIZE, 0, stream>>>(
+            a->embed_wgrad.data, (long long*)a->dT_i.data, counts, hot_map, ew->D, wg_n);
         nh_bias_flush_kernel<<<grid_size(H + NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
             bacc, a->proj_bgrad.data, H, a->bl_bgrad.data, NH_BL_HID,
             (precision_t*)nullptr, 0, (precision_t*)nullptr, 0);
@@ -1823,12 +1862,11 @@ static void nethack_mixer_backward(void* w, void* activations, PrecisionTensor g
     int dT_n = NH_GLYPH_VOCAB * trow;
     int sg = 1024;
     while ((sg * 256) % ew->C) sg++;       // fixed column per thread (bias trick)
-    cudaMemsetAsync(a->dT_f.data, 0, (size_t)dT_n * sizeof(float), stream);
-    nhm_dT_scatter_kernel<<<sg, 256, (NH_HOT_T * trow + ew->C) * sizeof(float), stream>>>(
-        a->dT_f.data, bacc + H, gstem, a->stem_out.data,
+    nhm_dT_scatter_kernel<<<sg, 256, (NH_HOT_T * trow + ew->C) * sizeof(long long), stream>>>(
+        (long long*)a->dT_i.data, bacc + H, gstem, a->stem_out.data,
         a->glyph_idx.data, hot_map, hot_list, hot_n, B, ew->C);
-    n3_float_to_precision_kernel<<<grid_size(dT_n), BLOCK_SIZE, 0, stream>>>(
-        a->dT.data, a->dT_f.data, dT_n);
+    nh_fxp_to_precision_rows_kernel<<<grid_size(dT_n), BLOCK_SIZE, 0, stream>>>(
+        a->dT.data, (long long*)a->dT_i.data, counts, hot_map, trow, dT_n);
     puf_mm_nn(&a->dT, &ew->w_perm, &a->embed_wgrad, stream);  // dE  = dT @ W'
     puf_mm_tn(&a->dT, &ew->embed_w, &a->dw_perm, stream);     // dW' = dT^T @ E
     nhm_unpermute_w_kernel<<<grid_size(NHM_W * ew->C * ew->D), BLOCK_SIZE, 0, stream>>>(
@@ -1938,11 +1976,17 @@ static void nethack_mixer_reg_train(void* w, void* activations, Allocator* acts,
     a->is_train      = 1;
     a->sort_buf      = {.shape = {2 * NH_GLYPH_VOCAB + NH_HOT_T + 1}};
     a->dT            = {.shape = {NH_GLYPH_VOCAB, NHM_W * ew->C}};
-    // cellflat: dT_f doubles as the fp32 embed-grad staging (no dT table)
-    a->dT_f          = {.shape = {NH_GLYPH_VOCAB, ew->use_cellflat ? ew->D : NHM_W * ew->C}};
+    // cellflat: dT_i doubles as the fixed-point embed-grad staging (no dT table)
+    a->dT_i          = {.shape = {NH_GLYPH_VOCAB, ew->use_cellflat ? ew->D : NHM_W * ew->C}};
     a->dw_perm       = {.shape = {NHM_W * ew->C, ew->D}};
     a->bias_acc      = {.shape = {ew->hidden + ew->C + NH_BL_HID + NHM_CH}};
     a->bl_grad       = {.shape = {B_TT, NH_BL_HID}};
+    if (!ew->use_cellflat && cudaFuncSetAttribute(nhm_dT_scatter_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (NH_HOT_T * NHM_W * ew->C + ew->C) * (int)sizeof(long long)) != cudaSuccess) {
+        fprintf(stderr, "nethack mixer: GPU lacks smem for dT scatter at C=%d\n", ew->C);
+        exit(1);
+    }
     a->g_mix2        = {.shape = {B_TT * NHM_T, ew->C}};
     a->g_ch_h        = {.shape = {B_TT * NHM_T, NHM_CH}};
     a->g_mix1        = {.shape = {B_TT * NHM_T, NHM_C}};
@@ -1951,7 +1995,7 @@ static void nethack_mixer_reg_train(void* w, void* activations, Allocator* acts,
     a->g_stem        = {.shape = {B_TT * NHM_T, NHM_C}};
     a->g_poolT       = {.shape = {B_TT * NHM_C, NHMP_K}};
     alloc_register(acts, &a->sort_buf);
-    alloc_register(acts, &a->dT_f);
+    alloc_register(acts, &a->dT_i);
     alloc_register(acts, &a->bias_acc);
     alloc_register(acts, &a->bl_grad);
     if (!ew->use_cellflat)

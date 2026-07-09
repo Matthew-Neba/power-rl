@@ -29,6 +29,47 @@ static cudnnHandle_t get_cudnn_handle() {
     return h;
 }
 
+// Algo selection via v7 heuristics (no timing benchmark — same choice every
+// run) filtered to CUDNN_DETERMINISTIC execution. cudnnFind* picks by
+// wall-clock and can select atomics-based algos: both break run-to-run
+// bit reproducibility.
+static cudnnConvolutionFwdAlgo_t cudnn_det_fwd_algo(cudnnHandle_t h,
+        cudnnTensorDescriptor_t in, cudnnFilterDescriptor_t filt,
+        cudnnConvolutionDescriptor_t conv, cudnnTensorDescriptor_t out) {
+    cudnnConvolutionFwdAlgoPerf_t p[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
+    int n = 0;
+    CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithm_v7(h, in, filt, conv, out,
+        CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &n, p));
+    for (int i = 0; i < n; i++)
+        if (p[i].status == CUDNN_STATUS_SUCCESS && p[i].determinism == CUDNN_DETERMINISTIC)
+            return p[i].algo;
+    fprintf(stderr, "cuDNN: no deterministic fwd conv algo\n"); exit(1);
+}
+static cudnnConvolutionBwdFilterAlgo_t cudnn_det_wgrad_algo(cudnnHandle_t h,
+        cudnnTensorDescriptor_t in, cudnnTensorDescriptor_t out,
+        cudnnConvolutionDescriptor_t conv, cudnnFilterDescriptor_t filt) {
+    cudnnConvolutionBwdFilterAlgoPerf_t p[CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT];
+    int n = 0;
+    CHECK_CUDNN(cudnnGetConvolutionBackwardFilterAlgorithm_v7(h, in, out, conv, filt,
+        CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT, &n, p));
+    for (int i = 0; i < n; i++)
+        if (p[i].status == CUDNN_STATUS_SUCCESS && p[i].determinism == CUDNN_DETERMINISTIC)
+            return p[i].algo;
+    fprintf(stderr, "cuDNN: no deterministic wgrad conv algo\n"); exit(1);
+}
+static cudnnConvolutionBwdDataAlgo_t cudnn_det_dgrad_algo(cudnnHandle_t h,
+        cudnnFilterDescriptor_t filt, cudnnTensorDescriptor_t out,
+        cudnnConvolutionDescriptor_t conv, cudnnTensorDescriptor_t in) {
+    cudnnConvolutionBwdDataAlgoPerf_t p[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT];
+    int n = 0;
+    CHECK_CUDNN(cudnnGetConvolutionBackwardDataAlgorithm_v7(h, filt, out, conv, in,
+        CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &n, p));
+    for (int i = 0; i < n; i++)
+        if (p[i].status == CUDNN_STATUS_SUCCESS && p[i].determinism == CUDNN_DETERMINISTIC)
+            return p[i].algo;
+    fprintf(stderr, "cuDNN: no deterministic dgrad conv algo\n"); exit(1);
+}
+
 // ---- ConvWeights: params + batch-independent cuDNN state ----
 
 struct ConvWeights {
@@ -90,22 +131,15 @@ static void conv_setup_activations(ConvWeights* cw, ConvActivations* ca, int B, 
     CHECK_CUDNN(cudnnCreateTensorDescriptor(&ca->cudnn_out));
     CHECK_CUDNN(cudnnSetTensor4dDescriptor(ca->cudnn_out, CUDNN_TENSOR_NCHW, dt, B, cw->OC, cw->OH, cw->OW));
 
-    int returned;
-    cudnnConvolutionFwdAlgoPerf_t fp;
-    CHECK_CUDNN(cudnnFindConvolutionForwardAlgorithm(h, ca->cudnn_in, cw->cudnn_filt, cw->cudnn_conv, ca->cudnn_out, 1, &returned, &fp));
-    ca->fwd_algo = fp.algo;
+    ca->fwd_algo = cudnn_det_fwd_algo(h, ca->cudnn_in, cw->cudnn_filt, cw->cudnn_conv, ca->cudnn_out);
     CHECK_CUDNN(cudnnGetConvolutionForwardWorkspaceSize(h, ca->cudnn_in, cw->cudnn_filt, cw->cudnn_conv, ca->cudnn_out, ca->fwd_algo, &ca->fwd_ws_bytes));
     ca->fwd_ws = NULL; if (ca->fwd_ws_bytes > 0) cudaMalloc(&ca->fwd_ws, ca->fwd_ws_bytes);
 
-    cudnnConvolutionBwdFilterAlgoPerf_t ffp;
-    CHECK_CUDNN(cudnnFindConvolutionBackwardFilterAlgorithm(h, ca->cudnn_in, ca->cudnn_out, cw->cudnn_conv, cw->cudnn_filt, 1, &returned, &ffp));
-    ca->bwd_filt_algo = ffp.algo;
+    ca->bwd_filt_algo = cudnn_det_wgrad_algo(h, ca->cudnn_in, ca->cudnn_out, cw->cudnn_conv, cw->cudnn_filt);
     CHECK_CUDNN(cudnnGetConvolutionBackwardFilterWorkspaceSize(h, ca->cudnn_in, ca->cudnn_out, cw->cudnn_conv, cw->cudnn_filt, ca->bwd_filt_algo, &ca->bwd_filt_ws_bytes));
     ca->bwd_filt_ws = NULL; if (ca->bwd_filt_ws_bytes > 0) cudaMalloc(&ca->bwd_filt_ws, ca->bwd_filt_ws_bytes);
 
-    cudnnConvolutionBwdDataAlgoPerf_t dp;
-    CHECK_CUDNN(cudnnFindConvolutionBackwardDataAlgorithm(h, cw->cudnn_filt, ca->cudnn_out, cw->cudnn_conv, ca->cudnn_in, 1, &returned, &dp));
-    ca->bwd_data_algo = dp.algo;
+    ca->bwd_data_algo = cudnn_det_dgrad_algo(h, cw->cudnn_filt, ca->cudnn_out, cw->cudnn_conv, ca->cudnn_in);
     CHECK_CUDNN(cudnnGetConvolutionBackwardDataWorkspaceSize(h, cw->cudnn_filt, ca->cudnn_out, cw->cudnn_conv, ca->cudnn_in, ca->bwd_data_algo, &ca->bwd_data_ws_bytes));
     ca->bwd_data_ws = NULL; if (ca->bwd_data_ws_bytes > 0) cudaMalloc(&ca->bwd_data_ws, ca->bwd_data_ws_bytes);
 
