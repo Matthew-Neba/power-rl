@@ -119,18 +119,20 @@ elif [ "$ENV" = "impulse_wars" ]; then
     LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
 elif [ "$ENV" = "nethack" ]; then
     SRC_DIR="ocean/$ENV"
-    NLE_DIR="vendor/nle"
-    NLE_REPO="https://github.com/liujonathan24/NetHack.git"
+    NLE_DIR="vendor/fast-nle"
+    NLE_REPO="https://github.com/FinlaySanders/fast-nle.git"
     if [ ! -d "$NLE_DIR/src" ]; then
-        echo "Cloning modified NLE from $NLE_REPO ..."
+        echo "Cloning fast-nle from $NLE_REPO ..."
         git clone --depth 1 "$NLE_REPO" "$NLE_DIR"
     fi
-    NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/src/build"
+    NETHACK_LIB_DIR="$(pwd)/$NLE_DIR/build"
     if [ ! -f "$NETHACK_LIB_DIR/libnethack.so" ]; then
         echo "Building libnethack.so ..."
-        make -C "$NETHACK_LIB_DIR" nethack -j$(nproc)
+        cmake -S "$NLE_DIR" -B "$NETHACK_LIB_DIR" -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$NETHACK_LIB_DIR" --target nethack -j$(nproc)
     fi
-    INCLUDES+=(-I./$NLE_DIR/include)
+    INCLUDES+=(-I./$NLE_DIR/include
+               -I./$NLE_DIR/build/_deps/deboost_context-src/include)
     EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack -Wl,-rpath,"$NETHACK_LIB_DIR" -ldl)
 elif [ -d "ocean/$ENV" ]; then
     SRC_DIR="ocean/$ENV"

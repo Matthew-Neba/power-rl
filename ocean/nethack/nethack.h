@@ -27,11 +27,10 @@
 #include <signal.h>
 #include "nethack_fs.h"
 
-#define NLE_ALLOW_SEEDING 1
-#include "nleobs.h"
+// nletypes.h, not nle.h: nle.h's `settings` macro would rewrite env->settings
+#include "nletypes.h"
 
-typedef struct nle_ctx nle_ctx_t;
-extern nle_ctx_t* nle_start(nle_obs*, FILE*, nle_seeds_init_t*, nle_settings*);
+extern nle_ctx_t* nle_start(nle_obs*, FILE*, nle_settings*);
 extern nle_ctx_t* nle_step(nle_ctx_t*, nle_obs*);
 extern void       nle_end(nle_ctx_t*);
 
@@ -90,8 +89,8 @@ static const int NETHACK_ACTION_TABLE[NETHACK_NUM_ACTIONS] = {
     'e',                               // eat carried food; macro, see nethack_do_use_item
 };
 
-// !status_updates: disable NetHack's status-line renderer (~5% CPU spent
-// sprintf'ing a line nothing reads; blstats come from update_blstats()).
+// !status_updates: disables the status renderer and recalc_mapseen
+// (~25% of engine instructions); blstats come from update_blstats().
 #define NETHACK_DEFAULT_OPTIONS \
     "name:Agent-mon-hum-neu-mal," \
     "autopickup,color,disclose:+i +a +v +g +c +o," \
@@ -420,7 +419,7 @@ static int nethack_do_use_item(Nethack* env, int cmd, const char* gate, const ch
 static void nethack_init_settings(Nethack* env) {
     memset(&env->settings, 0, sizeof(env->settings));
     const char* source = getenv("NETHACKDIR");
-    if (source == NULL) source = "./vendor/nle/nethackdir";
+    if (source == NULL) source = "./vendor/fast-nle/build/dat";
 
     if (nethack_make_vardir(source, env->vardir, sizeof(env->vardir)) != 0) {
         fprintf(stderr, "nethack: failed to create vardir from source=%s\n", source);
@@ -430,6 +429,7 @@ static void nethack_init_settings(Nethack* env) {
     }
     env->settings.spawn_monsters = 1;
     strncpy(env->settings.options, NETHACK_DEFAULT_OPTIONS, sizeof(env->settings.options) - 1);
+    env->settings.fix_moon_phase = true;  // moon phase from seed, not host clock
 }
 
 void init(Nethack* env) {
@@ -576,11 +576,12 @@ static void nethack_do_reset(Nethack* env) {
     // reset gets a fresh, known-safe seed.
     env->seed_a = env->seed_a * 6364136223846793005UL + 1442695040888963407UL;
     env->seed_b = env->seed_b * 6364136223846793005UL + 1442695040888963407UL;
-    nle_seeds_init_t seeds;
-    memset(&seeds, 0, sizeof(seeds));
-    seeds.seeds[0] = env->seed_a;
-    seeds.seeds[1] = env->seed_b;
-    env->ctx = nle_start(&env->obs, NULL, &seeds, &env->settings);
+    env->settings.initial_seeds.seeds[0] = env->seed_a;
+    env->settings.initial_seeds.seeds[1] = env->seed_b;
+    env->settings.initial_seeds.use_init_seeds = true;
+    env->settings.time_seed = env->seed_a;
+    env->settings.time_seed_is_set = true;
+    env->ctx = nle_start(&env->obs, NULL, &env->settings);
 
     nethack_drain_prompts(env);
 

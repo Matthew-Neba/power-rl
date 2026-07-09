@@ -173,3 +173,4 @@ resources/drive/data/*
 resources/drive/binaries/*
 
 vendor/nle/
+vendor/fast-nle/

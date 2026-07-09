@@ -1,11 +1,12 @@
 # NetHack environment for PufferLib
 
-C-level NLE binding for the PufferLib RL framework. Each env owns a
-per-env `nle_ctx_t` holding all of NetHack's mutable game state, with a
-private 64 MB memory arena. `libnethack.so` is linked directly (no
-dlopen). Auto-dismiss for prompts, fixed 1070-byte observation (glyph crop
-+ blstats + cooldown/prev-action/inventory stats), reward shaping,
-multi-threaded OMP stepping.
+C-level binding for the PufferLib RL framework against
+[fast-nle](https://github.com/FinlaySanders/fast-nle). Each env owns a
+per-env `nle_ctx_t` holding all of NetHack's mutable game state.
+`libnethack.so` is linked directly (no dlopen). Auto-dismiss for prompts,
+fixed 1070-byte observation (glyph crop + blstats +
+cooldown/prev-action/inventory stats), reward shaping, multi-threaded OMP
+stepping.
 
 ---
 
@@ -17,8 +18,8 @@ multi-threaded OMP stepping.
 git clone https://github.com/PufferAI/PufferLib.git && cd PufferLib
 git checkout 4.0
 
-# Clone the modified NLE into vendor/nle
-git clone https://github.com/liujonathan24/NetHack.git vendor/nle
+# Clone fast-nle into vendor/fast-nle
+git clone https://github.com/FinlaySanders/fast-nle.git vendor/fast-nle
 ```
 
 ### 2. Python environment
@@ -53,17 +54,14 @@ On other clusters, find equivalents for:
 
 ```bash
 # First-time only: configure cmake
-cd vendor/nle/src
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cd ../../../..
+cmake -S vendor/fast-nle -B vendor/fast-nle/build -DCMAKE_BUILD_TYPE=Release
 
 # Build (always from repo root)
-make -C vendor/nle/src/build nethack -j$(nproc)
+cmake --build vendor/fast-nle/build --target nethack -j$(nproc)
 ```
 
-Produces `vendor/nle/src/build/libnethack.so` and data files in
-`vendor/nle/src/build/dat/` (including `nhdat`).
+Produces `vendor/fast-nle/build/libnethack.so` and data files in
+`vendor/fast-nle/build/dat/` (including `nhdat`).
 
 If cmake fails with missing `bz2`, install libbz2-dev
 (`apt install libbz2-dev` or `yum install bzip2-devel`).
@@ -82,7 +80,7 @@ Produces `pufferlib/_C.cpython-*.so`. If you get linker errors about
 Point to the directory containing `nhdat`:
 
 ```bash
-export NETHACKDIR=$(pwd)/vendor/nle/src/build/dat
+export NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat
 ```
 
 ### 7. Verify
@@ -92,12 +90,6 @@ export NETHACKDIR=$(pwd)/vendor/nle/src/build/dat
 puffer train nethack \
     --vec.total-agents 64 --vec.num-buffers 1 --vec.num-threads 4 \
     --train.gpus 1 --train.total-timesteps 1000000 --train.minibatch-size 4096
-
-# Interactive play
-./live_view -i
-
-# Random agent viewer
-./live_view --random --steps 200
 ```
 
 ### 8. SLURM training
@@ -113,34 +105,33 @@ puffer train nethack --wandb \
 ### Rebuild after code changes
 
 ```bash
-make -C vendor/nle/src/build nethack -j$(nproc)   # if vendor/nle changed
+cmake --build vendor/fast-nle/build --target nethack -j$(nproc)   # if vendor/fast-nle changed
 bash build.sh nethack                               # always (relinks _C.so)
 ```
 
 ### Pulling NLE updates
 
-The modified NLE lives in a separate repo. To pull latest changes:
+fast-nle lives in its own repo. To pull latest changes:
 
 ```bash
-cd vendor/nle
+cd vendor/fast-nle
 git pull origin main
 cd ../..
-make -C vendor/nle/src/build nethack -j$(nproc)
+cmake --build vendor/fast-nle/build --target nethack -j$(nproc)
 bash build.sh nethack
 ```
 
-To push NLE changes (after editing files under `vendor/nle/`):
+To push NLE changes (after editing files under `vendor/fast-nle/`):
 
 ```bash
-cd vendor/nle
+cd vendor/fast-nle
 git add -A && git commit -m "description of changes"
 git push origin main
 cd ../..
 ```
 
-Note: `vendor/nle/` has its own `.git` — it is NOT tracked by the
-PufferLib repo. Add `vendor/nle` to PufferLib's `.gitignore` if it
-isn't already.
+Note: `vendor/fast-nle/` has its own `.git` — it is NOT tracked by the
+PufferLib repo (it is in `.gitignore`).
 
 ### Troubleshooting
 
@@ -150,7 +141,7 @@ isn't already.
 | `cannot find -liomp5` | `module load intel-oneapi/2024.2` (or equivalent) |
 | `libiomp5.so: cannot open shared object file` | Same module, also at runtime |
 | `cannot allocate memory in static TLS block` | Too many `__thread` vars — rebuild libnethack |
-| `NETHACKDIR is misconfigured` | `export NETHACKDIR=$(pwd)/vendor/nle/src/build/dat` |
+| `NETHACKDIR is misconfigured` | `export NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat` |
 | `ZeroDivisionError` in train | Need `--train.gpus 1` (even on CPU-only, the CUDA build requires it) |
 | Core dump / segfault at T>1 | Check that libnethack.so was rebuilt after latest source changes |
 
@@ -336,46 +327,23 @@ policy by default — a CPU puffernet port of the CUDA encoder that loads
 hidden size and layer count are inferred from the file):
 
 ```bash
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack               # policy demo
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack 2000 0       # headless, 2000 steps
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack random       # random policy
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack bench 100000 # steps/sec
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./nethack record traj.txt 500
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack               # policy demo
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack 2000 0       # headless, 2000 steps
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack random       # random policy
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack bench 100000 # steps/sec
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack record traj.txt 500
 ```
 
+Build the nethack tool:
 ```bash
-# Live viewer (interactive play)
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./live_view -i
-
-# Live viewer (random agent)
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./live_view --random --steps 500
-
-# Live viewer (replay a recorded trajectory)
-NETHACKDIR=$(pwd)/vendor/nle/src/build/dat ./live_view --replay path/to/recording.bin
-```
-
-Build the nethack tool (same flags, swap the source file for live_view):
-```bash
-clang -O2 -I vendor/nle/src/include -I vendor/nle/src/build/include \
-    -I vendor/nle/src/third_party/deboost.context/include \
+clang -O2 -I vendor/fast-nle/include -I vendor/fast-nle/build/include \
+    -I vendor/fast-nle/build/_deps/deboost_context-src/include \
     -DDEFAULT_WINDOW_SYS=\"rl\" -DDLB -DNLE_ALLOW_SEEDING \
     -DNLE_PER_ENV_FILES=1 -DNLE_PER_ENV_FLAGS=1 -DNLE_USE_ARENA_FREE=1 \
     -DNLE_USE_TILES -DNOCLIPPING -DNOCWD_ASSUMPTIONS -DNOMAIL -DNOTPARMDECL \
     ocean/nethack/nethack.c -o nethack \
-    -L./vendor/nle/src/build -lnethack -lm -lbz2 -lpthread \
-    -Wl,-rpath=$(pwd)/vendor/nle/src/build
-```
-
-Build live_view from source:
-```bash
-clang -O2 -I vendor/nle/src/include -I vendor/nle/src/build/include \
-    -I vendor/nle/src/third_party/deboost.context/include \
-    -DDEFAULT_WINDOW_SYS=\"rl\" -DDLB -DNLE_ALLOW_SEEDING \
-    -DNLE_PER_ENV_FILES=1 -DNLE_PER_ENV_FLAGS=1 -DNLE_USE_ARENA_FREE=1 \
-    -DNLE_USE_TILES -DNOCLIPPING -DNOCWD_ASSUMPTIONS -DNOMAIL -DNOTPARMDECL \
-    ocean/nethack/live_view.c -o live_view \
-    -L./vendor/nle/src/build -lnethack -lm -lbz2 -lpthread \
-    -Wl,-rpath=$(pwd)/vendor/nle/src/build
+    -L./vendor/fast-nle/build -lnethack -lm -lbz2 -lpthread \
+    -Wl,-rpath=$(pwd)/vendor/fast-nle/build
 ```
 
 ## Performance

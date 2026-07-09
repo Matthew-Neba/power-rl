@@ -86,12 +86,12 @@ static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t
     // Fail fast on a broken NETHACKDIR: symlink(2) succeeds for dangling
     // links, and the error would otherwise surface 100ms later as a cryptic
     // libnethack panic in init_dungeons.
-    char resolved[1280];
+    char resolved[4096];   // realpath(3) requires a PATH_MAX buffer
     if (realpath(src, resolved) == NULL || access(resolved, R_OK) != 0) {
         fprintf(stderr,
                 "nethack: NETHACKDIR misconfigured — no readable nhdat at %s (%s).\n"
                 "Set NETHACKDIR to an absolute dir containing nhdat, e.g. "
-                "<repo>/vendor/nle/nethackdir.\n", src, strerror(errno));
+                "<repo>/vendor/fast-nle/build/dat.\n", src, strerror(errno));
         exit(1);
     }
     if (symlink(src, dst) != 0) return -1;
