@@ -4,33 +4,39 @@
 #include "nethack.h"
 #include "../../src/puffernet.h"
 
-// Action index -> printable label for the trajectory log.
-// Matches NETHACK_ACTION_TABLE: k j h l y u b n  K J H L Y U B N  > < ^D s M-p E W e
+// labels for the end-of-run histogram, in NETHACK_ACTION_TABLE order
 static const char* NETHACK_ACTION_NAMES[NETHACK_NUM_ACTIONS] = {
     "N","S","W","E","NW","NE","SW","SE",
     "N_RUN","S_RUN","W_RUN","E_RUN","NW_RUN","NE_RUN","SW_RUN","SE_RUN",
     "DOWN_STAIRS","UP_STAIRS","KICK","SEARCH","PRAY","ELBERETH","WEAR","EAT",
 };
 
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
+// single-agent env, reset immediately (training's c_reset is lazy)
+static void env_open(Nethack* env) {
+    memset(env, 0, sizeof(*env));
+    env->num_agents = 1;
+    env->observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
+    env->actions      = (float*)calloc(1, sizeof(float));
+    env->rewards      = (float*)calloc(1, sizeof(float));
+    env->terminals    = (float*)calloc(1, sizeof(float));
+    init(env);
+    nethack_do_reset(env);
 }
 
-// ---------------------------------------------------------------------------
-// Trained-policy demo: CPU port of the custom CUDA encoder (src/nethack.cu
-// NethackEncoder) feeding puffernet's MinGRU + decoder. Weights =
-// resources/nethack/nethack_weights.bin, the fp32 dump training saves.
-// Weight order matches param registration: encoder tensors, decoder, mingru.
-// ---------------------------------------------------------------------------
+static void env_close(Nethack* env) {
+    c_close(env);
+    free(env->observations); free(env->actions); free(env->rewards); free(env->terminals);
+}
+
+// CPU port of the CUDA encoder (src/nethack.cu) + puffernet MinGRU/decoder;
+// weight order matches param registration: encoder, decoder, mingru
 #define DEMO_VOCAB   5977
 #define DEMO_EMBED   32
 #define DEMO_BL_FEAT 88   // 25 scalars + hunger 7 + cond 13 + cooldown + prevact 24 + counts 18
 #define DEMO_CONV    1024                       // conv2 out, 64ch x 4x4, NCHW flat
 #define DEMO_CONCAT  (DEMO_CONV + 64 + DEMO_BL_FEAT)
 
-// Per-blstat normalization, mirroring NH_BL_SCALE / NH_BL_ISLOG in src/nethack.cu.
+// per-blstat normalization, mirroring NH_BL_SCALE / NH_BL_ISLOG in src/nethack.cu
 static const float DEMO_BL_SCALE[27] = {
     1.f/79, 1.f/21,
     1.f/25, 1.f/125, 1.f/25, 1.f/25, 1.f/25, 1.f/25, 1.f/25,
@@ -45,8 +51,8 @@ typedef struct {
     float *conv1_w, *conv1_b;   // (64, 32*5*5), (64)
     float *conv2_w, *conv2_b;   // (64, 64*3*3), (64)
     float *embed;               // (5977, 32)
-    float *bl_w, *bl_b;         // (64, 45), (64)
-    float *proj_w, *proj_b;     // (H, 1133), (H)
+    float *bl_w, *bl_b;         // (64, 88), (64)
+    float *proj_w, *proj_b;     // (H, 1176), (H)
     Linear* decoder;            // (18+1, H), bias-free; last output is value
     MinGRU* mingru;
     Multidiscrete* md;
@@ -57,15 +63,10 @@ typedef struct {
     float* hidden;              // (hidden_size)
 } NethackNet;
 
-// The checkpoint's float count uniquely determines (hidden, layers): all
-// encoder tensors are fixed except proj, and every tensor is a multiple of
-// 8 floats (the dump's 16-byte alignment), so
-//   total = ENC_FIXED + H*(DEMO_CONCAT + 1 + A + 1) + L * 3*H*H.
-// Only the current action count is considered: the v1-bundle obs layout
-// (extra stats segment, 88 bl feats) broke every earlier checkpoint anyway.
+// (hidden, layers) from the checkpoint float count:
+//   total = ENC_FIXED + H*(DEMO_CONCAT + 1 + A + 1) + L * 3*H*H
 #define DEMO_ENC_FIXED (51200 + 64 + 36864 + 64 + DEMO_VOCAB*DEMO_EMBED + 64*DEMO_BL_FEAT + 64)
-// Ambiguities are possible (e.g. 380768 floats = 64/2/18 = 32/20/19);
-// prefer the fewest layers — real configs have <= 8.
+// ambiguities are possible; prefer the fewest layers (real configs have <= 8)
 static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
     int best_l = 1 << 30;
     for (int H = 8; H <= 4096; H += 8) {
@@ -124,7 +125,8 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {
     _relu(net->c1, net->c1, 64 * 36);
     _conv2d(net->c1, net->conv2_w, net->conv2_b, net->concat, 1, 6, 6, 64, 64, 3, 1);
 
-    // blstats -> 45 features: 25 scaled scalars, hunger one-hot 7, condition bits 13
+    // blstats+extra -> 88 features (25 scalars, hunger 7, cond bits 13,
+    // cooldown, prev action 24, inv counts 18)
     float* f = net->concat + DEMO_CONV + 64;
     int j = 0;
     for (int i = 0; i < 27; i++) {
@@ -155,8 +157,6 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {
     return (int)action;
 }
 
-static void standalone_reset(Nethack* env);
-
 static void run_demo(long max_steps, int frame_ms) {
     Weights* w = load_weights("resources/nethack/nethack_weights.bin");
     if (!w) {
@@ -167,18 +167,13 @@ static void run_demo(long max_steps, int frame_ms) {
     }
     NethackNet* net = make_nethack_net(w);
 
-    Nethack env; memset(&env, 0, sizeof(env));
-    env.num_agents = 1;
-    env.observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env.actions      = (float*)calloc(1, sizeof(float));
-    env.rewards      = (float*)calloc(1, sizeof(float));
-    env.terminals    = (float*)calloc(1, sizeof(float));
-    init(&env);
-    standalone_reset(&env);
+    Nethack env;
+    env_open(&env);
     srand((unsigned)time(NULL));
 
     long max_dlvl = 1;
     long acts[NETHACK_NUM_ACTIONS] = {0};
+    float ep_score = 0.0f, ep_len = 0.0f;   // log totals at last episode end
     for (long t = 0; t < max_steps; t++) {
         int a = nethack_net_forward(net, env.observations);
         acts[a]++;
@@ -191,10 +186,14 @@ static void run_demo(long max_steps, int frame_ms) {
         } else if (t % 2000 == 1999) {
             fprintf(stderr, "step %ld: score=%ld dlvl=%ld T=%ld len=%d\n", t + 1,
                     env.blstats[NLE_BL_SCORE], env.blstats[NLE_BL_DEPTH],
-                    env.blstats[NLE_BL_TIME], env.episode_length);
+                    env.blstats[NLE_BL_TIME], env.stats.length);
         }
         if (env.terminals[0] > 0.5f) {
-            fprintf(stderr, "episode end: score=%ld len=%d\n", env.prev_score, env.episode_length);
+            // c_step already reset the env; per-episode values via log deltas
+            fprintf(stderr, "episode end: score=%.0f len=%.0f\n",
+                    env.log.score - ep_score, env.log.episode_length - ep_len);
+            ep_score = env.log.score;
+            ep_len = env.log.episode_length;
             memset(net->mingru->state, 0,
                    (size_t)net->num_layers * net->hidden_size * sizeof(float));
         }
@@ -215,207 +214,15 @@ static void run_demo(long max_steps, int frame_ms) {
                env.log.wears / env.log.n, env.log.eats / env.log.n,
                env.log.engraves / env.log.n);
     }
-    c_close(&env);
-    free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
+    env_close(&env);
     free_mingru(net->mingru);
     free(net->decoder); free(net->md); free(net->hidden); free(net);
     free(w);
 }
 
-static void standalone_reset(Nethack* env) {
-    env->pending_reset = 0;
-    nethack_do_reset(env);
-}
-
-static void run_interactive(int max_steps) {
-    Nethack env;
-    memset(&env, 0, sizeof(env));
-    env.num_agents = 1;
-    env.observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env.actions      = (float*)calloc(1, sizeof(float));
-    env.rewards      = (float*)calloc(1, sizeof(float));
-    env.terminals    = (float*)calloc(1, sizeof(float));
-
-    init(&env);
-    standalone_reset(&env);
-    c_render(&env);
-
-    srand((unsigned)time(NULL));
-    for (int t = 0; t < max_steps; t++) {
-        env.actions[0] = (float)(rand() % NETHACK_NUM_ACTIONS);
-        c_step(&env);
-        c_render(&env);
-        printf("step=%d action=%d reward=%.2f done=%.0f\n",
-               t, (int)env.actions[0], env.rewards[0], env.terminals[0]);
-        usleep(50 * 1000);
-    }
-    c_close(&env);
-    free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
-}
-
-static void run_benchmark(long steps, int policy) {
-    // policy: 0 = random, 1 = hold position (move N into a wall is the
-    // closest thing to waiting in the 18-action set)
-    Nethack env;
-    memset(&env, 0, sizeof(env));
-    env.num_agents = 1;
-    env.observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env.actions      = (float*)calloc(1, sizeof(float));
-    env.rewards      = (float*)calloc(1, sizeof(float));
-    env.terminals    = (float*)calloc(1, sizeof(float));
-
-    init(&env);
-    standalone_reset(&env);
-    srand(0xC0FFEE);
-    long episodes = 1;
-    double sum_reward = 0.0;
-
-    double t0 = now_sec();
-    for (long t = 0; t < steps; t++) {
-        env.actions[0] = (policy == 1) ? 0.0f : (float)(rand() % NETHACK_NUM_ACTIONS);
-        c_step(&env);
-        sum_reward += env.rewards[0];
-        if (env.terminals[0] > 0.5f) episodes++;
-    }
-    double dt = now_sec() - t0;
-
-    printf("steps=%ld  episodes=%ld  time=%.3fs  steps/sec=%.0f  sum_reward=%.1f\n",
-           steps, episodes, dt, steps / dt, sum_reward);
-    printf("  valid_moves=%ld (%.1f%%)  illegal_actions=%ld (%.1f%%)\n",
-           env.episode_valid_moves,
-           100.0 * env.episode_valid_moves / (double)steps,
-           env.episode_illegal_actions,
-           100.0 * env.episode_illegal_actions / (double)steps);
-    printf("  final HP=%ld/%ld  AC=%ld  Dlvl=%ld  Score=%ld  GameTime=%ld\n",
-           env.blstats[NLE_BL_HP], env.blstats[NLE_BL_HPMAX],
-           env.blstats[NLE_BL_AC],
-           env.blstats[NLE_BL_DEPTH], env.blstats[NLE_BL_SCORE],
-           env.blstats[NLE_BL_TIME]);
-
-    c_close(&env);
-    free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
-}
-
-// Dump one frame as plain text (chars grid + status + message + action label).
-static void dump_frame(FILE* f, Nethack* env, long step, int action_idx, float reward) {
-    fprintf(f, "=== step %ld | action=%s | reward=%+.2f | done=%.0f | in_normal_game=%d ===\n",
-            step, NETHACK_ACTION_NAMES[action_idx], reward,
-            env->terminals[0], env->obs.in_normal_game);
-    fprintf(f, "HP %ld/%ld  AC %ld  Dlvl %ld  Score %ld  GameTime %ld  Hunger %ld\n",
-            env->blstats[NLE_BL_HP], env->blstats[NLE_BL_HPMAX],
-            env->blstats[NLE_BL_AC], env->blstats[NLE_BL_DEPTH],
-            env->blstats[NLE_BL_SCORE], env->blstats[NLE_BL_TIME],
-            env->blstats[NLE_BL_HUNGER]);
-    fprintf(f, "Msg: %.256s\n", env->message);
-    for (int r = 0; r < NH_ROWS; r++) {
-        fputs("  |", f);
-        for (int c = 0; c < NH_COLS; c++) {
-            unsigned char ch = env->chars[r * NH_COLS + c];
-            fputc(ch >= 32 && ch < 127 ? ch : (ch == 0 ? ' ' : '?'), f);
-        }
-        fputs("|\n", f);
-    }
-    fputc('\n', f);
-}
-
-static void run_record(const char* path, long steps, int policy) {
-    FILE* f = (strcmp(path, "-") == 0) ? stdout : fopen(path, "w");
-    if (!f) { perror("fopen"); return; }
-
-    Nethack env; memset(&env, 0, sizeof(env));
-    env.num_agents = 1;
-    env.observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env.actions      = (float*)calloc(1, sizeof(float));
-    env.rewards      = (float*)calloc(1, sizeof(float));
-    env.terminals    = (float*)calloc(1, sizeof(float));
-    init(&env);
-    standalone_reset(&env);
-    dump_frame(f, &env, -1, 0, 0.0f);   // post-reset frame, "action" col is meaningless
-
-    srand(0xC0FFEE);
-    for (long t = 0; t < steps; t++) {
-        int action_idx = (policy == 1) ? 0 : (rand() % NETHACK_NUM_ACTIONS);
-        env.actions[0] = (float)action_idx;
-        c_step(&env);
-        dump_frame(f, &env, t, action_idx, env.rewards[0]);
-        if (env.terminals[0] > 0.5f) {
-            fprintf(f, "##### EPISODE END at step %ld #####\n\n", t);
-            break;
-        }
-    }
-    c_close(&env);
-    if (f != stdout) fclose(f);
-    free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
-}
-
+// ./nethack [N_STEPS] [MS_PER_FRAME (0 = headless)]
 int main(int argc, char** argv) {
-    if (argc >= 2 && strcmp(argv[1], "record") == 0) {
-        // Usage: ./nethack record OUTFILE [N_STEPS] [random|wait]
-        const char* path = (argc >= 3) ? argv[2] : "trajectory.txt";
-        long steps      = (argc >= 4) ? atol(argv[3]) : 100;
-        int policy      = (argc >= 5 && strcmp(argv[4], "wait") == 0) ? 1 : 0;
-        run_record(path, steps, policy);
-        return 0;
-    }
-    if (argc >= 2 && strcmp(argv[1], "bench") == 0) {
-        long steps = (argc >= 3) ? atol(argv[2]) : 100000;
-        int policy = (argc >= 4 && strcmp(argv[3], "wait") == 0) ? 1 : 0;
-        printf("policy=%s\n", policy ? "wait" : "random");
-        run_benchmark(steps, policy);
-    } else if (argc >= 2 && strcmp(argv[1], "resets") == 0) {
-        long n = (argc >= 3) ? atol(argv[2]) : 50;
-        Nethack env; memset(&env, 0, sizeof(env));
-        env.num_agents = 1;
-        env.observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-        env.actions      = (float*)calloc(1, sizeof(float));
-        env.rewards      = (float*)calloc(1, sizeof(float));
-        env.terminals    = (float*)calloc(1, sizeof(float));
-        init(&env);
-        standalone_reset(&env); c_step(&env);  // warm-up not counted
-        double t0 = now_sec();
-        // c_reset is lazy (sets a flag); the step forces the actual reset.
-        for (long i = 0; i < n; i++) { c_reset(&env); env.actions[0] = 0.0f; c_step(&env); }
-        double dt = now_sec() - t0;
-        printf("resets=%ld  time=%.3fs  per_reset=%.2fms  resets/sec=%.0f\n",
-               n, dt, 1000.0 * dt / n, n / dt);
-        c_close(&env);
-        free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
-    } else if (argc >= 2 && strcmp(argv[1], "stepreset") == 0) {
-        // step+reset cycle test. Args: STEPS_PER_EPISODE NUM_RESETS
-        long steps_per = (argc >= 3) ? atol(argv[2]) : 100;
-        long n_resets  = (argc >= 4) ? atol(argv[3]) : 20;
-        Nethack env; memset(&env, 0, sizeof(env));
-        env.num_agents = 1;
-        env.observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-        env.actions      = (float*)calloc(1, sizeof(float));
-        env.rewards      = (float*)calloc(1, sizeof(float));
-        env.terminals    = (float*)calloc(1, sizeof(float));
-        init(&env);
-        standalone_reset(&env);
-        srand(0xC0FFEE);
-        double t0 = now_sec();
-        for (long r = 0; r < n_resets; r++) {
-            for (long t = 0; t < steps_per; t++) {
-                env.actions[0] = (float)(rand() % NETHACK_NUM_ACTIONS);
-                c_step(&env);
-            }
-            c_reset(&env);
-        }
-        double dt = now_sec() - t0;
-        long total = steps_per * n_resets;
-        printf("stepreset: %ld cycles x %ld steps = %ld steps  time=%.3fs  sps=%.0f\n",
-               n_resets, steps_per, total, dt, total / dt);
-        c_close(&env);
-        free(env.observations); free(env.actions); free(env.rewards); free(env.terminals);
-    } else if (argc >= 2 && strcmp(argv[1], "random") == 0) {
-        int max_steps = (argc >= 3) ? atoi(argv[2]) : 100000;
-        run_interactive(max_steps);
-    } else {
-        // Default: play the trained policy from resources/nethack.
-        // Usage: ./nethack [N_STEPS] [MS_PER_FRAME (0 = headless)]
-        long steps   = (argc >= 2) ? atol(argv[1]) : 1000000;
-        int frame_ms = (argc >= 3) ? atoi(argv[2]) : 50;
-        run_demo(steps, frame_ms);
-    }
+    run_demo((argc >= 2) ? atol(argv[1]) : 1000000,
+             (argc >= 3) ? atoi(argv[2]) : 50);
     return 0;
 }

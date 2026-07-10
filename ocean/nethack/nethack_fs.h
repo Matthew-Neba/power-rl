@@ -1,6 +1,5 @@
-// Filesystem plumbing for the NetHack env: one private vardir per env
-// instance (NetHack expects nhdat + a few writable files), living under a
-// per-process parent on tmpfs, with orphan sweeping for crashed runs.
+// One private vardir per env instance (NetHack expects nhdat + writable
+// files), under a per-process parent on tmpfs, with orphan sweeping.
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,15 +11,12 @@
 #include <dirent.h>
 #include <signal.h>
 
-// ---------------------------------------------------------------------------
-// Per-instance vardir (NetHack expects nhdat + a few touched files)
-// ---------------------------------------------------------------------------
 static void nethack_touch(const char* path) {
     int fd = open(path, O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) close(fd);
 }
 
-// Recursive remove, depth-capped (vardir trees are at most base/env/save/files).
+// recursive remove, depth-capped (vardir trees are at most base/env/save/files)
 static void nethack_rm_rf(const char* path, int depth) {
     if (depth > 3) return;
     DIR* d = opendir(path);
@@ -37,9 +33,8 @@ static void nethack_rm_rf(const char* path, int depth) {
     rmdir(path);
 }
 
-// Vardirs live under a per-process parent on tmpfs so NetHack's lock/level
-// file I/O never touches real disk. On first use, sweep parents whose owning
-// pid is gone — a killed run leaks one vardir per env.
+// per-process parent on tmpfs (level/lock I/O never hits disk); on first use,
+// sweep parents whose owning pid is dead — a killed run leaks one dir per env
 static const char* nethack_vardir_base(void) {
     static char base[256] = "";
     if (base[0]) return base;
@@ -83,9 +78,8 @@ static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t
     snprintf(src, sizeof(src), "%s/nhdat", abs_source);
     snprintf(dst, sizeof(dst), "%s/nhdat", dir);
 
-    // Fail fast on a broken NETHACKDIR: symlink(2) succeeds for dangling
-    // links, and the error would otherwise surface 100ms later as a cryptic
-    // libnethack panic in init_dungeons.
+    // fail fast on a broken NETHACKDIR: symlink(2) succeeds for dangling links
+    // and the error would surface later as a cryptic init_dungeons panic
     char resolved[4096];   // realpath(3) requires a PATH_MAX buffer
     if (realpath(src, resolved) == NULL || access(resolved, R_OK) != 0) {
         fprintf(stderr,
@@ -107,8 +101,7 @@ static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t
 
 static void nethack_rm_vardir(const char* dir) {
     if (dir == NULL || dir[0] == '\0') return;
-    // Full tree: NetHack drops level/lock files beyond the fixed set we
-    // create, and any leftover blocks the rmdir.
+    // full tree: the game drops level/lock files beyond the fixed set
     nethack_rm_rf(dir, 1);
 }
 

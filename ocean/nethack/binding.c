@@ -7,31 +7,17 @@
 #define Env Nethack
 #include "vecenv.h"
 
-// Read a float kwarg if present; otherwise keep the value already set in
-// init() (the per-term legacy default). This means config/nethack.ini can
-// safely omit a key — the env still works.
-static void nethack_read_coef(Dict* kwargs, const char* key, float* dst) {
-    DictItem* it = dict_get_unsafe(kwargs, key);
-    if (it != NULL) *dst = (float)it->value;
-}
-
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     init(env);
-    // Reward-shaping coefficients (see ocean/nethack/REWARDS.md). All four
-    // are optional; defaults are baked in init(). To add a new coef:
-    //   1) Add `float my_coef;` to Nethack struct in nethack.h
-    //   2) Set its default in init()
-    //   3) Add a nethack_read_coef line here
-    //   4) Add `my_coef = <default>` to [env] in config/nethack.ini
-    nethack_read_coef(kwargs, "gold_coef",       &env->gold_coef);
-    nethack_read_coef(kwargs, "exp_coef",        &env->exp_coef);
-    nethack_read_coef(kwargs, "descent_coef",    &env->descent_coef);
-    nethack_read_coef(kwargs, "scout_coef",      &env->scout_coef);
-    nethack_read_coef(kwargs, "xp_coef",         &env->xp_coef);
-    nethack_read_coef(kwargs, "hp_coef",         &env->hp_coef);
-    nethack_read_coef(kwargs, "illegal_penalty", &env->illegal_penalty);
-    nethack_read_coef(kwargs, "death_penalty",   &env->death_penalty);
+    env->gold_coef = dict_get(kwargs, "gold_coef")->value;
+    env->exp_coef = dict_get(kwargs, "exp_coef")->value;
+    env->descent_coef = dict_get(kwargs, "descent_coef")->value;
+    env->scout_coef = dict_get(kwargs, "scout_coef")->value;
+    env->xp_coef = dict_get(kwargs, "xp_coef")->value;
+    env->hp_coef = dict_get(kwargs, "hp_coef")->value;
+    env->illegal_penalty = dict_get(kwargs, "illegal_penalty")->value;
+    env->death_penalty = dict_get(kwargs, "death_penalty")->value;
 }
 
 void my_log(Log* log, Dict* out) {

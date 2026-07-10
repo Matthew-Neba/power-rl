@@ -299,19 +299,16 @@ auto-reset after `NETHACK_MAX_EPISODE_STEPS=10000` steps.
 | `reach_main_d5`    | Fraction that reached depth 5+ in the main dungeon     |
 | `reach_sokoban`    | Fraction that entered Sokoban                          |
 
-## Standalone tools
+## Policy demo
 
 The `nethack` binary (from `ocean/nethack/nethack.c`) plays the trained
-policy by default — a CPU puffernet port of the CUDA encoder that loads
+policy — a CPU puffernet port of the CUDA encoder that loads
 `resources/nethack/nethack_weights.bin` (copy any checkpoint there — the
 hidden size and layer count are inferred from the file):
 
 ```bash
-NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack               # policy demo
-NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack 2000 0       # headless, 2000 steps
-NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack random       # random policy
-NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack bench 100000 # steps/sec
-NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack record traj.txt 500
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack          # policy demo
+NETHACKDIR=$(pwd)/vendor/fast-nle/build/dat ./nethack 2000 0   # headless, 2000 steps
 ```
 
 Build the nethack tool:
