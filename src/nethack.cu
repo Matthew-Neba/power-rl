@@ -367,39 +367,43 @@ __global__ void nh_bias_flush_kernel(
 // features: 25 scaled scalars, 7 hunger one-hot, 13 condition bits, prayer
 // cooldown (log), prev-action one-hot (-1 at episode start = all zeros),
 // 18 inventory class counts.
+__device__ __forceinline__ int nh_bl_read_i32(const precision_t* p) {
+    return (int)((unsigned int)(int)to_float(p[0])
+               | ((unsigned int)(int)to_float(p[1]) << 8)
+               | ((unsigned int)(int)to_float(p[2]) << 16)
+               | ((unsigned int)(int)to_float(p[3]) << 24));
+}
+
 __global__ void nh_blstats_kernel(
     precision_t* __restrict__ out, const precision_t* __restrict__ obs, int B) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    // warp per sample: one serial thread per sample is a 200-op latency chain
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = tid / 32, lane = tid % 32;
     if (b >= B) return;
     const precision_t* src = obs + (int64_t)b * NH_OBS_SIZE + 2 * NH_GRID;
-    precision_t* dst = out + (int64_t)b * NH_BL_FEAT;
-    int j = 0, hunger = 0;
-    unsigned int cond = 0;
-    for (int i = 0; i < NH_BL_RAW; i++) {
-        unsigned int u = (unsigned int)(int)to_float(src[4*i])
-                       | ((unsigned int)(int)to_float(src[4*i + 1]) << 8)
-                       | ((unsigned int)(int)to_float(src[4*i + 2]) << 16)
-                       | ((unsigned int)(int)to_float(src[4*i + 3]) << 24);
-        int v = (int)u;
-        if (i == NH_BL_HUNGER) { hunger = max(0, min(v, 6)); continue; }
-        if (i == NH_BL_CONDITION) { cond = u; continue; }
-        float f = NH_BL_ISLOG[i] ? log1pf(fmaxf((float)v, 0.0f)) * NH_BL_SCALE[i]
-                                 : (float)v * NH_BL_SCALE[i];
-        dst[j++] = from_float(f);
-    }
-    for (int h = 0; h < 7; h++) dst[j++] = from_float(h == hunger ? 1.0f : 0.0f);
-    for (int k = 0; k < 13; k++) dst[j++] = from_float((float)((cond >> k) & 1u));
     const precision_t* ex = src + 4 * NH_BL_RAW;
-    for (int i = 0; i < NH_EX_RAW; i++) {
-        unsigned int u = (unsigned int)(int)to_float(ex[4*i])
-                       | ((unsigned int)(int)to_float(ex[4*i + 1]) << 8)
-                       | ((unsigned int)(int)to_float(ex[4*i + 2]) << 16)
-                       | ((unsigned int)(int)to_float(ex[4*i + 3]) << 24);
-        int v = (int)u;
-        if (i == 0) dst[j++] = from_float(log1pf(fmaxf((float)v, 0.0f)) * 0.1f);
-        else if (i == 1)
-            for (int h = 0; h < NH_ACTIONS; h++) dst[j++] = from_float(h == v ? 1.0f : 0.0f);
-        else dst[j++] = from_float((float)v * 0.125f);
+    precision_t* dst = out + (int64_t)b * NH_BL_FEAT;
+    for (int j = lane; j < NH_BL_FEAT; j += 32) {
+        float f;
+        if (j < 25) {
+            int i = j + (j >= 21) + (j >= 24);   // skip hunger(21), condition(25)
+            int v = nh_bl_read_i32(src + 4*i);
+            f = NH_BL_ISLOG[i] ? log1pf(fmaxf((float)v, 0.0f)) * NH_BL_SCALE[i]
+                               : (float)v * NH_BL_SCALE[i];
+        } else if (j < 32) {
+            int v = nh_bl_read_i32(src + 4*NH_BL_HUNGER);
+            f = (j - 25 == max(0, min(v, 6))) ? 1.0f : 0.0f;
+        } else if (j < 45) {
+            unsigned int cond = (unsigned int)nh_bl_read_i32(src + 4*NH_BL_CONDITION);
+            f = (float)((cond >> (j - 32)) & 1u);
+        } else if (j == 45) {
+            f = log1pf(fmaxf((float)nh_bl_read_i32(ex), 0.0f)) * 0.1f;
+        } else if (j < 46 + NH_ACTIONS) {
+            f = (j - 46 == nh_bl_read_i32(ex + 4)) ? 1.0f : 0.0f;
+        } else {
+            f = (float)nh_bl_read_i32(ex + 4*(j - 44 - NH_ACTIONS)) * 0.125f;
+        }
+        dst[j] = from_float(f);
     }
 }
 
@@ -651,7 +655,7 @@ static PrecisionTensor nethack_encoder_forward(void* w, void* activations, Preci
         ew->c2_conv, a->c2_fwd_algo, a->c2_fwd_ws, a->c2_fwd_ws_n,
         &c_beta, a->c2_out, a->conv2.out.data));
 
-    nh_blstats_kernel<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(
+    nh_blstats_kernel<<<grid_size(B * 32), BLOCK_SIZE, 0, stream>>>(
         a->bl_feats.data, input.data, B);
     puf_mm(&a->bl_feats, &ew->bl_w, &a->bl_out, stream);
     nh_bias_relu_kernel<<<grid_size(B * NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
@@ -715,7 +719,9 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     nh_hist_kernel<<<NH_SORT_BLOCKS, 256, 0, stream>>>(counts, a->glyph_idx.data, N);
     nh_hot_select_kernel<<<1, 1024, 0, stream>>>(hot_map, hot_list, hot_n, counts);
     int dT_n = NH_GLYPH_VOCAB * NH_TROW;
-    nh_dT_scatter_kernel<<<1024, 256, NH_HOT_T * NH_TROW * sizeof(long long), stream>>>(
+    // 89.6KB smem = 1 block/SM: max threads per block for atomic latency
+    // hiding, one wave of blocks (3.5x over 1024x256)
+    nh_dT_scatter_kernel<<<128, 1024, NH_HOT_T * NH_TROW * sizeof(long long), stream>>>(
         (long long*)a->dT_i.data, a->conv1.grad.data, a->glyph_idx.data, hot_map, hot_list, hot_n, B);
     nh_fxp_to_precision_rows_kernel<<<grid_size(dT_n), BLOCK_SIZE, 0, stream>>>(
         a->dT.data, (long long*)a->dT_i.data, counts, hot_map, NH_TROW, dT_n);

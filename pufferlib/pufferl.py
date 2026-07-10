@@ -14,6 +14,7 @@ import argparse
 import configparser
 from collections import defaultdict
 import multiprocessing as mp
+import queue as pyqueue
 from copy import deepcopy
 
 import numpy as np
@@ -189,6 +190,12 @@ def _train_worker(args):
 
 def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
+    cores = args.get('cpu_affinity')
+    if cores:
+        # dedicated core block per concurrent sweep run; torch defaults to all cores each
+        os.sched_setaffinity(0, cores)
+        import torch
+        torch.set_num_threads(max(1, len(cores)//2))
     backend = _resolve_backend(args)
     rank = args['rank']
     run_id = str(int(1000*time.time()))
@@ -390,6 +397,7 @@ def train(env_name, args=None, gpus=None, **kwargs):
         gpus = gpus[-1:] + gpus[:-1]  # Main process gets rank 0
 
     ctx = mp.get_context('spawn')
+    procs = []
     for rank, gpu_id in reversed(list(enumerate(gpus))):
         worker_args = deepcopy(args)
         worker_args['rank'] = rank
@@ -400,15 +408,24 @@ def train(env_name, args=None, gpus=None, **kwargs):
             # Protein's GP models live on cuda:0 on non-WSL setups; spawn-pickling
             # them works fine via CUDA IPC. On WSL, sweep.py forces device='cpu'
             # at construction so there's nothing to move.
-            ctx.Process(target=_train, args=(env_name, worker_args),
-                kwargs=kwargs).start()
+            p = ctx.Process(target=_train, args=(env_name, worker_args),
+                kwargs=kwargs)
+            p.start()
+            procs.append(p)
+    return procs
 
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
     exp_gpus = args['train']['gpus']
     sweep_gpus = args['sweep']['gpus'] or len(os.listdir('/proc/driver/nvidia/gpus'))
-    args['vec']['num_threads'] //= (sweep_gpus // exp_gpus)
+    concurrent = max(1, sweep_gpus // exp_gpus)
+    args['vec']['num_threads'] = max(1, args['vec']['num_threads'] // concurrent)
+    if args['vec']['num_buffers'] > args['vec']['num_threads']:
+        # num_buffers > num_threads silently steps each buffer single-threaded
+        print(f"WARNING: sweep runs get {args['vec']['num_threads']} threads; "
+              f"clamping num_buffers from {args['vec']['num_buffers']}")
+        args['vec']['num_buffers'] = args['vec']['num_threads']
     args['no_model_upload'] = True
 
     sweep_config = args['sweep']
@@ -431,8 +448,21 @@ def sweep(env_name, args=None, pareto=False):
     completed = 0
     while completed < num_experiments:
         if len(active) >= sweep_gpus//exp_gpus: # Collect completed runs
-            gpu_id, scores, costs, timesteps = result_queue.get()
-            done_args = active.pop(gpu_id)
+            try:
+                gpu_id, scores, costs, timesteps = result_queue.get(timeout=60)
+            except pyqueue.Empty:
+                # a run killed by segfault/OOM never reports; fail loudly instead of hanging
+                dead = [g for g, (_, procs) in active.items()
+                    if procs and any(not p.is_alive() for p in procs)]
+                if not dead:
+                    continue # All runs alive, just a long one
+                for _, procs in active.values():
+                    for p in procs:
+                        if p.is_alive():
+                            p.terminate()
+                raise RuntimeError(f'Sweep run on gpu(s) {dead} died without reporting')
+
+            done_args, _ = active.pop(gpu_id)
 
             if not scores:
                 sweep_obj.observe(done_args, 0, 0, is_failure=True)
@@ -461,9 +491,14 @@ def sweep(env_name, args=None, pareto=False):
             continue
 
         exp_args = deepcopy(args)
-        active[gpu_id] = exp_args
-        train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
+        if exp_args['vec']['num_buffers'] > exp_args['vec']['num_threads']:
+            exp_args['vec']['num_buffers'] = exp_args['vec']['num_threads'] # suggestion may exceed budget
+        cores_per_gpu = max(1, (os.cpu_count() or 1) // sweep_gpus)
+        exp_args['cpu_affinity'] = list(range(
+            gpu_id*cores_per_gpu, (gpu_id + exp_gpus)*cores_per_gpu))
+        procs = train(env_name, exp_args, range(gpu_id, gpu_id + exp_gpus),
             sweep_obj=sweep_obj, result_queue=result_queue)
+        active[gpu_id] = (exp_args, procs)
 
 def eval(env_name, args=None, load_path=None):
     '''Evaluate a trained policy. Supports both native and --slowly torch backends.'''
