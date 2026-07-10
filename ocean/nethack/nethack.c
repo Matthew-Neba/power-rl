@@ -33,8 +33,18 @@ static void env_close(Nethack* env) {
 #define DEMO_VOCAB   5977
 #define DEMO_EMBED   32
 #define DEMO_BL_FEAT 88   // 25 scalars + hunger 7 + cond 13 + cooldown + prevact 24 + counts 18
-#define DEMO_CONV    1024                       // conv2 out, 64ch x 4x4, NCHW flat
-#define DEMO_CONCAT  (DEMO_CONV + 64 + DEMO_BL_FEAT)
+#define DEMO_LOC_IN  (NETHACK_CROP_GRID * DEMO_EMBED)   // 9x9 crop, per-cell embeds
+#define DEMO_LOC_HID 256
+#define DEMO_PW 5
+#define DEMO_PH 5
+#define DEMO_PX 16
+#define DEMO_PY 5
+#define DEMO_TOK     (DEMO_PX * DEMO_PY)                // 5x5 patches over 79x21
+#define DEMO_PCELLS  (DEMO_PW * DEMO_PH)                // off-map cells read the pad glyph
+#define DEMO_P1      16
+#define DEMO_GLB_IN  (DEMO_PCELLS * DEMO_EMBED)         // per-patch flatten (glyph slice)
+#define DEMO_GLB_HID 128
+#define DEMO_CONCAT  (DEMO_LOC_HID + DEMO_GLB_HID + 64 + DEMO_BL_FEAT)
 
 // per-blstat normalization, mirroring NH_BL_SCALE / NH_BL_ISLOG in src/nethack.cu
 static const float DEMO_BL_SCALE[27] = {
@@ -48,24 +58,29 @@ static const int DEMO_BL_ISLOG[27] =
     {0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1,1,0,0,0,0,0,0};
 
 typedef struct {
-    float *conv1_w, *conv1_b;   // (64, 32*5*5), (64)
-    float *conv2_w, *conv2_b;   // (64, 64*3*3), (64)
     float *embed;               // (5977, 32)
+    float *loc_w, *loc_b;       // (256, 2592), (256)
+    float *g1_w, *g1_xy, *g1_b; // (16, 800), (16, 2), (16): per-patch embed+flatten + hero dx,dy -> 16
+    float *g2_w, *g2_b;         // (128, 16), (128): 16 -> 128, maxed over tokens
     float *bl_w, *bl_b;         // (64, 88), (64)
-    float *proj_w, *proj_b;     // (H, 1176), (H)
-    Linear* decoder;            // (18+1, H), bias-free; last output is value
+    float *proj_w, *proj_b;     // (H, 536), (H)
+    Linear* decoder;            // (24+1, H), bias-free; last output is value
     MinGRU* mingru;
     Multidiscrete* md;
     int hidden_size, num_layers, num_actions;
-    float x[DEMO_EMBED * NETHACK_CROP_GRID];   // embedded crop, NCHW (32,21,21)
-    float c1[64 * 6 * 6];
-    float concat[DEMO_CONCAT];                 // [conv2 flat | bl hidden | bl feats]
+    float x[DEMO_LOC_IN];       // crop cell embeds, flattened
+    float px[DEMO_GLB_IN];      // one patch's cell embeds, flattened
+    float t16[DEMO_P1];
+    float t128[DEMO_GLB_HID];
+    float concat[DEMO_CONCAT];  // [local hid | global hid | bl hidden | bl feats]
     float* hidden;              // (hidden_size)
 } NethackNet;
 
 // (hidden, layers) from the checkpoint float count:
 //   total = ENC_FIXED + H*(DEMO_CONCAT + 1 + A + 1) + L * 3*H*H
-#define DEMO_ENC_FIXED (51200 + 64 + 36864 + 64 + DEMO_VOCAB*DEMO_EMBED + 64*DEMO_BL_FEAT + 64)
+#define DEMO_ENC_FIXED (DEMO_VOCAB*DEMO_EMBED + DEMO_LOC_HID*DEMO_LOC_IN + DEMO_LOC_HID \
+                        + DEMO_P1*DEMO_GLB_IN + DEMO_P1*2 + DEMO_P1 \
+                        + DEMO_GLB_HID*DEMO_P1 + DEMO_GLB_HID + 64*DEMO_BL_FEAT + 64)
 // ambiguities are possible; prefer the fewest layers (real configs have <= 8)
 static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
     int best_l = 1 << 30;
@@ -91,11 +106,14 @@ static NethackNet* make_nethack_net(Weights* w) {
     fprintf(stderr, "nethack demo: hidden=%d layers=%d actions=%d (%d floats)\n",
             net->hidden_size, net->num_layers, net->num_actions, w->size - 7);
     net->hidden = (float*)calloc(net->hidden_size, sizeof(float));
-    net->conv1_w = get_weights_aligned(w, 64 * DEMO_EMBED * 25);
-    net->conv1_b = get_weights_aligned(w, 64);
-    net->conv2_w = get_weights_aligned(w, 64 * 64 * 9);
-    net->conv2_b = get_weights_aligned(w, 64);
     net->embed   = get_weights_aligned(w, DEMO_VOCAB * DEMO_EMBED);
+    net->loc_w   = get_weights_aligned(w, DEMO_LOC_HID * DEMO_LOC_IN);
+    net->loc_b   = get_weights_aligned(w, DEMO_LOC_HID);
+    net->g1_w    = get_weights_aligned(w, DEMO_P1 * DEMO_GLB_IN);
+    net->g1_xy   = get_weights_aligned(w, DEMO_P1 * 2);
+    net->g1_b    = get_weights_aligned(w, DEMO_P1);
+    net->g2_w    = get_weights_aligned(w, DEMO_GLB_HID * DEMO_P1);
+    net->g2_b    = get_weights_aligned(w, DEMO_GLB_HID);
     net->bl_w    = get_weights_aligned(w, 64 * DEMO_BL_FEAT);
     net->bl_b    = get_weights_aligned(w, 64);
     net->proj_w  = get_weights_aligned(w, net->hidden_size * DEMO_CONCAT);
@@ -108,26 +126,58 @@ static NethackNet* make_nethack_net(Weights* w) {
     return net;
 }
 
+static int demo_glyph_at(const int16_t* glyphs, int r, int c) {
+    if (r < 0 || r >= NH_ROWS || c < 0 || c >= NH_COLS) return NETHACK_PAD_GLYPH;
+    int g = glyphs[r * NH_COLS + c];
+    if (g < 0) g = 0;
+    if (g >= DEMO_VOCAB) g = DEMO_VOCAB - 1;
+    return g;
+}
+
 static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {
     const int16_t* glyphs = (const int16_t*)(obs + NETHACK_OFF_GLYPHS);
     const int32_t* bl = (const int32_t*)(obs + NETHACK_OFF_BLSTATS);
 
+    // local view: per-cell embeds of the egocentric crop, flattened
+    int hx = bl[0], hy = bl[1];
+    int half = NETHACK_CROP / 2;
     for (int p = 0; p < NETHACK_CROP_GRID; p++) {
-        int g = glyphs[p];
-        if (g < 0) g = 0;
-        if (g >= DEMO_VOCAB) g = DEMO_VOCAB - 1;
-        const float* e = net->embed + g * DEMO_EMBED;
-        for (int d = 0; d < DEMO_EMBED; d++)
-            net->x[d * NETHACK_CROP_GRID + p] = e[d];
+        int g = demo_glyph_at(glyphs, hy - half + p / NETHACK_CROP,
+                              hx - half + p % NETHACK_CROP);
+        memcpy(net->x + p * DEMO_EMBED, net->embed + g * DEMO_EMBED,
+               DEMO_EMBED * sizeof(float));
     }
-    _conv2d(net->x, net->conv1_w, net->conv1_b, net->c1,
-            1, NETHACK_CROP, NETHACK_CROP, DEMO_EMBED, 64, 5, 3);
-    _relu(net->c1, net->c1, 64 * 36);
-    _conv2d(net->c1, net->conv2_w, net->conv2_b, net->concat, 1, 6, 6, 64, 64, 3, 1);
+    _linear(net->x, net->loc_w, net->loc_b, net->concat, 1, DEMO_LOC_IN, DEMO_LOC_HID);
+    _relu(net->concat, net->concat, DEMO_LOC_HID);
+
+    // global view: per patch embed+flatten + normalized hero (dx,dy) -> 16 ->
+    // 128, elementwise max over the 80 tokens (off-map cells of ragged edge
+    // patches read the pad glyph)
+    float* glb = net->concat + DEMO_LOC_HID;
+    for (int o = 0; o < DEMO_GLB_HID; o++) glb[o] = -1e30f;
+    for (int tk = 0; tk < DEMO_TOK; tk++) {
+        int r0 = (tk / DEMO_PX) * DEMO_PH, c0 = (tk % DEMO_PX) * DEMO_PW;
+        for (int pos = 0; pos < DEMO_PCELLS; pos++) {
+            int g = demo_glyph_at(glyphs, r0 + pos / DEMO_PW, c0 + pos % DEMO_PW);
+            memcpy(net->px + pos * DEMO_EMBED, net->embed + g * DEMO_EMBED,
+                   DEMO_EMBED * sizeof(float));
+        }
+        float dx = (c0 + 0.5f * (DEMO_PW - 1) - hx) / (float)NH_COLS;
+        float dy = (r0 + 0.5f * (DEMO_PH - 1) - hy) / (float)NH_ROWS;
+        _linear(net->px, net->g1_w, net->g1_b, net->t16, 1, DEMO_GLB_IN, DEMO_P1);
+        for (int k = 0; k < DEMO_P1; k++) {
+            net->t16[k] += dx * net->g1_xy[k * 2] + dy * net->g1_xy[k * 2 + 1];
+            if (net->t16[k] < 0.f) net->t16[k] = 0.f;
+        }
+        _linear(net->t16, net->g2_w, net->g2_b, net->t128, 1, DEMO_P1, DEMO_GLB_HID);
+        for (int o = 0; o < DEMO_GLB_HID; o++)
+            if (net->t128[o] > glb[o]) glb[o] = net->t128[o];
+    }
+    _relu(glb, glb, DEMO_GLB_HID);
 
     // blstats+extra -> 88 features (25 scalars, hunger 7, cond bits 13,
     // cooldown, prev action 24, inv counts 18)
-    float* f = net->concat + DEMO_CONV + 64;
+    float* f = net->concat + DEMO_LOC_HID + DEMO_GLB_HID + 64;
     int j = 0;
     for (int i = 0; i < 27; i++) {
         if (i == 21 || i == 25) continue;   // hunger, condition: expanded below
@@ -143,7 +193,7 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {
     for (int h = 0; h < NETHACK_NUM_ACTIONS; h++) f[j++] = (h == ex[1]) ? 1.f : 0.f;
     for (int k = 0; k < NETHACK_NUM_OCLASSES; k++) f[j++] = (float)ex[2 + k] * 0.125f;
 
-    float* blout = net->concat + DEMO_CONV;
+    float* blout = net->concat + DEMO_LOC_HID + DEMO_GLB_HID;
     _linear(f, net->bl_w, net->bl_b, blout, 1, DEMO_BL_FEAT, 64);
     _relu(blout, blout, 64);
 

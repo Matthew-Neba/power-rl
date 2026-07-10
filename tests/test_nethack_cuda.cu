@@ -9,7 +9,6 @@
 #include <string>
 #include <cstdio>
 #include "../src/models.cu"
-#include "../src/cudnn_conv2d.cu"
 #include "../src/nethack.cu"
 
 extern "C" {
@@ -45,7 +44,7 @@ int nh_bl_feat()     { return NH_BL_FEAT; }
 int nh_glyph_vocab() { return NH_GLYPH_VOCAB; }
 int nh_embed_dim()   { return NH_EMBED_DIM; }
 int nh_concat()      { return NH_CONCAT; }
-int nh_grid()        { return NH_GRID; }
+int nh_grid()        { return NH_MGRID; }
 
 void nh_forward(void* out, void* obs, int B) {
     PrecisionTensor in = {.data = (precision_t*)obs, .shape = {B, NH_OBS_SIZE}};
@@ -70,8 +69,13 @@ TENSOR_ACC(bl_w,    bl_w)
 TENSOR_ACC(bl_b,    bl_b)
 TENSOR_ACC(proj_w,  proj_w)
 TENSOR_ACC(proj_b,  proj_b)
-TENSOR_ACC(conv1_w, conv1.w)
-TENSOR_ACC(conv2_w, conv2.w)
+TENSOR_ACC(loc_w,   loc_w)
+TENSOR_ACC(loc_b,   loc_b)
+TENSOR_ACC(glb1_w,  glb1_w)
+TENSOR_ACC(glb1_xy, glb1_xy)
+TENSOR_ACC(glb1_b,  glb1_b)
+TENSOR_ACC(glb2_w,  glb2_w)
+TENSOR_ACC(glb2_b,  glb2_b)
 
 #define GRAD_ACC(name, field) \
     void nh_grad_##name(void* dst) { cudaMemcpy(dst, g_a->field.data, numel(g_a->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); }
@@ -80,7 +84,12 @@ GRAD_ACC(bl_w,    bl_wgrad)
 GRAD_ACC(bl_b,    bl_bgrad)
 GRAD_ACC(proj_w,  proj_wgrad)
 GRAD_ACC(proj_b,  proj_bgrad)
-GRAD_ACC(conv1_w, conv1.wgrad)
-GRAD_ACC(conv2_w, conv2.wgrad)
+GRAD_ACC(loc_w,   loc_wgrad)
+GRAD_ACC(loc_b,   loc_bgrad)
+GRAD_ACC(glb1_w,  glb1_wgrad)
+GRAD_ACC(glb1_xy, glb1_xygrad)
+GRAD_ACC(glb1_b,  glb1_bgrad)
+GRAD_ACC(glb2_w,  glb2_wgrad)
+GRAD_ACC(glb2_b,  glb2_bgrad)
 
 }  // extern "C"

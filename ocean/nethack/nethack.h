@@ -25,8 +25,9 @@ extern void       nle_end(nle_ctx_t*);
 #define NH_COLS 79
 #define NH_GRID (NH_ROWS * NH_COLS)
 
-// odd side, centered on the agent, padded with NO_GLYPH (== MAX_GLYPH) off-map
-#define NETHACK_CROP       21
+// encoder views (GPU-side, cut from the full grid): odd-side egocentric crop
+// padded with NO_GLYPH (== MAX_GLYPH) off-map, plus 8x4 patches over the map
+#define NETHACK_CROP       9
 #define NETHACK_CROP_GRID  (NETHACK_CROP * NETHACK_CROP)
 #define NETHACK_PAD_GLYPH  5976
 
@@ -34,10 +35,12 @@ extern void       nle_end(nle_ctx_t*);
 #define NETHACK_GLYPH_BODY_OFF 1144
 #define NETHACK_NUMMONS        381
 
-// obs layout: glyphs | blstats | extra (prayer cooldown, prev action, inv counts)
+// obs layout: full glyph grid | blstats | extra (prayer cooldown, prev action,
+// inv counts). The grid ships whole (map memory included); the encoder derives
+// the egocentric crop from blstats x,y.
 #define NETHACK_NUM_OCLASSES 18   // MAXOCLASSES; inv_oclasses pads with 18
 #define NETHACK_OFF_GLYPHS  0
-#define NETHACK_OFF_BLSTATS (NETHACK_CROP_GRID * 2)
+#define NETHACK_OFF_BLSTATS (NH_GRID * 2)
 #define NETHACK_OFF_EXTRA   (NETHACK_OFF_BLSTATS + NLE_BLSTATS_SIZE * 4)
 #define NETHACK_EXTRA_INTS  (2 + NETHACK_NUM_OCLASSES)
 #define NETHACK_OBS_SIZE    (NETHACK_OFF_EXTRA + NETHACK_EXTRA_INTS * 4)
@@ -253,24 +256,7 @@ void c_close(Nethack* env) {
 }
 
 static void nethack_pack_obs(Nethack* env) {
-    int cx = (int)env->blstats[NLE_BL_X];   // 0-based, aligned with glyphs
-    int cy = (int)env->blstats[NLE_BL_Y];
-    int half = NETHACK_CROP / 2;
-    short* dst = (short*)(env->observations + NETHACK_OFF_GLYPHS);
-    for (int r = 0; r < NETHACK_CROP; r++) {
-        short* row = dst + r * NETHACK_CROP;
-        int gy = cy - half + r;
-        if (gy < 0 || gy >= NH_ROWS) {
-            for (int c = 0; c < NETHACK_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
-            continue;
-        }
-        int gx0 = cx - half;
-        int c0 = gx0 < 0 ? -gx0 : 0;
-        int c1 = gx0 + NETHACK_CROP > NH_COLS ? NH_COLS - gx0 : NETHACK_CROP;
-        for (int c = 0; c < c0; c++) row[c] = NETHACK_PAD_GLYPH;
-        memcpy(row + c0, env->glyphs + gy * NH_COLS + gx0 + c0, (size_t)(c1 - c0) * sizeof(short));
-        for (int c = c1; c < NETHACK_CROP; c++) row[c] = NETHACK_PAD_GLYPH;
-    }
+    memcpy(env->observations + NETHACK_OFF_GLYPHS, env->glyphs, sizeof(env->glyphs));
     unsigned char* bl = env->observations + NETHACK_OFF_BLSTATS;
     for (int i = 0; i < NLE_BLSTATS_SIZE; i++) {
         uint32_t v = (uint32_t)(int32_t)env->blstats[i];
