@@ -19,7 +19,7 @@ static double now_sec(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Trained-policy demo: CPU port of the custom CUDA encoder (src/ocean.cu
+// Trained-policy demo: CPU port of the custom CUDA encoder (src/nethack.cu
 // NethackEncoder) feeding puffernet's MinGRU + decoder. Weights =
 // resources/nethack/nethack_weights.bin, the fp32 dump training saves.
 // Weight order matches param registration: encoder tensors, decoder, mingru.
@@ -30,7 +30,7 @@ static double now_sec(void) {
 #define DEMO_CONV    1024                       // conv2 out, 64ch x 4x4, NCHW flat
 #define DEMO_CONCAT  (DEMO_CONV + 64 + DEMO_BL_FEAT)
 
-// Per-blstat normalization, mirroring NH_BL_SCALE / NH_BL_ISLOG in src/ocean.cu.
+// Per-blstat normalization, mirroring NH_BL_SCALE / NH_BL_ISLOG in src/nethack.cu.
 static const float DEMO_BL_SCALE[27] = {
     1.f/79, 1.f/21,
     1.f/25, 1.f/125, 1.f/25, 1.f/25, 1.f/25, 1.f/25, 1.f/25,

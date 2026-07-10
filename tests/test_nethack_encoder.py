@@ -1,4 +1,4 @@
-"""Numeric gradient check for the Nethack CUDA encoder (src/ocean.cu).
+"""Numeric gradient check for the Nethack CUDA encoder (src/nethack.cu).
 
 Builds tests/test_nethack_cuda.cu as a float shared lib and verifies the
 analytic gradients from encoder backward() against central finite differences

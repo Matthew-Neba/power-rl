@@ -2,7 +2,7 @@
 //   obs     = 21x21 egocentric glyph crop (int16 LE) + 27 blstats (int32 LE)
 //             + 20 extra stats (int32 LE: prayer cooldown, previous action,
 //             18 per-class inventory counts), 1070 bytes — exactly what the
-//             custom CUDA encoder in src/ocean.cu expects. chars/message/inv_*
+//             custom CUDA encoder in src/nethack.cu expects. chars/message/inv_*
 //             are kept in side buffers for the standalone tools and the item
 //             macros but never enter the obs tensor raw.
 //   actions = 24: 8 compass moves, 8 run-moves, down (>), up (<), kick (^D),

@@ -165,7 +165,7 @@ action index (-1 at episode start; a 64-dim recurrent trunk otherwise
 has to reverse-engineer what it just did from obs deltas), and 18
 per-object-class inventory item counts (stack = 1; tells the policy
 *when* WEAR/EAT are worth pressing — the macros choose the item). This
-layout is exactly what the custom CUDA encoder in `src/ocean.cu`
+layout is exactly what the custom CUDA encoder in `src/nethack.cu`
 expects (glyph embedding -> 2 convs, blstats+extra normalized/expanded
 to 88 features -> linear, concat -> projection); it is gradient-checked
 by `tests/test_nethack_encoder.py`. `chars`, `message`, and
@@ -173,26 +173,6 @@ by `tests/test_nethack_encoder.py`. `chars`, `message`, and
 for the standalone tools, the prompt heuristic, and the item macros,
 but never enter the obs tensor raw (`inv_strs` stays unbound: it alone
 triggers NetHack's doname() string formatting).
-
-Three alternative encoders are selected via `NETHACK_ENCODER` at train
-time (default = conv), all gradient-checked by
-`tests/test_nethack_mixer.py`:
-
-- `patch`: embed(16) -> shared non-overlapping 3x3 patch linear ->
-  flatten || blstats -> projection. Speed parity with the cuDNN conv
-  path with far less machinery (train phase 707 vs 715 ms/epoch at
-  minibatch 8192); single-tap embedding backward. Compile-time knobs
-  NHM_D/NHM_C trade capacity for further speed.
-- `minpatch`: patch stem + learned token pool (49 spatial tokens ->
-  16) -> flatten || blstats -> projection. Preserves the local symbolic
-  patch primitive while shrinking spatial features from 3136 to 1024.
-- `mixer`: patch stem + one norm-free MLP-Mixer block (full-crop
-  token mixing). Trains correctly but ~30% lower SPS than conv —
-  bandwidth-bound elementwise passes; exists for score-per-sample
-  A/B, not speed.
-
-Checkpoints are not interchangeable between encoders, and the CPU
-demo only supports the conv encoder.
 
 ## Action space (24 actions)
 

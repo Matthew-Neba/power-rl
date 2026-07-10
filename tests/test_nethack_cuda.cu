@@ -1,4 +1,4 @@
-// Test harness for the Nethack encoder — thin wrapper around ocean.cu's real
+// Test harness for the Nethack encoder — thin wrapper around nethack.cu's real
 // implementation. Built as a float (PRECISION_FLOAT) shared lib so finite-diff
 // gradient checking is numerically meaningful.
 //
@@ -9,7 +9,8 @@
 #include <string>
 #include <cstdio>
 #include "../src/models.cu"
-#include "../src/ocean.cu"
+#include "../src/cudnn_conv2d.cu"
+#include "../src/nethack.cu"
 
 extern "C" {
 
@@ -24,7 +25,7 @@ void nh_init(int B, int hidden) {
     g_enc = {};
     g_enc.in_dim = NH_OBS_SIZE;
     g_enc.out_dim = hidden;
-    create_custom_encoder("nethack", &g_enc);
+    create_nethack_encoder(&g_enc);
     g_w = (NethackEncoderWeights*)g_enc.create_weights(&g_enc);
     g_pa = {};
     g_enc.reg_params(g_w, &g_pa);

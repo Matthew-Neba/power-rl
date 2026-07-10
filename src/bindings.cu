@@ -215,8 +215,6 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
             pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
-    if (pufferl.policy.encoder.post_step)
-        pufferl.policy.encoder.post_step(pufferl.weights.encoder, pufferl.default_stream);
 }
 
 int py_add_frozen_bank(py::object pufferl_obj, int slice_size,

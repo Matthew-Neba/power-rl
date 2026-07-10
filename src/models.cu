@@ -20,10 +20,6 @@ typedef void (*reg_rollout_fn)(void* weights, void* buf, Allocator* alloc, int B
 typedef void* (*create_weights_fn)(void* self);
 typedef void  (*free_weights_fn)(void* weights);
 typedef void  (*free_activations_fn)(void* activations);
-// Optional: refresh derived weight state (e.g. fused lookup tables) after the
-// optimizer steps or weights are loaded. Called once per train epoch and after
-// checkpoint load, on the given stream.
-typedef void  (*post_step_fn)(void* weights, cudaStream_t stream);
 typedef PrecisionTensor (*forward_fn)(void* weights, void* activations, PrecisionTensor input, cudaStream_t stream);
 typedef void (*encoder_backward_fn)(void* weights, void* activations,
     PrecisionTensor grad, cudaStream_t stream);
@@ -46,7 +42,6 @@ struct Encoder {
     create_weights_fn create_weights;
     free_weights_fn free_weights;
     free_activations_fn free_activations;
-    post_step_fn post_step;   // optional (may be null)
     int in_dim, out_dim;
     size_t activation_size;  // sizeof(EncoderActivations) or custom override
 };
