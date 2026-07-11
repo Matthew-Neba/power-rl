@@ -1724,7 +1724,9 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
         .free_weights = decoder_free_weights,
         .free_activations = decoder_free_activations,
         .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
+        .activation_size = (int)sizeof(DecoderActivations),
     };
+    create_custom_decoder(env_name, &decoder);
     Network network = {
         .forward = mingru_forward,
         .forward_train = mingru_forward_train,

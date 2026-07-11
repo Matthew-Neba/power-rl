@@ -7,7 +7,7 @@
 // labels for the end-of-run histogram, in NETHACK_ACTION_TABLE order
 static const char* NETHACK_ACTION_NAMES[NETHACK_NUM_ACTIONS] = {
     "MOVE","RUN","DOWN_STAIRS","UP_STAIRS","KICK","SEARCH",
-    "ELBERETH","WEAR","EAT","QUAFF","PRAY","THROW",
+    "ELBERETH","WEAR","EAT","QUAFF","PRAY","THROW","ZAP",
 };
 
 // single-agent env, reset immediately (training's c_reset is lazy)
@@ -15,7 +15,7 @@ static void env_open(Nethack* env) {
     memset(env, 0, sizeof(*env));
     env->num_agents = 1;
     env->observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env->actions      = (float*)calloc(3, sizeof(float));   // {verb, item slot, direction}
+    env->actions      = (float*)calloc(7, sizeof(float));   // {verb, 5 per-verb slots, direction}
     env->rewards      = (float*)calloc(1, sizeof(float));
     env->terminals    = (float*)calloc(1, sizeof(float));
     init(env);

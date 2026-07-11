@@ -26,7 +26,7 @@ extern void       nle_end(nle_ctx_t*);
 #define NH_GRID (NH_ROWS * NH_COLS)
 
 // encoder views (GPU-side, cut from the full grid): odd-side egocentric crop
-// padded with NO_GLYPH (== MAX_GLYPH) off-map, plus 8x4 patches over the map
+// padded with NO_GLYPH (== MAX_GLYPH) off-map, plus 5x5 patches over the map
 #define NETHACK_CROP       9
 #define NETHACK_CROP_GRID  (NETHACK_CROP * NETHACK_CROP)
 #define NETHACK_PAD_GLYPH  5976
@@ -69,7 +69,7 @@ enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 // Factored action space: verb head (12) + item-slot head (55) + direction
 // head (8, vi-key order). MOVE/RUN/KICK/THROW consume the direction; the
 // direction head trains dense on every move, so directional verbs inherit it.
-#define NETHACK_NUM_ACTIONS 12
+#define NETHACK_NUM_ACTIONS 13
 #define NETHACK_NUM_DIRS    8
 static const int NETHACK_DIR_KEYS[NETHACK_NUM_DIRS] =
     {'k','j','h','l','y','u','b','n'};   // N S W E NW NE SW SE
@@ -87,6 +87,7 @@ enum {
     NETHACK_ACT_QUAFF    = 9,
     NETHACK_ACT_PRAY     = 10,
     NETHACK_ACT_THROW    = 11,
+    NETHACK_ACT_ZAP      = 12,
 };
 
 // !status_updates skips the status renderer + recalc_mapseen (~25% of engine)
@@ -94,7 +95,7 @@ enum {
     "name:Agent-mon-hum-neu-mal," \
     "autopickup,color,disclose:+i +a +v +g +c +o," \
     "mention_walls,nobones,nocmdassist,nolegacy,nosparkle," \
-    "pickup_burden:unencumbered,pickup_types:$[%!)," \
+    "pickup_burden:unencumbered,pickup_types:$[%!)/," \
     "runmode:teleport,showexp,showscore,time," \
     "!status_updates"
 
@@ -117,6 +118,11 @@ typedef struct Log {
     float prayers;
     float prayers_low_hp;     // prayers at <=25% max HP
     float throws;             // throw presses that launched an item
+    float zaps;               // zap presses that fired a wand
+    // slot position-dependence diagnostic: if uses sit far below where valid
+    // items live, the flat slot head isn't generalizing across positions
+    float use_slot_mean;      // mean slot index of successful item uses
+    float valid_slot_mean;    // mean slot index of mask-legal slots
     float damage_taken;
     float reward_saturated;   // fraction of steps with |reward| > 1
     float game_time;          // NetHack turns survived
@@ -153,6 +159,9 @@ typedef struct Stats {
     long quaffs;
     long prayers;
     long throws;
+    long zaps;
+    long use_slot_sum, use_cnt;       // slot indices of successful item uses
+    long valid_slot_sum, valid_cnt;   // slot indices legal in the mask, per step
     long last_ok_turn;   // last turn with HP >= 75% max
     long last_maxhp;
     int  last_adj;       // hostile monsters adjacent, last obs
@@ -322,24 +331,31 @@ static void nethack_pack_obs(Nethack* env) {
         iv[2*i + 1] = (unsigned char)((g >> 8) & 0xffu);
     }
 
-    // action mask, aligned with this obs: verbs [0,23) all legal except EAT
-    // while Satiated (a forced no-op); slots [23,78) legal when they hold a
-    // wearable (armor, oclass 3) or edible (food, 7) item. Coarse union over
-    // the item verbs — the prompt-answer path still ESCs residual mismatches.
+    // action mask, aligned with this obs: verbs all legal except EAT while
+    // Satiated; four PER-VERB slot heads, each legal only for its own item
+    // class (wear=armor 3, eat=food 7, quaff=potion 8, throw=weapon 2) —
+    // verb-conditioned selection with class-tight masks. The prompt-answer
+    // path still ESCs residual mismatches (worn armor, carried corpses).
     if (env->action_mask != NULL) {
         unsigned char* m = env->action_mask;
         memset(m, 1, NETHACK_NUM_ACTIONS);
         if (env->blstats[NLE_BL_HUNGER] == 0) m[NETHACK_ACT_EAT] = 0;
-        unsigned char* s = m + NETHACK_NUM_ACTIONS;
-        memset(s, 0, NETHACK_INV_SLOTS);
-        int any = 0;
-        for (int i = 0; i < NETHACK_INV_SLOTS && env->inv_letters[i]; i++) {
-            int oc = env->inv_oclasses[i];
-            if (oc >= NETHACK_NUM_OCLASSES) break;
-            if (oc == 2 || oc == 3 || oc == 7 || oc == 8) { s[i] = 1; any = 1; }
+        static const int head_oc[5] = {3, 7, 8, 2, 11};   // wear, eat, quaff, throw, zap
+        for (int h = 0; h < 5; h++) {
+            unsigned char* s = m + NETHACK_NUM_ACTIONS + h * NETHACK_INV_SLOTS;
+            memset(s, 0, NETHACK_INV_SLOTS);
+            int any = 0;
+            for (int i = 0; i < NETHACK_INV_SLOTS && env->inv_letters[i]; i++) {
+                int oc = env->inv_oclasses[i];
+                if (oc >= NETHACK_NUM_OCLASSES) break;
+                if (oc == head_oc[h]) {
+                    s[i] = 1; any = 1;
+                    env->stats.valid_slot_sum += i; env->stats.valid_cnt++;
+                }
+            }
+            if (!any) s[0] = 1;   // sampling needs >=1 legal entry per head
         }
-        if (!any) s[0] = 1;   // sampling needs >=1 legal entry per head
-        memset(s + NETHACK_INV_SLOTS, 1, NETHACK_NUM_DIRS);   // dir head: all legal
+        memset(m + NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS, 1, NETHACK_NUM_DIRS);
     }
 }
 
@@ -360,8 +376,13 @@ static void nethack_add_log(Nethack* env, int how) {
     env->log.prayers         += (float)env->stats.prayers;
     env->log.prayers_low_hp  += (float)env->stats.prayers_low_hp;
     env->log.throws          += (float)env->stats.throws;
+    env->log.zaps            += (float)env->stats.zaps;
     env->log.floor_eats      += (float)env->stats.floor_eats;
     env->log.damage_taken    += (float)env->stats.damage;
+    env->log.use_slot_mean += env->stats.use_cnt > 0
+        ? (float)env->stats.use_slot_sum / (float)env->stats.use_cnt : 0.0f;
+    env->log.valid_slot_mean += env->stats.valid_cnt > 0
+        ? (float)env->stats.valid_slot_sum / (float)env->stats.valid_cnt : 0.0f;
     env->log.reward_saturated += env->stats.length > 0
         ? (float)env->stats.saturated / (float)env->stats.length : 0.0f;
     env->log.game_time       += (float)env->prev_time;
@@ -540,9 +561,18 @@ void c_step(Nethack* env) {
 
     int a = (int)env->actions[0];
     if (a < 0 || a >= NETHACK_NUM_ACTIONS) a = 0;
-    int slot = (int)env->actions[1];   // item head, consumed by WEAR/EAT/QUAFF/THROW
+    // per-verb slot heads (verb-conditioned item selection): actions[1..4] =
+    // wear/eat/quaff/throw slots; only the sampled verb's head is consumed
+    int slot = 0;
+    switch (a) {
+    case NETHACK_ACT_WEAR:  slot = (int)env->actions[1]; break;
+    case NETHACK_ACT_EAT:   slot = (int)env->actions[2]; break;
+    case NETHACK_ACT_QUAFF: slot = (int)env->actions[3]; break;
+    case NETHACK_ACT_THROW: slot = (int)env->actions[4]; break;
+    case NETHACK_ACT_ZAP:   slot = (int)env->actions[5]; break;
+    }
     if (slot < 0 || slot >= NETHACK_INV_SLOTS) slot = 0;
-    int dir = (int)env->actions[2];    // direction head, consumed by MOVE/RUN/KICK/THROW
+    int dir = (int)env->actions[6];    // direction head, consumed by MOVE/RUN/KICK/THROW/ZAP
     if (dir < 0 || dir >= NETHACK_NUM_DIRS) dir = 0;
     int dirkey = NETHACK_DIR_KEYS[dir];
 
@@ -586,28 +616,55 @@ void c_step(Nethack* env) {
         break;
     case NETHACK_ACT_WEAR:
         used = nethack_do_use_item(env, 'W', "want to wear", NULL, slot);
-        if (used > 0) env->stats.wears++;
+        if (used > 0) {
+            env->stats.wears++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+        }
         else if (used < 0) bad_pick = 1;
         break;
     case NETHACK_ACT_EAT:
         // satiated gate: eating past Satiated is NetHack's choke() death
         if (env->blstats[NLE_BL_HUNGER] == 0) stepped = 0;
         else {
+            long fe0 = env->stats.floor_eats;
             used = nethack_do_use_item(env, 'e', "want to eat", "eat it", slot);
-            if (used > 0) env->stats.eats++;
+            if (used > 0) {
+                env->stats.eats++;
+                if (env->stats.floor_eats == fe0) {   // slot-directed, not floor
+                    env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+                }
+            }
             else if (used < 0) bad_pick = 1;
         }
         break;
     case NETHACK_ACT_QUAFF:
         used = nethack_do_use_item(env, 'q', "want to drink", "rink from the", slot);
-        if (used > 0) env->stats.quaffs++;
+        if (used > 0) {
+            env->stats.quaffs++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+        }
         else if (used < 0) bad_pick = 1;
         break;
     case NETHACK_ACT_THROW:
         used = nethack_do_use_item(env, 't', "want to throw", NULL, slot);
         if (used > 0) {
             env->stats.throws++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
             // answer the direction prompt in-step: throw is atomic now
+            if (!env->obs.done && env->misc[NETHACK_MISC_YN]
+                && nethack_msg_contains(env, "n what direction")) {
+                env->obs.action = dirkey;
+                env->ctx = nle_step(env->ctx, &env->obs);
+            }
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_ZAP:
+        used = nethack_do_use_item(env, 'z', "want to zap", NULL, slot);
+        if (used > 0) {
+            env->stats.zaps++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+            // directional wands raise "In what direction?" — answer in-step
             if (!env->obs.done && env->misc[NETHACK_MISC_YN]
                 && nethack_msg_contains(env, "n what direction")) {
                 env->obs.action = dirkey;

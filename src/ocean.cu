@@ -591,3 +591,7 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
         create_nethack_encoder(enc);
     }
 }
+
+static void create_custom_decoder(const std::string& env_name, Decoder* dec) {
+    if (getenv("NH_PTR_DECODER") && env_name == "nethack") create_nethack_decoder(dec);
+}

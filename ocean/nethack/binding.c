@@ -1,9 +1,9 @@
 #include "nethack.h"
 #define OBS_SIZE NETHACK_OBS_SIZE
-#define NUM_ATNS 3
-#define ACT_SIZES {NETHACK_NUM_ACTIONS, NETHACK_INV_SLOTS, NETHACK_NUM_DIRS}
+#define NUM_ATNS 7
+#define ACT_SIZES {NETHACK_NUM_ACTIONS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_NUM_DIRS}
 #define OBS_TENSOR_T ByteTensor
-#define MY_ACTION_MASK (NETHACK_NUM_ACTIONS + NETHACK_INV_SLOTS + NETHACK_NUM_DIRS)
+#define MY_ACTION_MASK (NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS)
 
 #define Env Nethack
 #include "vecenv.h"
@@ -41,6 +41,9 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "prayers", log->prayers);
     dict_set(out, "prayers_low_hp", log->prayers_low_hp);
     dict_set(out, "throws", log->throws);
+    dict_set(out, "zaps", log->zaps);
+    dict_set(out, "use_slot_mean", log->use_slot_mean);
+    dict_set(out, "valid_slot_mean", log->valid_slot_mean);
     dict_set(out, "damage_taken", log->damage_taken);
     dict_set(out, "reward_saturated", log->reward_saturated);
     dict_set(out, "game_time", log->game_time);

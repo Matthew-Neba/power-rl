@@ -84,10 +84,10 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     u = vals.astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, :27] = ((u >> (8 * k)) & 0xFF).astype(np.float32)
-    # extra stats @ +27*4: prayer cooldown, prev action (-1..11), 18 class counts
+    # extra stats @ +27*4: prayer cooldown, prev action (-1..12), 18 class counts
     ex = np.concatenate([
         rng.integers(0, 1000, size=(B, 1)),
-        rng.integers(-1, 12, size=(B, 1)),
+        rng.integers(-1, 13, size=(B, 1)),
         rng.integers(0, 6, size=(B, 18)),
     ], axis=1).astype(np.int64).astype(np.uint32)
     for k in range(4):
@@ -266,8 +266,8 @@ def torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs):
     g1_xy  = getw("glb1_xy", (16, 2))
     g2_w   = getw("glb2_w", (128, 16));               g2_b  = getw("glb2_b", (128,))
     inv1_w = getw("inv1_w", (32, 32));                inv1_b = getw("inv1_b", (32,))
-    bl_w   = getw("bl_w", (64, 76));                  bl_b  = getw("bl_b", (64,))
-    proj_w = getw("proj_w", (H, 2284));               proj_b = getw("proj_b", (H,))
+    bl_w   = getw("bl_w", (64, 77));                  bl_b  = getw("bl_b", (64,))
+    proj_w = getw("proj_w", (H, 2285));               proj_b = getw("proj_b", (H,))
 
     grid_t = torch.tensor(glyphs.reshape(B, ROWS, COLS).astype(np.int64))
     # local: crop glyph ids with pad off-map
@@ -296,7 +296,7 @@ def torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs):
     t128 = t16 @ g2_w.T
     glb = torch.relu(t128.max(dim=1).values + g2_b)
     # blstats features
-    f = np.zeros((B, 76), dtype=np.float64)
+    f = np.zeros((B, 77), dtype=np.float64)
     j = 0
     for i in range(27):
         if i in (21, 25):
@@ -310,7 +310,7 @@ def torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs):
     for k in range(13):
         f[:, j] = (bl_vals[:, 25].astype(np.uint32) >> k) & 1; j += 1
     f[:, j] = np.log1p(np.maximum(ex_vals[:, 0], 0)) * 0.1; j += 1
-    for h in range(12):
+    for h in range(13):
         f[:, j] = (ex_vals[:, 1] == h); j += 1
     for k in range(18):
         f[:, j] = ex_vals[:, 2 + k] * 0.125; j += 1

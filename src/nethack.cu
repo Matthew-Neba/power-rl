@@ -1,6 +1,6 @@
 // NetHack CUDA encoder: one shared glyph embedding feeding two views of the
 // full 79x21 map — an egocentric 9x9 crop at per-cell detail (flatten-linear)
-// and a global 8x4-patch view (embed sums per patch, 10x6 = 60 tokens) — plus
+// and a global 5x5-patch view (fused embed+flatten->16->128 max over 16x5 = 80 tokens) — plus
 // the blstats MLP. Included by ocean.cu — requires kernels.cu, models.cu.
 // Bit-deterministic backward: fixed-point integer atomics and split-K GEMMs
 // with atomic reduction schemes masked out.
@@ -108,16 +108,16 @@ static constexpr int NH_PAD_PER_SAMPLE = NH_TOK * NH_PCELLS - NH_MGRID;
 static constexpr int NH_HOT_G = 10;                // hot-glyph dT smem slots (10x400 int64 = 32KB)
 static constexpr int NH_BL_RAW = 27;               // NLE_BLSTATS_SIZE
 static constexpr int NH_BL_HUNGER = 21, NH_BL_CONDITION = 25;
-static constexpr int NH_ACTIONS = 12;              // NETHACK_NUM_ACTIONS
+static constexpr int NH_ACTIONS = 13;              // NETHACK_NUM_ACTIONS
 static constexpr int NH_OCLASSES = 18;             // MAXOCLASSES
 static constexpr int NH_EX_RAW = 2 + NH_OCLASSES;  // NETHACK_EXTRA_INTS
 // scalars + hunger onehot + condition bits + cooldown + prev-action onehot + counts
 static constexpr int NH_BL_FEAT = 25 + 7 + 13 + 1 + NH_ACTIONS + NH_OCLASSES;
 static constexpr int NH_BL_HID = 64;
 // Inventory entity branch: 55 slot glyphs (the item action head indexes these
-// positions), each embed -> shared 32->16 linear -> relu, flattened in slot
+// positions), each embed -> shared 32->32 linear -> relu, flattened in slot
 // order (position must survive: the policy has to name a slot index). Fused
-// per-glyph table T_inv = E @ inv1_w^T (5977x16) rebuilt per forward.
+// per-glyph table T_inv = E @ inv1_w^T (5977xNH_INV_HID) rebuilt per forward.
 static constexpr int NH_INV = 55;                  // NETHACK_INV_SLOTS
 static constexpr int NH_INV_HID = 32;
 static constexpr int NH_INV_FLAT = NH_INV * NH_INV_HID;
@@ -745,6 +745,19 @@ static NethackEncoderWeights* nethack_encoder_create(int obs_size, int hidden) {
 
 // ---- Nethack encoder interface ----
 
+// ---- encoder <-> pointer-decoder wiring ----
+// The decoder's slot head is a pointer over the inventory branch's per-slot
+// vectors: it reads the encoder's inv_out (keys), and the encoder backward
+// adds the decoder's key gradients into the inv slice (inv_out has two grad
+// consumers: the concat slice and the keys). Struct pointers are fixed at
+// registration (cudagraph-safe); train vs rollout resolved by batch size.
+struct NethackDecoderActivations;
+// encoder acts register immediately before their partner decoder acts inside
+// each policy_reg_* call; the decoder captures this at its own reg time, so
+// every rollout buffer's decoder reads its own buffer's inv_out.
+static NethackEncoderActivations* nh_enc_last = nullptr;
+static PrecisionTensor* nh_ptr_keygrad = nullptr;   // train decoder's (B_TT, NH_INV_FLAT)
+
 static PrecisionTensor nethack_encoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
     NethackEncoderWeights* ew = (NethackEncoderWeights*)w;
     NethackEncoderActivations* a = (NethackEncoderActivations*)activations;
@@ -840,6 +853,11 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     // then dinv1_w = dT_inv^T @ E; the dE contribution is added at the end.
     nh_slice_kernel<<<grid_size(B * NH_INV_FLAT), BLOCK_SIZE, 0, stream>>>(
         a->inv_grad.data, grad_concat.data, B, NH_CONCAT, NH_LOC_HID + NH_GLB_HID, NH_INV_FLAT);
+    // pointer-decoder key grads: second consumer of inv_out, summed before
+    // the relu mask (both paths read the post-relu slot vectors)
+    if (nh_ptr_keygrad != nullptr)
+        nh_add_inplace_kernel<<<grid_size(B * NH_INV_FLAT), BLOCK_SIZE, 0, stream>>>(
+            a->inv_grad.data, nh_ptr_keygrad->data, B * NH_INV_FLAT);
     nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * NH_INV_FLAT, NH_INV_HID), BLOCK_SIZE, NH_INV_HID * sizeof(long long), stream>>>(
         a->inv_grad.data, a->inv_out.data, bacc + H + NH_LOC_HID + NH_GLB_HID + NH_BL_HID + NH_P1,
         (int64_t)B * NH_INV_FLAT, NH_INV_HID);
@@ -1032,6 +1050,7 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     alloc_register(grads,&a->inv1_wgrad);  alloc_register(grads,&a->inv1_bgrad);
     alloc_register(grads,&a->bl_wgrad);    alloc_register(grads,&a->bl_bgrad);
     alloc_register(grads,&a->proj_wgrad);  alloc_register(grads,&a->proj_bgrad);
+    nh_enc_last = a;
 }
 
 static void nethack_encoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
@@ -1064,6 +1083,7 @@ static void nethack_encoder_reg_rollout(void* w, void* activations, Allocator* a
     alloc_register(alloc,&a->loc_out);   alloc_register(alloc,&a->glb_out);
     alloc_register(alloc,&a->bl_feats);  alloc_register(alloc,&a->bl_out);
     alloc_register(alloc,&a->concat);    alloc_register(alloc,&a->out);
+    nh_enc_last = a;
 }
 
 static void* nethack_encoder_create_weights(void* self) {
@@ -1086,5 +1106,328 @@ static void create_nethack_encoder(Encoder* enc) {
         .free_activations = nethack_encoder_free_activations,
         .in_dim = enc->in_dim, .out_dim = enc->out_dim,
         .activation_size = sizeof(NethackEncoderActivations),
+    };
+}
+
+// ---- Nethack decoder: pointer slot head ----
+// Output layout matches DefaultDecoder: [12 verb | 55 slot | 8 dir | value].
+// verb/dir/value are one small linear; slot logit i = q . s_i / sqrt(32)
+// where q is a linear query of the hidden state and s_i is the inventory
+// branch's post-relu slot vector — item->action mapping is position-
+// invariant and every item use trains the same two projections.
+
+static constexpr int NH_DIRS    = 8;
+static constexpr int NH_DEC_OD  = NH_ACTIONS + NH_INV + NH_DIRS;   // 75 logits
+static constexpr int NH_DEC_LIN = NH_ACTIONS + NH_DIRS + 1;        // verb|dir|value rows
+static constexpr int NH_DEC_PAD = 24;                               // lin rows padded (cublasLt alignment)
+
+struct NethackDecoderWeights {
+    // Header mirrors DecoderWeights EXACTLY: the framework casts decoder
+    // weights to DecoderWeights to read .continuous / .logstd when deciding
+    // discrete-vs-continuous sampling (pufferlib.cu sample + train sites).
+    // weight_unused is never registered; logstd stays null; continuous false.
+    PrecisionTensor weight_unused, logstd;
+    int hidden_dim, output_dim;
+    bool continuous;
+    // pointer-head weights (v2: cosine attention)
+    PrecisionTensor lin_w;   // (NH_DEC_PAD rows, hidden); first NH_DEC_LIN used
+    PrecisionTensor q_w;     // (NH_INV_HID, hidden) query projection
+    PrecisionTensor k_w;     // (NH_INV_HID, NH_INV_HID) key projection over inv features
+    PrecisionTensor tau;     // (1,) learnable temperature; logit = tau * cos(q,k)
+};
+
+struct NethackDecoderActivations {
+    NethackEncoderActivations* enc;          // partner encoder acts (keys source)
+    PrecisionTensor out;                     // (B, NH_DEC_OD+1)
+    PrecisionTensor tmp, q;                  // (B, NH_DEC_LIN), (B, NH_INV_HID)
+    PrecisionTensor saved_input, grad_input, grad_input2;
+    PrecisionTensor grad_out;                // assembled logits+value grad
+    PrecisionTensor dtmp, dq;
+    PrecisionTensor keygrad;                 // (B, NH_INV_FLAT) -> encoder inv slice
+    PrecisionTensor kmat;                    // (B, NH_INV_FLAT) projected keys
+    PrecisionTensor kn, qn;                  // key norms (B, NH_INV), query norm (B, 1)
+    PrecisionTensor slot_logits;             // (B, NH_INV) tau * cos
+    PrecisionTensor dkmat, dv;               // backward scratch
+    LongTensor tau_acc;                      // fixed-point dtau staging (1,)
+    PrecisionTensor lin_wgrad, q_wgrad, k_wgrad, tau_grad;
+};
+
+__global__ void nh_dec_assemble_kernel(precision_t* __restrict__ out,
+    const precision_t* __restrict__ tmp, const precision_t* __restrict__ slot_logits, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int od1 = NH_DEC_OD + 1;
+    if (idx >= B * od1) return;
+    int b = idx / od1, c = idx % od1;
+    float v;
+    if (c < NH_ACTIONS) v = to_float(tmp[(int64_t)b * NH_DEC_PAD + c]);
+    else if (c < NH_ACTIONS + NH_INV)
+        v = to_float(slot_logits[(int64_t)b * NH_INV + (c - NH_ACTIONS)]);
+    else v = to_float(tmp[(int64_t)b * NH_DEC_PAD + NH_ACTIONS + (c - NH_ACTIONS - NH_INV)]);
+    out[idx] = from_float(v);
+}
+
+__global__ void nh_ptr2_qnorm_kernel(precision_t* __restrict__ qn,
+    const precision_t* __restrict__ q, int B) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B) return;
+    float acc = 0.0f;
+    for (int k = 0; k < NH_INV_HID; k++) {
+        float v = to_float(q[(int64_t)b * NH_INV_HID + k]);
+        acc += v * v;
+    }
+    qn[b] = from_float(sqrtf(acc) + 1e-6f);
+}
+
+// slot logit = tau * cos(q, k_i); key norms saved for backward
+__global__ void nh_ptr2_cos_kernel(precision_t* __restrict__ slot_logits,
+    precision_t* __restrict__ kn, const precision_t* __restrict__ q,
+    const precision_t* __restrict__ qn, const precision_t* __restrict__ kmat,
+    const precision_t* __restrict__ tau, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * NH_INV) return;
+    int b = idx / NH_INV;
+    const precision_t* qb = q + (int64_t)b * NH_INV_HID;
+    const precision_t* ki = kmat + (int64_t)idx * NH_INV_HID;
+    float nk = 0.0f, dot = 0.0f;
+    for (int k = 0; k < NH_INV_HID; k++) {
+        float kv = to_float(ki[k]);
+        nk += kv * kv;
+        dot += to_float(qb[k]) * kv;
+    }
+    float nkr = sqrtf(nk) + 1e-6f;
+    kn[idx] = from_float(nkr);
+    slot_logits[idx] = from_float(to_float(tau[0]) * dot / (to_float(qn[b]) * nkr));
+}
+
+__global__ void nh_dec_dtmp_kernel(precision_t* __restrict__ dtmp,
+    const precision_t* __restrict__ g, int B) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * NH_DEC_PAD) return;
+    int b = idx / NH_DEC_PAD, c = idx % NH_DEC_PAD;
+    if (c >= NH_DEC_LIN) { dtmp[idx] = from_float(0.0f); return; }   // pad rows
+    int src = c < NH_ACTIONS ? c : NH_ACTIONS + NH_INV + (c - NH_ACTIONS);
+    dtmp[idx] = g[(int64_t)b * (NH_DEC_OD + 1) + src];
+}
+
+// dtau (fxp scalar) + dv = tau * sum_i g_i * u_i (u = normalized key);
+// dq = (dv - v (v.dv)) / ||q||, computed per-sample with sequential loops.
+__global__ void nh_ptr2_dq_kernel(precision_t* __restrict__ dq,
+    long long* __restrict__ tau_acc, const precision_t* __restrict__ g,
+    const precision_t* __restrict__ out, const precision_t* __restrict__ q,
+    const precision_t* __restrict__ qn, const precision_t* __restrict__ kmat,
+    const precision_t* __restrict__ kn, const precision_t* __restrict__ tau, int B) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B) return;
+    float tauv = to_float(tau[0]);
+    float qnv = to_float(qn[b]);
+    float vhat[NH_INV_HID], dv[NH_INV_HID];
+    for (int k = 0; k < NH_INV_HID; k++) {
+        vhat[k] = to_float(q[(int64_t)b * NH_INV_HID + k]) / qnv;
+        dv[k] = 0.0f;
+    }
+    float dtau = 0.0f;
+    for (int i = 0; i < NH_INV; i++) {
+        float gi = to_float(g[(int64_t)b * (NH_DEC_OD + 1) + NH_ACTIONS + i]);
+        if (gi == 0.0f) continue;
+        float cosv = to_float(out[(int64_t)b * (NH_DEC_OD + 1) + NH_ACTIONS + i]) / tauv;
+        dtau += gi * cosv;
+        float knv = to_float(kn[(int64_t)b * NH_INV + i]);
+        const precision_t* ki = kmat + ((int64_t)b * NH_INV + i) * NH_INV_HID;
+        for (int k = 0; k < NH_INV_HID; k++)
+            dv[k] += tauv * gi * to_float(ki[k]) / knv;
+    }
+    float vdv = 0.0f;
+    for (int k = 0; k < NH_INV_HID; k++) vdv += vhat[k] * dv[k];
+    for (int k = 0; k < NH_INV_HID; k++)
+        dq[(int64_t)b * NH_INV_HID + k] = from_float((dv[k] - vhat[k] * vdv) / qnv);
+    if (dtau != 0.0f) nh_fxp_atomic_add(tau_acc, dtau);
+}
+
+// dk_i = tau * g_i * (v - u_i * cos_i) / ||k_i||
+__global__ void nh_ptr2_dkmat_kernel(precision_t* __restrict__ dkmat,
+    const precision_t* __restrict__ g, const precision_t* __restrict__ out,
+    const precision_t* __restrict__ q, const precision_t* __restrict__ qn,
+    const precision_t* __restrict__ kmat, const precision_t* __restrict__ kn,
+    const precision_t* __restrict__ tau, int B) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * NH_INV_FLAT) return;
+    int64_t bi = idx / NH_INV_HID;
+    int64_t b = bi / NH_INV;
+    int i = (int)(bi % NH_INV);
+    int k = (int)(idx % NH_INV_HID);
+    float tauv = to_float(tau[0]);
+    float gi = to_float(g[b * (NH_DEC_OD + 1) + NH_ACTIONS + i]);
+    if (gi == 0.0f) { dkmat[idx] = from_float(0.0f); return; }
+    float cosv = to_float(out[b * (NH_DEC_OD + 1) + NH_ACTIONS + i]) / tauv;
+    float knv = to_float(kn[bi]);
+    float vk = to_float(q[b * NH_INV_HID + k]) / to_float(qn[b]);
+    float uk = to_float(kmat[idx]) / knv;
+    dkmat[idx] = from_float(tauv * gi * (vk - uk * cosv) / knv);
+}
+
+static PrecisionTensor nethack_decoder_forward(void* w, void* activations, PrecisionTensor input, cudaStream_t stream) {
+    NethackDecoderWeights* dw = (NethackDecoderWeights*)w;
+    NethackDecoderActivations* a = (NethackDecoderActivations*)activations;
+    int B = input.shape[0];
+    NethackEncoderActivations* ea = a->enc;
+    if (a->saved_input.data) puf_copy(&a->saved_input, &input, stream);
+    puf_mm(&input, &dw->lin_w, &a->tmp, stream);
+    puf_mm(&input, &dw->q_w, &a->q, stream);
+    PrecisionTensor sflat = {.data = ea->inv_out.data, .shape = {B * NH_INV, NH_INV_HID}};
+    PrecisionTensor kflat = {.data = a->kmat.data, .shape = {B * NH_INV, NH_INV_HID}};
+    puf_mm(&sflat, &dw->k_w, &kflat, stream);
+    nh_ptr2_qnorm_kernel<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(a->qn.data, a->q.data, B);
+    nh_ptr2_cos_kernel<<<grid_size(B * NH_INV), BLOCK_SIZE, 0, stream>>>(
+        a->slot_logits.data, a->kn.data, a->q.data, a->qn.data, a->kmat.data, dw->tau.data, B);
+    nh_dec_assemble_kernel<<<grid_size(B * (NH_DEC_OD + 1)), BLOCK_SIZE, 0, stream>>>(
+        a->out.data, a->tmp.data, a->slot_logits.data, B);
+    return a->out;
+}
+
+static PrecisionTensor nethack_decoder_backward(void* w, void* activations,
+    FloatTensor grad_logits, FloatTensor grad_logstd, FloatTensor grad_value, cudaStream_t stream) {
+    (void)grad_logstd;
+    NethackDecoderWeights* dw = (NethackDecoderWeights*)w;
+    NethackDecoderActivations* a = (NethackDecoderActivations*)activations;
+    int B = a->saved_input.shape[0];
+    NethackEncoderActivations* ea = a->enc;
+    assemble_decoder_grad<<<grid_size(B * (NH_DEC_OD + 1)), BLOCK_SIZE, 0, stream>>>(
+        a->grad_out.data, grad_logits.data, grad_value.data, B, NH_DEC_OD, NH_DEC_OD + 1);
+    nh_dec_dtmp_kernel<<<grid_size(B * NH_DEC_PAD), BLOCK_SIZE, 0, stream>>>(
+        a->dtmp.data, a->grad_out.data, B);
+    cudaMemsetAsync(a->tau_acc.data, 0, sizeof(long long), stream);
+    nh_ptr2_dq_kernel<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(
+        a->dq.data, (long long*)a->tau_acc.data, a->grad_out.data, a->out.data,
+        a->q.data, a->qn.data, a->kmat.data, a->kn.data, dw->tau.data, B);
+    nh_fxp_to_precision_kernel<<<1, 1, 0, stream>>>(
+        a->tau_grad.data, (long long*)a->tau_acc.data, 1);
+    nh_ptr2_dkmat_kernel<<<grid_size((int64_t)B * NH_INV_FLAT), BLOCK_SIZE, 0, stream>>>(
+        a->dkmat.data, a->grad_out.data, a->out.data, a->q.data, a->qn.data,
+        a->kmat.data, a->kn.data, dw->tau.data, B);
+    // dK = dkmat^T @ s ; keygrad (ds, into the encoder inv slice) = dkmat @ K
+    PrecisionTensor dkflat = {.data = a->dkmat.data, .shape = {B * NH_INV, NH_INV_HID}};
+    PrecisionTensor sflat = {.data = ea->inv_out.data, .shape = {B * NH_INV, NH_INV_HID}};
+    PrecisionTensor kgflat = {.data = a->keygrad.data, .shape = {B * NH_INV, NH_INV_HID}};
+    puf_mm_tn_splitk(&dkflat, &sflat, &a->k_wgrad, stream);
+    puf_mm_nn(&dkflat, &dw->k_w, &kgflat, stream);
+    puf_mm_tn(&a->dtmp, &a->saved_input, &a->lin_wgrad, stream);
+    puf_mm_tn(&a->dq, &a->saved_input, &a->q_wgrad, stream);
+    puf_mm_nn(&a->dtmp, &dw->lin_w, &a->grad_input, stream);
+    puf_mm_nn(&a->dq, &dw->q_w, &a->grad_input2, stream);
+    nh_add_inplace_kernel<<<grid_size(B * dw->hidden_dim), BLOCK_SIZE, 0, stream>>>(
+        a->grad_input.data, a->grad_input2.data, B * dw->hidden_dim);
+    return a->grad_input;
+}
+
+__global__ void nh_fill_kernel(precision_t* p, float v) { p[0] = from_float(v); }
+
+static void nethack_decoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+    NethackDecoderWeights* dw = (NethackDecoderWeights*)w;
+    puf_kaiming_init(&dw->lin_w, 1.0f, (*seed)++, stream);
+    puf_kaiming_init(&dw->q_w, 1.0f, (*seed)++, stream);
+    puf_kaiming_init(&dw->k_w, 1.0f, (*seed)++, stream);
+    nh_fill_kernel<<<1, 1, 0, stream>>>(dw->tau.data, 10.0f);
+}
+
+static void nethack_decoder_reg_params(void* w, Allocator* alloc) {
+    NethackDecoderWeights* dw = (NethackDecoderWeights*)w;
+    dw->lin_w = {.shape = {NH_DEC_PAD, dw->hidden_dim}};
+    dw->q_w   = {.shape = {NH_INV_HID, dw->hidden_dim}};
+    dw->k_w   = {.shape = {NH_INV_HID, NH_INV_HID}};
+    dw->tau   = {.shape = {1}};
+    alloc_register(alloc,&dw->lin_w);
+    alloc_register(alloc,&dw->q_w);
+    alloc_register(alloc,&dw->k_w);
+    alloc_register(alloc,&dw->tau);
+}
+
+static void nethack_decoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
+    NethackDecoderWeights* dw = (NethackDecoderWeights*)w;
+    NethackDecoderActivations* a = (NethackDecoderActivations*)activations;
+    *a = {};
+    a->out         = {.shape = {B_TT, NH_DEC_OD + 1}};
+    a->tmp         = {.shape = {B_TT, NH_DEC_PAD}};
+    a->q           = {.shape = {B_TT, NH_INV_HID}};
+    a->saved_input = {.shape = {B_TT, dw->hidden_dim}};
+    a->grad_input  = {.shape = {B_TT, dw->hidden_dim}};
+    a->grad_input2 = {.shape = {B_TT, dw->hidden_dim}};
+    a->grad_out    = {.shape = {B_TT, NH_DEC_OD + 1}};
+    a->dtmp        = {.shape = {B_TT, NH_DEC_PAD}};
+    a->dq          = {.shape = {B_TT, NH_INV_HID}};
+    a->keygrad     = {.shape = {B_TT, NH_INV_FLAT}};
+    a->kmat        = {.shape = {B_TT, NH_INV_FLAT}};
+    a->kn          = {.shape = {B_TT, NH_INV}};
+    a->qn          = {.shape = {B_TT, 1}};
+    a->slot_logits = {.shape = {B_TT, NH_INV}};
+    a->dkmat       = {.shape = {B_TT, NH_INV_FLAT}};
+    a->tau_acc     = {.shape = {1}};
+    a->lin_wgrad   = {.shape = {NH_DEC_PAD, dw->hidden_dim}};
+    a->q_wgrad     = {.shape = {NH_INV_HID, dw->hidden_dim}};
+    a->k_wgrad     = {.shape = {NH_INV_HID, NH_INV_HID}};
+    a->tau_grad    = {.shape = {1}};
+    alloc_register(acts,&a->out);         alloc_register(acts,&a->tmp);
+    alloc_register(acts,&a->q);           alloc_register(acts,&a->saved_input);
+    alloc_register(acts,&a->grad_input);  alloc_register(acts,&a->grad_input2);
+    alloc_register(acts,&a->grad_out);    alloc_register(acts,&a->dtmp);
+    alloc_register(acts,&a->dq);          alloc_register(acts,&a->keygrad);
+    alloc_register(acts,&a->kmat);        alloc_register(acts,&a->kn);
+    alloc_register(acts,&a->qn);          alloc_register(acts,&a->slot_logits);
+    alloc_register(acts,&a->dkmat);       alloc_register(acts,&a->tau_acc);
+    alloc_register(grads,&a->lin_wgrad);  alloc_register(grads,&a->q_wgrad);
+    alloc_register(grads,&a->k_wgrad);    alloc_register(grads,&a->tau_grad);
+    a->enc = nh_enc_last;
+    nh_ptr_keygrad = &a->keygrad;
+}
+
+static void nethack_decoder_reg_rollout(void* w, void* activations, Allocator* alloc, int B) {
+    (void)w;   // rollout shapes are all compile-time constants
+    NethackDecoderActivations* a = (NethackDecoderActivations*)activations;
+    a->enc = nh_enc_last;
+    a->out = {.shape = {B, NH_DEC_OD + 1}};
+    a->tmp = {.shape = {B, NH_DEC_PAD}};
+    a->q   = {.shape = {B, NH_INV_HID}};
+    a->kmat        = {.shape = {B, NH_INV_FLAT}};
+    a->kn          = {.shape = {B, NH_INV}};
+    a->qn          = {.shape = {B, 1}};
+    a->slot_logits = {.shape = {B, NH_INV}};
+    alloc_register(alloc,&a->out);
+    alloc_register(alloc,&a->tmp);
+    alloc_register(alloc,&a->q);
+    alloc_register(alloc,&a->kmat);
+    alloc_register(alloc,&a->kn);
+    alloc_register(alloc,&a->qn);
+    alloc_register(alloc,&a->slot_logits);
+}
+
+static void* nethack_decoder_create_weights(void* self) {
+    Decoder* d = (Decoder*)self;
+    if (d->output_dim != NH_DEC_OD) {
+        fprintf(stderr, "nethack decoder: output_dim %d != expected %d\n",
+                d->output_dim, NH_DEC_OD);
+        exit(1);
+    }
+    NethackDecoderWeights* dw = (NethackDecoderWeights*)calloc(1, sizeof(NethackDecoderWeights));
+    dw->hidden_dim = d->hidden_dim;
+    dw->output_dim = d->output_dim;
+    dw->continuous = false;
+    return dw;
+}
+static void nethack_decoder_free_weights(void* weights) { free(weights); }
+static void nethack_decoder_free_activations(void* activations) { free(activations); }
+
+static void create_nethack_decoder(Decoder* dec) {
+    *dec = Decoder{
+        .forward = nethack_decoder_forward,
+        .backward = nethack_decoder_backward,
+        .init_weights = nethack_decoder_init_weights,
+        .reg_params = nethack_decoder_reg_params,
+        .reg_train = nethack_decoder_reg_train,
+        .reg_rollout = nethack_decoder_reg_rollout,
+        .create_weights = nethack_decoder_create_weights,
+        .free_weights = nethack_decoder_free_weights,
+        .free_activations = nethack_decoder_free_activations,
+        .hidden_dim = dec->hidden_dim, .output_dim = dec->output_dim,
+        .continuous = dec->continuous,
+        .activation_size = (int)sizeof(NethackDecoderActivations),
     };
 }
