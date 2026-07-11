@@ -147,20 +147,28 @@ PufferLib repo (it is in `.gitignore`).
 
 ---
 
-## Observation (fixed, 1070 bytes)
+## Observation (fixed, 3616 bytes)
 
 A single flat `ByteTensor` per agent:
 
-| Slice     | Offset | Bytes | Encoding                                    |
-|-----------|-------:|------:|---------------------------------------------|
-| `glyphs`  |      0 |   882 | 21x21 egocentric crop, int16 LE per cell     |
-| `blstats` |    882 |   108 | 27 stats, int64 truncated to int32 LE        |
-| `extra`   |    990 |    80 | 20 stats, int32 LE (see below)               |
+| Slice     | Offset | Bytes | Encoding                                     |
+|-----------|-------:|------:|----------------------------------------------|
+| `glyphs`  |      0 |  3318 | full 79x21 grid, int16 LE per cell (map memory included; the GPU encoder derives the 9x9 egocentric crop from blstats x,y) |
+| `blstats` |   3318 |   108 | 27 stats, int64 truncated to int32 LE        |
+| `extra`   |   3426 |    80 | 20 stats, int32 LE (see below)               |
+| `inv`     |   3506 |   110 | 55 inventory slot glyphs, int16 LE, in slot order (the item action head indexes these positions); empty slots = `NO_GLYPH` |
 
 The crop is centered on the agent and padded with `NO_GLYPH` (5976)
-outside the map. The extra segment carries 20 env-derived stats: the
-prayer cooldown (`u.ublesscnt`, exported by a vendored NLE patch —
-makes pray timing learnable instead of superstition), the previous
+outside the map. The hero's own tile shows what the hero is standing
+on (top object, else terrain) instead of the hero glyph — a vendored,
+settings-gated engine patch (`underfoot_glyphs`, off by default so
+golden replays are unaffected). NetHack's display occludes exactly the
+items an agent must act on (corpses to eat, stairs), the hero position
+is already in blstats, and stock NLE has the same blind spot in every
+spatial channel. The extra segment carries 20 env-derived stats: the
+prayer cooldown (`u.ublesscnt`, exported by a vendored NLE patch;
+vestigial since pray left the action space, kept to preserve the obs
+layout), the previous
 action index (-1 at episode start; a 64-dim recurrent trunk otherwise
 has to reverse-engineer what it just did from obs deltas), and 18
 per-object-class inventory item counts (stack = 1; tells the policy
@@ -174,18 +182,31 @@ for the standalone tools, the prompt heuristic, and the item macros,
 but never enter the obs tensor raw (`inv_strs` stays unbound: it alone
 triggers NetHack's doname() string formatting).
 
-## Action space (24 actions)
+## Action space (MultiDiscrete {24, 55})
+
+Two heads, sampled jointly each step. Head 0 is the verb:
 
 ```
  0  N            8  N_RUN         16  >  (down)
  1  S            9  S_RUN         17  <  (up)
  2  W           10  W_RUN        18  kick (^D)
  3  E           11  E_RUN        19  search (s)
- 4  NW          12  NW_RUN       20  pray (M-p)
- 5  NE          13  NE_RUN       21  engrave Elbereth (macro)
- 6  SW          14  SW_RUN       22  wear armor (macro)
- 7  SE          15  SE_RUN       23  eat (macro)
+ 4  NW          12  NW_RUN       20  engrave Elbereth (macro)
+ 5  NE          13  NE_RUN       21  wear armor (slot arg)
+ 6  SW          14  SW_RUN       22  eat (slot arg)
+ 7  SE          15  SE_RUN       23  quaff potion (slot arg)
 ```
+
+Head 1 is the item argument: an inventory position 0-54, matching the
+obs `inv` block one-to-one. It is consumed only by WEAR/EAT/QUAFF (ignored
+otherwise). The env answers the verb's getobj prompt with that slot's
+letter if the game lists it as valid; otherwise the prompt is ESC'd and
+the step counts as an illegal action (illegal_penalty applies). An
+action mask (`MY_ACTION_MASK`, applied at sampling and in the training
+recompute) keeps the lottery small: slots are legal only when holding
+armor, food, or a potion, and EAT is masked out while Satiated — residual
+mismatches the mask can't see (worn armor, carried corpses) still go
+through the ESC path.
 
 The 8 cardinal/intercardinal moves use vi-keys (kjhl ynbu). Long
 "run" versions are uppercase (KJHL YNBU). Kick prompts "In what
@@ -193,9 +214,9 @@ direction?"; that prompt is left live, so the agent's next action (a
 movement key) answers it — kick-through-a-locked-door is a learnable
 two-step sequence. Search checks adjacent squares once for hidden
 doors/passages (repeated searching raises the find chance, as in the
-real game). Pray's "Are you sure?" confirm is auto-answered 'y'; the
-gods heal low HP and cure starving, but praying too often angers them
-— when to pray is the thing to learn. Engrave-Elbereth drives the full
+real game). Pray was removed from the action space: policies burned a
+large share of episodes on god smites before learning prayer timing
+(accumulated god anger is unobservable). Engrave-Elbereth drives the full
 key sequence (`E`, `-` fingertip, "Elbereth", RET) in one env step;
 most melee monsters won't attack while the agent stands on a legible
 Elbereth square, but attacking from it smudges the text — a panic
@@ -209,12 +230,19 @@ cloak, a blocked slot) stays in the list, and a first-letter pick would
 retry it forever. Eat is gated on hunger: pressing it while Satiated is
 a no-op (the game step is skipped entirely) because eating past
 Satiated is NetHack's choke() death — ungated, EAT-happy policies
-choke themselves in a handful of presses. Corpses are never eaten:
-floor offers ("There is a lichen corpse here; eat it?") are declined
-and autopickup'd corpses are filtered out of the candidate list by
-glyph — corpse age is invisible and old or poisonous ones kill.
+choke themselves in a handful of presses. Floor offers ("There is a
+lichen corpse here; eat it?") are accepted — with pray removed, fresh
+kills are the sustainable food source, and when the rot gamble is worth
+taking is the policy's to learn. The cockatrice family is the exception
+(declined: eating one is instant petrification). Carried corpses are
+still filtered out of the candidate list by glyph — they age invisibly
+in the pack, so old or poisonous ones kill.
 Nothing wearable/edible -> no prompt -> clean no-op, no penalty.
-Autopickup is set to `$[%` (gold, armor, food) to feed both macros.
+Autopickup is set to `$[%!` (gold, armor, food, potions) to feed the item verbs,
+with an `AUTOPICKUP_EXCEPTION` for corpses so they stay on the floor
+where the eat offer (and NetHack's own freshness clock) lives — the
+exception is a config-file-only directive, so the env writes a small
+rc file per process and passes `@<path>` as the options string.
 The wear macro doesn't rank items — a body-armor suit can get worn
 (monks fight worse in suits) and cursed gear sticks; both are rare and
 part of the game. No wield action on purpose: monks fight better
@@ -229,12 +257,22 @@ reward = gold_coef     * d(gold net of start, floor 0)  # as botl_score counts i
        + xp_coef       * (new episode-max XL only)      # power progression before descent
        + scout_coef    * (new_tile_this_level)          # exploration bonus
        + hp_coef       * (hp - prev_hp)                 # HP potential (dense survival signal)
+       + hunger_coef   * (prev_hunger - hunger)         # hunger potential (see below)
        + illegal_penalty * (illegal_action)             # sub-prompt penalty
 ```
 
 The terminal step of a game-over (not truncation) carries
 `death_penalty - hp_coef * prev_hp` instead of the shaped terms — the
 HP potential cashes out, so dying at high HP forfeits more.
+
+The hunger potential is linear over the hunger blstat clamped to
+[NotHungry..Starved] — Satiated counts as NotHungry, so overeating
+toward NetHack's choke death earns nothing. Eating pays at the meal
+(from Weak: +2 levels), hunger decay charges one level at a time, and
+the potential form is farm-proof (any eat/digest cycle nets zero). It
+exists to bridge the credit gap that kept eating reactive: the payoff
+for opportunistic fresh-corpse eating otherwise lands thousands of
+steps later, far outside the effective credit horizon.
 
 gold/exp/descent decompose NetHack's score into separable knobs:
 `botl_score()` = gold (net of starting purse, floored at 0) + `u.urexp`
@@ -279,12 +317,12 @@ auto-reset after `NETHACK_MAX_EPISODE_STEPS=10000` steps.
 | `illegal_actions`  | c_steps where the agent triggered a sub-prompt         |
 | `new_tiles`        | Unique tiles entered this episode                      |
 | `max_depth`        | Deepest level reached (depth-at-death under-reports)   |
-| `prayers`          | Prayer actions per episode                             |
-| `prayers_low_hp`   | Prayers issued at <=25% max HP (learned panic button)  |
 | `searches`         | Search actions per episode                             |
 | `engraves`         | Elbereth macro actions per episode                     |
 | `wears`            | Wear macro presses that chose an item, per episode     |
 | `eats`             | Eat macro presses that chose an item, per episode      |
+| `floor_eats`       | Eats that accepted a floor "eat it?" offer             |
+| `quaffs`           | Quaff presses that drank a potion                      |
 | `damage_taken`     | Sum of HP lost per episode                             |
 | `reward_saturated` | Fraction of steps with \|reward\| > 1 (trainer clamps) |
 | `game_time`        | NetHack turns survived (steps can compress many turns) |

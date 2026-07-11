@@ -6,9 +6,8 @@
 
 // labels for the end-of-run histogram, in NETHACK_ACTION_TABLE order
 static const char* NETHACK_ACTION_NAMES[NETHACK_NUM_ACTIONS] = {
-    "N","S","W","E","NW","NE","SW","SE",
-    "N_RUN","S_RUN","W_RUN","E_RUN","NW_RUN","NE_RUN","SW_RUN","SE_RUN",
-    "DOWN_STAIRS","UP_STAIRS","KICK","SEARCH","PRAY","ELBERETH","WEAR","EAT",
+    "MOVE","RUN","DOWN_STAIRS","UP_STAIRS","KICK","SEARCH",
+    "ELBERETH","WEAR","EAT","QUAFF","PRAY","THROW",
 };
 
 // single-agent env, reset immediately (training's c_reset is lazy)
@@ -16,7 +15,7 @@ static void env_open(Nethack* env) {
     memset(env, 0, sizeof(*env));
     env->num_agents = 1;
     env->observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env->actions      = (float*)calloc(1, sizeof(float));
+    env->actions      = (float*)calloc(3, sizeof(float));   // {verb, item slot, direction}
     env->rewards      = (float*)calloc(1, sizeof(float));
     env->terminals    = (float*)calloc(1, sizeof(float));
     init(env);
@@ -32,7 +31,7 @@ static void env_close(Nethack* env) {
 // weight order matches param registration: encoder, decoder, mingru
 #define DEMO_VOCAB   5977
 #define DEMO_EMBED   32
-#define DEMO_BL_FEAT 88   // 25 scalars + hunger 7 + cond 13 + cooldown + prevact 24 + counts 18
+#define DEMO_BL_FEAT 87   // 25 scalars + hunger 7 + cond 13 + cooldown + prevact 23 + counts 18
 #define DEMO_LOC_IN  (NETHACK_CROP_GRID * DEMO_EMBED)   // 9x9 crop, per-cell embeds
 #define DEMO_LOC_HID 256
 #define DEMO_PW 5
@@ -62,7 +61,7 @@ typedef struct {
     float *loc_w, *loc_b;       // (256, 2592), (256)
     float *g1_w, *g1_xy, *g1_b; // (16, 800), (16, 2), (16): per-patch embed+flatten + hero dx,dy -> 16
     float *g2_w, *g2_b;         // (128, 16), (128): 16 -> 128, maxed over tokens
-    float *bl_w, *bl_b;         // (64, 88), (64)
+    float *bl_w, *bl_b;         // (64, 87), (64)
     float *proj_w, *proj_b;     // (H, 536), (H)
     Linear* decoder;            // (24+1, H), bias-free; last output is value
     MinGRU* mingru;

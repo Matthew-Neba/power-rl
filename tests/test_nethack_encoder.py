@@ -84,15 +84,23 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     u = vals.astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, :27] = ((u >> (8 * k)) & 0xFF).astype(np.float32)
-    # extra stats @ +27*4: prayer cooldown, prev action (-1..23), 18 class counts
+    # extra stats @ +27*4: prayer cooldown, prev action (-1..11), 18 class counts
     ex = np.concatenate([
         rng.integers(0, 1000, size=(B, 1)),
-        rng.integers(-1, 24, size=(B, 1)),
+        rng.integers(-1, 12, size=(B, 1)),
         rng.integers(0, 6, size=(B, 18)),
     ], axis=1).astype(np.int64).astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, 27:47] = ((ex >> (8 * k)) & 0xFF).astype(np.float32)
-    return obs, glyphs, vals, ex.astype(np.int64).astype(np.int32)
+    # inventory entities @ +47*4: 55 slot glyphs int16 LE, tail padded (5976)
+    inv_off = bl_off + 47 * 4
+    inv = rng.integers(0, max_glyph_used, size=(B, 55)).astype(np.int32)
+    n_items = rng.integers(3, 12, size=B)
+    for b in range(B):
+        inv[b, n_items[b]:] = 5976
+    obs[:, inv_off + 0::2][:, :55] = (inv & 0xFF).astype(np.float32)
+    obs[:, inv_off + 1::2][:, :55] = ((inv >> 8) & 0xFF).astype(np.float32)
+    return obs, glyphs, vals, ex.astype(np.int64).astype(np.int32), inv
 
 
 def dev(nbytes):
@@ -134,7 +142,7 @@ def run(lib):
     lib.nh_set_glb1_xy(wxy.ctypes.data_as(VP))
 
     max_glyph_used = 40  # keep embedding usage dense & checkable
-    obs, glyphs, bl_vals, ex_vals = make_obs(B, obs_size, grid, max_glyph_used)
+    obs, glyphs, bl_vals, ex_vals, inv_vals = make_obs(B, obs_size, grid, max_glyph_used)
     obs_d, _ = h2d(obs)
     out_d = dev(B * hidden * 4)
 
@@ -164,6 +172,8 @@ def run(lib):
         ("glb1_b",  lib.nh_get_glb1_b,  lib.nh_set_glb1_b,  lib.nh_grad_glb1_b,  lib.nh_numel_glb1_b),
         ("glb2_w",  lib.nh_get_glb2_w,  lib.nh_set_glb2_w,  lib.nh_grad_glb2_w,  lib.nh_numel_glb2_w),
         ("glb2_b",  lib.nh_get_glb2_b,  lib.nh_set_glb2_b,  lib.nh_grad_glb2_b,  lib.nh_numel_glb2_b),
+        ("inv1_w",  lib.nh_get_inv1_w,  lib.nh_set_inv1_w,  lib.nh_grad_inv1_w,  lib.nh_numel_inv1_w),
+        ("inv1_b",  lib.nh_get_inv1_b,  lib.nh_set_inv1_b,  lib.nh_grad_inv1_b,  lib.nh_numel_inv1_b),
         ("embed_w", lib.nh_get_embed_w, lib.nh_set_embed_w, lib.nh_grad_embed_w, lib.nh_numel_embed_w),
     ]
 
@@ -191,7 +201,7 @@ def run(lib):
         ga = np.empty(n, dtype=np.float32); gradf(ga.ctypes.data_as(VP))
 
         if name == "embed_w":
-            used = np.unique(glyphs)
+            used = np.unique(np.concatenate([glyphs.reshape(-1), inv_vals.reshape(-1)]))
             D = lib.nh_embed_dim()
             cand = np.array([g * D + d for g in used for d in range(D)], dtype=np.int64)
         else:
@@ -227,11 +237,11 @@ def run(lib):
     # Finite differences can't cleanly verify glb1 — its weights are shared
     # across all 60 max-pooled tokens, so any perturbation flips near-tied
     # argmax winners below the kink detector's threshold.
-    all_ok = torch_check(lib, glyphs, bl_vals, ex_vals, g_out, specs) and all_ok
+    all_ok = torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs) and all_ok
     return all_ok
 
 
-def torch_check(lib, glyphs, bl_vals, ex_vals, g_out, specs):
+def torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs):
     import torch
     B = glyphs.shape[0]
     H = g_out.shape[1]
@@ -255,8 +265,9 @@ def torch_check(lib, glyphs, bl_vals, ex_vals, g_out, specs):
     g1_w   = getw("glb1_w", (16, PW * PH * 32));      g1_b  = getw("glb1_b", (16,))
     g1_xy  = getw("glb1_xy", (16, 2))
     g2_w   = getw("glb2_w", (128, 16));               g2_b  = getw("glb2_b", (128,))
-    bl_w   = getw("bl_w", (64, 88));                  bl_b  = getw("bl_b", (64,))
-    proj_w = getw("proj_w", (H, 536));                proj_b = getw("proj_b", (H,))
+    inv1_w = getw("inv1_w", (32, 32));                inv1_b = getw("inv1_b", (32,))
+    bl_w   = getw("bl_w", (64, 76));                  bl_b  = getw("bl_b", (64,))
+    proj_w = getw("proj_w", (H, 2284));               proj_b = getw("proj_b", (H,))
 
     grid_t = torch.tensor(glyphs.reshape(B, ROWS, COLS).astype(np.int64))
     # local: crop glyph ids with pad off-map
@@ -285,7 +296,7 @@ def torch_check(lib, glyphs, bl_vals, ex_vals, g_out, specs):
     t128 = t16 @ g2_w.T
     glb = torch.relu(t128.max(dim=1).values + g2_b)
     # blstats features
-    f = np.zeros((B, 88), dtype=np.float64)
+    f = np.zeros((B, 76), dtype=np.float64)
     j = 0
     for i in range(27):
         if i in (21, 25):
@@ -299,18 +310,22 @@ def torch_check(lib, glyphs, bl_vals, ex_vals, g_out, specs):
     for k in range(13):
         f[:, j] = (bl_vals[:, 25].astype(np.uint32) >> k) & 1; j += 1
     f[:, j] = np.log1p(np.maximum(ex_vals[:, 0], 0)) * 0.1; j += 1
-    for h in range(24):
+    for h in range(12):
         f[:, j] = (ex_vals[:, 1] == h); j += 1
     for k in range(18):
         f[:, j] = ex_vals[:, 2 + k] * 0.125; j += 1
     fb = torch.tensor(f)
     blh = torch.relu(fb @ bl_w.T + bl_b)
-    concat = torch.cat([loc, glb, blh, fb], dim=1)
+    # inventory entities: per-slot embed -> 16, relu, flattened in slot order
+    xi = E[torch.tensor(inv_vals.astype(np.int64))]
+    invh = torch.relu(xi @ inv1_w.T + inv1_b).reshape(B, -1)
+    concat = torch.cat([loc, glb, invh, blh, fb], dim=1)
     out = torch.relu(concat @ proj_w.T + proj_b)
     (out * torch.tensor(g_out.astype(np.float64))).sum().backward()
 
     refs = {"embed_w": E, "loc_w": loc_w, "loc_b": loc_b, "glb1_w": g1_w,
             "glb1_xy": g1_xy, "glb1_b": g1_b, "glb2_w": g2_w, "glb2_b": g2_b,
+            "inv1_w": inv1_w, "inv1_b": inv1_b,
             "bl_w": bl_w, "bl_b": bl_b, "proj_w": proj_w, "proj_b": proj_b}
     ok = True
     for name, _, _, gradf, numelf in specs:

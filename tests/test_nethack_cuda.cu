@@ -76,6 +76,8 @@ TENSOR_ACC(glb1_xy, glb1_xy)
 TENSOR_ACC(glb1_b,  glb1_b)
 TENSOR_ACC(glb2_w,  glb2_w)
 TENSOR_ACC(glb2_b,  glb2_b)
+TENSOR_ACC(inv1_w,  inv1_w)
+TENSOR_ACC(inv1_b,  inv1_b)
 
 #define GRAD_ACC(name, field) \
     void nh_grad_##name(void* dst) { cudaMemcpy(dst, g_a->field.data, numel(g_a->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); }
@@ -91,5 +93,7 @@ GRAD_ACC(glb1_xy, glb1_xygrad)
 GRAD_ACC(glb1_b,  glb1_bgrad)
 GRAD_ACC(glb2_w,  glb2_wgrad)
 GRAD_ACC(glb2_b,  glb2_bgrad)
+GRAD_ACC(inv1_w,  inv1_wgrad)
+GRAD_ACC(inv1_b,  inv1_bgrad)
 
 }  // extern "C"

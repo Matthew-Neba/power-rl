@@ -43,8 +43,14 @@ extern void       nle_end(nle_ctx_t*);
 #define NETHACK_OFF_BLSTATS (NH_GRID * 2)
 #define NETHACK_OFF_EXTRA   (NETHACK_OFF_BLSTATS + NLE_BLSTATS_SIZE * 4)
 #define NETHACK_EXTRA_INTS  (2 + NETHACK_NUM_OCLASSES)
-#define NETHACK_OBS_SIZE    (NETHACK_OFF_EXTRA + NETHACK_EXTRA_INTS * 4)
+// inventory entity block: 55 slot glyphs int16 LE, in inventory order (the
+// item-slot action head indexes these positions); empty slots = pad glyph
+#define NETHACK_INV_SLOTS   NLE_INVENTORY_SIZE
+#define NETHACK_OFF_INV     (NETHACK_OFF_EXTRA + NETHACK_EXTRA_INTS * 4)
+#define NETHACK_OBS_SIZE    (NETHACK_OFF_INV + NETHACK_INV_SLOTS * 2)
 #define NETHACK_INTERNAL_UBLESSCNT 5   // u.ublesscnt, vendored winrl.cc patch
+#define NETHACK_INTERNAL_KILLER_MNUM 9 // killer monster index + 1 (0 = not a monster), death only
+#define NETHACK_INTERNAL_KILLER_MLEV 10 // killer monster level, death only
 
 #define NETHACK_MAX_EPISODE_STEPS 10000
 #define NETHACK_AUTODISMISS_MAX   64   // cap on prompt-dismiss keystrokes per step
@@ -60,26 +66,27 @@ extern void       nle_end(nle_ctx_t*);
 // nle_obs.misc[] prompt-state flags
 enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 
-#define NETHACK_NUM_ACTIONS 24
-static const int NETHACK_ACTION_TABLE[NETHACK_NUM_ACTIONS] = {
-    'k','j','h','l','y','u','b','n',   // N S W E NW NE SW SE
-    'K','J','H','L','Y','U','B','N',   // run variants
-    '>','<',                           // stairs down, up
-    4,                                 // ^D kick (locked doors); asks a direction
-    's',                               // search once (hidden doors/passages)
-    0x80|'p',                          // M-p pray (heals low HP, cures starving)
-    'E',                               // engrave Elbereth; macro, see nethack_do_elbereth
-    'W',                               // wear armor; macro, see nethack_do_use_item
-    'e',                               // eat carried food; macro, see nethack_do_use_item
-};
+// Factored action space: verb head (12) + item-slot head (55) + direction
+// head (8, vi-key order). MOVE/RUN/KICK/THROW consume the direction; the
+// direction head trains dense on every move, so directional verbs inherit it.
+#define NETHACK_NUM_ACTIONS 12
+#define NETHACK_NUM_DIRS    8
+static const int NETHACK_DIR_KEYS[NETHACK_NUM_DIRS] =
+    {'k','j','h','l','y','u','b','n'};   // N S W E NW NE SW SE
 
-// special-cased indices into NETHACK_ACTION_TABLE
 enum {
-    NETHACK_ACT_SEARCH   = 19,
-    NETHACK_ACT_PRAY     = 20,
-    NETHACK_ACT_ELBERETH = 21,
-    NETHACK_ACT_WEAR     = 22,
-    NETHACK_ACT_EAT      = 23,
+    NETHACK_ACT_MOVE     = 0,
+    NETHACK_ACT_RUN      = 1,
+    NETHACK_ACT_DOWN     = 2,
+    NETHACK_ACT_UP       = 3,
+    NETHACK_ACT_KICK     = 4,
+    NETHACK_ACT_SEARCH   = 5,
+    NETHACK_ACT_ELBERETH = 6,
+    NETHACK_ACT_WEAR     = 7,
+    NETHACK_ACT_EAT      = 8,
+    NETHACK_ACT_QUAFF    = 9,
+    NETHACK_ACT_PRAY     = 10,
+    NETHACK_ACT_THROW    = 11,
 };
 
 // !status_updates skips the status renderer + recalc_mapseen (~25% of engine)
@@ -87,7 +94,7 @@ enum {
     "name:Agent-mon-hum-neu-mal," \
     "autopickup,color,disclose:+i +a +v +g +c +o," \
     "mention_walls,nobones,nocmdassist,nolegacy,nosparkle," \
-    "pickup_burden:unencumbered,pickup_types:$[%," \
+    "pickup_burden:unencumbered,pickup_types:$[%!)," \
     "runmode:teleport,showexp,showscore,time," \
     "!status_updates"
 
@@ -101,12 +108,15 @@ typedef struct Log {
     float illegal_actions;    // steps that hit a sub-prompt we ESC'd
     float new_tiles;
     float max_depth;          // deepest level reached (depth under-reports at death)
-    float prayers;
-    float prayers_low_hp;     // prayers at <=25% max HP
     float searches;
     float engraves;
     float wears;              // macro presses that chose an item
     float eats;
+    float floor_eats;         // eats that accepted a floor "eat it?" offer
+    float quaffs;             // quaff presses that drank a potion
+    float prayers;
+    float prayers_low_hp;     // prayers at <=25% max HP
+    float throws;             // throw presses that launched an item
     float damage_taken;
     float reward_saturated;   // fraction of steps with |reward| > 1
     float game_time;          // NetHack turns survived
@@ -114,7 +124,13 @@ typedef struct Log {
     // episode end reason, one-hot (game_end_types in hack.h)
     float death_combat;
     float death_starved;
+    float death_smited;       // god's wrath (NLE_HOW_WRATH), not a monster kill
     float death_other;
+    // combat-death anatomy (0 for non-combat episodes; ~95% are combat)
+    float death_mon_level;    // killer's monster level (vs max_xp_level = the mismatch)
+    float death_burst_turns;  // turns from last >=75% HP to death (small = ambush/burst)
+    float death_adj_monsters; // hostile monsters adjacent on the last obs before death
+    float death_maxhp;        // max HP at death (progression measure)
     float truncated;          // hit NETHACK_MAX_EPISODE_STEPS
     // 0/1 per episode; the logged mean is the proportion
     float reach_mines;
@@ -130,12 +146,18 @@ typedef struct Stats {
     long valid_moves;
     long illegal_actions;
     long new_tiles;
-    long prayers;
-    long prayers_low_hp;
     long searches;
     long engraves;
     long wears;
     long eats;
+    long quaffs;
+    long prayers;
+    long throws;
+    long last_ok_turn;   // last turn with HP >= 75% max
+    long last_maxhp;
+    int  last_adj;       // hostile monsters adjacent, last obs
+    long prayers_low_hp;
+    long floor_eats;
     long damage;
     long saturated;
     int max_depth;
@@ -153,6 +175,7 @@ typedef struct Nethack {
     float* actions;
     float* rewards;
     float* terminals;
+    unsigned char* action_mask;   // (12+55+8,) — NULL unless MY_ACTION_MASK wired
     int num_agents;
 
     // deferred reset for main-thread c_reset (vecenv setup): NLE's coroutine
@@ -184,6 +207,7 @@ typedef struct Nethack {
     long prev_gold;
     long start_gold;
     long prev_hp;
+    long prev_hunger;   // clamped to [1,6]; Satiated counts as NotHungry
     long prev_time;
     int prev_depth;
     unsigned int rng;   // required by vecenv.h (seeded with env index)
@@ -199,6 +223,7 @@ typedef struct Nethack {
     float xp_coef;
     float scout_coef;
     float hp_coef;
+    float hunger_coef;
     float illegal_penalty;
     float death_penalty;
 
@@ -235,7 +260,9 @@ static void nethack_init_settings(Nethack* env) {
         strncpy(env->settings.hackdir, env->vardir, sizeof(env->settings.hackdir) - 1);
     }
     env->settings.spawn_monsters = 1;
-    strncpy(env->settings.options, NETHACK_DEFAULT_OPTIONS, sizeof(env->settings.options) - 1);
+    env->settings.underfoot_glyphs = 1;   // hero tile shows top object/terrain, not the hero
+    snprintf(env->settings.options, sizeof(env->settings.options), "@%s",
+             nethack_rc_path(NETHACK_DEFAULT_OPTIONS));
     env->settings.fix_moon_phase = true;  // moon phase from seed, not host clock
 }
 
@@ -266,7 +293,11 @@ static void nethack_pack_obs(Nethack* env) {
         bl[4*i + 3] = (unsigned char)((v >> 24) & 0xffu);
     }
     int32_t extra[NETHACK_EXTRA_INTS] = {0};
-    extra[0] = (int32_t)env->internal[NETHACK_INTERNAL_UBLESSCNT];
+    // ublesscnt ablation: the prayer clock is the one obs channel a human
+    // can never see (prev_action + game time bound it; the exact re-roll is
+    // privileged). Zeroed pending the smite-rate verdict; slot kept so the
+    // obs layout is stable.
+    extra[0] = 0;
     extra[1] = env->prev_action;
     for (int i = 0; i < NLE_INVENTORY_SIZE; i++) {
         int oc = env->inv_oclasses[i];
@@ -281,6 +312,35 @@ static void nethack_pack_obs(Nethack* env) {
         ex[4*i + 2] = (unsigned char)((v >> 16) & 0xffu);
         ex[4*i + 3] = (unsigned char)((v >> 24) & 0xffu);
     }
+    // inventory entities: slot k's glyph at position k (slot head indexes
+    // these); inv_oclasses is fully padded with 18, inv_glyphs is not
+    unsigned char* iv = env->observations + NETHACK_OFF_INV;
+    for (int i = 0; i < NETHACK_INV_SLOTS; i++) {
+        uint16_t g = env->inv_oclasses[i] < NETHACK_NUM_OCLASSES
+                   ? (uint16_t)env->inv_glyphs[i] : (uint16_t)NETHACK_PAD_GLYPH;
+        iv[2*i + 0] = (unsigned char)(g & 0xffu);
+        iv[2*i + 1] = (unsigned char)((g >> 8) & 0xffu);
+    }
+
+    // action mask, aligned with this obs: verbs [0,23) all legal except EAT
+    // while Satiated (a forced no-op); slots [23,78) legal when they hold a
+    // wearable (armor, oclass 3) or edible (food, 7) item. Coarse union over
+    // the item verbs — the prompt-answer path still ESCs residual mismatches.
+    if (env->action_mask != NULL) {
+        unsigned char* m = env->action_mask;
+        memset(m, 1, NETHACK_NUM_ACTIONS);
+        if (env->blstats[NLE_BL_HUNGER] == 0) m[NETHACK_ACT_EAT] = 0;
+        unsigned char* s = m + NETHACK_NUM_ACTIONS;
+        memset(s, 0, NETHACK_INV_SLOTS);
+        int any = 0;
+        for (int i = 0; i < NETHACK_INV_SLOTS && env->inv_letters[i]; i++) {
+            int oc = env->inv_oclasses[i];
+            if (oc >= NETHACK_NUM_OCLASSES) break;
+            if (oc == 2 || oc == 3 || oc == 7 || oc == 8) { s[i] = 1; any = 1; }
+        }
+        if (!any) s[0] = 1;   // sampling needs >=1 legal entry per head
+        memset(s + NETHACK_INV_SLOTS, 1, NETHACK_NUM_DIRS);   // dir head: all legal
+    }
 }
 
 // how = nle_obs.how_done, or -1 when truncated at the step cap
@@ -292,12 +352,15 @@ static void nethack_add_log(Nethack* env, int how) {
     env->log.illegal_actions += (float)env->stats.illegal_actions;
     env->log.new_tiles       += (float)env->stats.new_tiles;
     env->log.max_depth       += (float)env->stats.max_depth;
-    env->log.prayers         += (float)env->stats.prayers;
-    env->log.prayers_low_hp  += (float)env->stats.prayers_low_hp;
     env->log.searches        += (float)env->stats.searches;
     env->log.engraves        += (float)env->stats.engraves;
     env->log.wears           += (float)env->stats.wears;
     env->log.eats            += (float)env->stats.eats;
+    env->log.quaffs          += (float)env->stats.quaffs;
+    env->log.prayers         += (float)env->stats.prayers;
+    env->log.prayers_low_hp  += (float)env->stats.prayers_low_hp;
+    env->log.throws          += (float)env->stats.throws;
+    env->log.floor_eats      += (float)env->stats.floor_eats;
     env->log.damage_taken    += (float)env->stats.damage;
     env->log.reward_saturated += env->stats.length > 0
         ? (float)env->stats.saturated / (float)env->stats.length : 0.0f;
@@ -308,6 +371,13 @@ static void nethack_add_log(Nethack* env, int how) {
     if (how == -1)     env->log.truncated      += 1.0f;
     else if (how == 0) env->log.death_combat   += 1.0f;
     else if (how == 3) env->log.death_starved  += 1.0f;
+    else if (how == NLE_HOW_WRATH) env->log.death_smited += 1.0f;
+    if (how == 0) {
+        env->log.death_mon_level    += (float)env->internal[NETHACK_INTERNAL_KILLER_MLEV];
+        env->log.death_burst_turns  += (float)(env->prev_time - env->stats.last_ok_turn);
+        env->log.death_adj_monsters += (float)env->stats.last_adj;
+        env->log.death_maxhp        += (float)env->stats.last_maxhp;
+    }
     else               env->log.death_other    += 1.0f;
     env->log.reach_mines      += (env->stats.areas & NETHACK_AREA_MINES)      ? 1.0f : 0.0f;
     env->log.reach_minetown   += (env->stats.areas & NETHACK_AREA_MINETOWN)   ? 1.0f : 0.0f;
@@ -345,6 +415,9 @@ static void nethack_do_reset(Nethack* env) {
     env->prev_gold = env->blstats[NLE_BL_GOLD];
     env->start_gold = env->prev_gold;
     env->prev_hp = env->blstats[NLE_BL_HP];
+    env->prev_hunger = env->blstats[NLE_BL_HUNGER];
+    if (env->prev_hunger < 1) env->prev_hunger = 1;
+    else if (env->prev_hunger > 6) env->prev_hunger = 6;
     env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
     env->prev_time = env->blstats[NLE_BL_TIME];
     env->prev_action = -1;
@@ -373,6 +446,23 @@ static void nethack_update_stats(Nethack* env) {
 
     long hp = env->blstats[NLE_BL_HP];
     if (hp < env->prev_hp) env->stats.damage += env->prev_hp - hp;
+
+    // combat-death anatomy trackers, read back at death (blstats zero then)
+    long hpmax = env->blstats[NLE_BL_HPMAX];
+    if (4 * hp >= 3 * hpmax) env->stats.last_ok_turn = env->blstats[NLE_BL_TIME];
+    env->stats.last_maxhp = hpmax;
+    long hx = env->blstats[NLE_BL_X], hy = env->blstats[NLE_BL_Y];
+    int adj = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (!dx && !dy) continue;
+            long r = hy + dy, c = hx + dx;
+            if (r < 0 || r >= NH_ROWS || c < 0 || c >= NH_COLS) continue;
+            int g = env->glyphs[r * NH_COLS + c];
+            if (g >= 0 && g < NETHACK_NUMMONS) adj++;   // hostile monster range
+        }
+    env->stats.last_adj = adj;
+
     env->prev_score = env->blstats[NLE_BL_SCORE];
     env->prev_time = env->blstats[NLE_BL_TIME];
     env->prev_depth = depth;
@@ -410,6 +500,15 @@ static float nethack_shaped_reward(Nethack* env, int illegal) {
     r += env->hp_coef * (float)(hp - env->prev_hp);
     env->prev_hp = hp;
 
+    // hunger potential, linear below NotHungry (Satiated == NotHungry, so
+    // overeating toward choke earns nothing): eating pays at the meal, decay
+    // charges as it happens, potential form is farm-proof
+    long hu = env->blstats[NLE_BL_HUNGER];
+    if (hu < 1) hu = 1;
+    else if (hu > 6) hu = 6;
+    r += env->hunger_coef * (float)(env->prev_hunger - hu);
+    env->prev_hunger = hu;
+
     // new episode-max experience level only, immune to drain re-earn
     int xp = (int)env->blstats[NLE_BL_XP];
     if (xp > env->stats.max_xp) {
@@ -441,39 +540,97 @@ void c_step(Nethack* env) {
 
     int a = (int)env->actions[0];
     if (a < 0 || a >= NETHACK_NUM_ACTIONS) a = 0;
-    env->obs.action = NETHACK_ACTION_TABLE[a];
+    int slot = (int)env->actions[1];   // item head, consumed by WEAR/EAT/QUAFF/THROW
+    if (slot < 0 || slot >= NETHACK_INV_SLOTS) slot = 0;
+    int dir = (int)env->actions[2];    // direction head, consumed by MOVE/RUN/KICK/THROW
+    if (dir < 0 || dir >= NETHACK_NUM_DIRS) dir = 0;
+    int dirkey = NETHACK_DIR_KEYS[dir];
 
     long time_before = env->blstats[NLE_BL_TIME];
-    int stepped = 1;
+    int stepped = 1, bad_pick = 0, used;
     switch (a) {
+    case NETHACK_ACT_MOVE:
+        env->obs.action = dirkey;
+        env->ctx = nle_step(env->ctx, &env->obs);
+        break;
+    case NETHACK_ACT_RUN:
+        env->obs.action = dirkey - 32;   // uppercase vi-key = run
+        env->ctx = nle_step(env->ctx, &env->obs);
+        break;
+    case NETHACK_ACT_DOWN:
+        env->obs.action = '>';
+        env->ctx = nle_step(env->ctx, &env->obs);
+        break;
+    case NETHACK_ACT_UP:
+        env->obs.action = '<';
+        env->ctx = nle_step(env->ctx, &env->obs);
+        break;
+    case NETHACK_ACT_KICK:
+        env->obs.action = 4;   // ^D
+        env->ctx = nle_step(env->ctx, &env->obs);
+        // answer the direction prompt in-step: kick is atomic now
+        if (!env->obs.done && env->misc[NETHACK_MISC_YN]
+            && nethack_msg_contains(env, "n what direction")) {
+            env->obs.action = dirkey;
+            env->ctx = nle_step(env->ctx, &env->obs);
+        }
+        break;
     case NETHACK_ACT_SEARCH:
+        env->obs.action = 's';
         env->stats.searches++;
         env->ctx = nle_step(env->ctx, &env->obs);
         break;
-    case NETHACK_ACT_PRAY: {
-        long hp = env->blstats[NLE_BL_HP], hpmax = env->blstats[NLE_BL_HPMAX];
-        if (4 * hp <= hpmax) env->stats.prayers_low_hp++;   // HP at decision time
-        env->stats.prayers++;
-        env->ctx = nle_step(env->ctx, &env->obs);
-        break;
-    }
     case NETHACK_ACT_ELBERETH:
         env->stats.engraves++;
         nethack_do_elbereth(env);
         break;
     case NETHACK_ACT_WEAR:
-        env->stats.wears += nethack_do_use_item(env, 'W', "want to wear", NULL);
+        used = nethack_do_use_item(env, 'W', "want to wear", NULL, slot);
+        if (used > 0) env->stats.wears++;
+        else if (used < 0) bad_pick = 1;
         break;
     case NETHACK_ACT_EAT:
         // satiated gate: eating past Satiated is NetHack's choke() death
         if (env->blstats[NLE_BL_HUNGER] == 0) stepped = 0;
-        else env->stats.eats += nethack_do_use_item(env, 'e', "want to eat", "eat it");
+        else {
+            used = nethack_do_use_item(env, 'e', "want to eat", "eat it", slot);
+            if (used > 0) env->stats.eats++;
+            else if (used < 0) bad_pick = 1;
+        }
         break;
+    case NETHACK_ACT_QUAFF:
+        used = nethack_do_use_item(env, 'q', "want to drink", "rink from the", slot);
+        if (used > 0) env->stats.quaffs++;
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_THROW:
+        used = nethack_do_use_item(env, 't', "want to throw", NULL, slot);
+        if (used > 0) {
+            env->stats.throws++;
+            // answer the direction prompt in-step: throw is atomic now
+            if (!env->obs.done && env->misc[NETHACK_MISC_YN]
+                && nethack_msg_contains(env, "n what direction")) {
+                env->obs.action = dirkey;
+                env->ctx = nle_step(env->ctx, &env->obs);
+            }
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_PRAY: {
+        long hp = env->blstats[NLE_BL_HP], hpmax = env->blstats[NLE_BL_HPMAX];
+        if (4 * hp <= hpmax) env->stats.prayers_low_hp++;   // HP at decision time
+        env->stats.prayers++;
+        env->obs.action = 0x80 | 'p';
+        env->ctx = nle_step(env->ctx, &env->obs);
+        break;
+    }
     default:
+        env->obs.action = dirkey;
         env->ctx = nle_step(env->ctx, &env->obs);
     }
     env->prev_action = a;
     int illegal = stepped ? nethack_handle_prompts(env) : 0;
+    if (bad_pick) { illegal = 1; env->stats.illegal_actions++; }
     if (env->blstats[NLE_BL_TIME] > time_before) env->stats.valid_moves++;
     env->stats.length++;
 

@@ -105,3 +105,29 @@ static void nethack_rm_vardir(const char* dir) {
     nethack_rm_rf(dir, 1);
 }
 
+// Options rc file, one per process: AUTOPICKUP_EXCEPTION is a config-FILE-only
+// directive (never a NETHACKOPTIONS token), so the options string becomes
+// "@<this file>" and the file carries the OPTIONS line + exceptions. Written
+// atomically (tmp + rename); concurrent env inits write identical content.
+static const char* nethack_rc_path(const char* default_options) {
+    static char path[512] = "";
+    if (path[0]) return path;
+    char p[512], tmp[560];
+    snprintf(p, sizeof(p), "%s/nhrc", nethack_vardir_base());
+    if (access(p, R_OK) != 0) {
+        snprintf(tmp, sizeof(tmp), "%s.%p", p, (void*)&tmp);
+        FILE* f = fopen(tmp, "w");
+        if (f) {
+            fprintf(f, "OPTIONS=%s\n", default_options);
+            // corpses stay on the floor ('>' = never pick up): fresh-kill
+            // eating is the food source (carried corpses age invisibly and
+            // are excluded from EAT)
+            fprintf(f, "AUTOPICKUP_EXCEPTION=\">corpse\"\n");
+            fclose(f);
+            rename(tmp, p);
+        }
+    }
+    strncpy(path, p, sizeof(path) - 1);
+    return path;
+}
+

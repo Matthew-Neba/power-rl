@@ -93,19 +93,17 @@ static int nethack_letter_is_corpse(const Nethack* env, char letter) {
     return 0;
 }
 
-// Random letter from a getobj bracket list ("[b-d f or ?*]"), 0 if none.
-// Random, not first: a refused item stays listed and would be retried forever.
-static int nethack_pick_candidate(Nethack* env) {
+// Parse a getobj bracket list ("[b-d f or ?*]") into cand[]; returns count.
+static int nethack_parse_candidates(const Nethack* env, char* cand, int cap) {
     const unsigned char* m = env->message;
     int i = 0;
     while (i < NLE_MESSAGE_SIZE && m[i] && m[i] != '[') i++;
-    char cand[52];
     int n = 0;
-    for (i++; i < NLE_MESSAGE_SIZE && m[i] && n < (int)sizeof(cand); i++) {
+    for (i++; i < NLE_MESSAGE_SIZE && m[i] && n < cap; i++) {
         unsigned char c = m[i];
-        if (n == 0 && (c == '-' || c == ' ')) continue;   // allownone's leading "- "
+        if (n == 0 && (c == '-' || c == ' ' || c == '$')) continue;   // leading "- " (allownone) / "$" (gold)
         if (c == '-' && i + 1 < NLE_MESSAGE_SIZE) {       // compactified run
-            for (char x = cand[n-1] + 1; x <= (char)m[i+1] && n < (int)sizeof(cand); x++)
+            for (char x = cand[n-1] + 1; x <= (char)m[i+1] && n < cap; x++)
                 cand[n++] = x;
             i++;
             continue;
@@ -113,32 +111,44 @@ static int nethack_pick_candidate(Nethack* env) {
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) cand[n++] = (char)c;
         else break;   // ' ' before "or ?*", ']', '#', ...: end of the letter list
     }
-    int k = 0;
-    for (int j = 0; j < n; j++)
-        if (!nethack_letter_is_corpse(env, cand[j])) cand[k++] = cand[j];
-    n = k;
-    if (n == 0) return 0;
-    env->rng = env->rng * 1103515245u + 12345u;
-    return cand[(env->rng >> 16) % (unsigned)n];
+    return n;
 }
 
 // Use a carried item through a getobj command (W = wear, e = eat): answer the
-// prompt with a random listed letter. `decline` skips floor-item offers
-// ("eat it?" — floor corpses kill). Nothing usable -> no prompt -> clean
-// no-op. Returns 1 if an item letter was sent.
-static int nethack_do_use_item(Nethack* env, int cmd, const char* gate, const char* decline) {
+// prompt with the letter of inventory slot `slot` (the item action head).
+// Floor offers (`floor_offer` = "eat it?") are ACCEPTED regardless of slot —
+// fresh kills are the sustainable food source now that pray is gone; the
+// cockatrice family is declined (instant petrification, matches "cockatrice"
+// and "chickatrice"). Carried corpses stay invalid for EAT (age invisible).
+// Returns 1 if an item was eaten/worn, 0 for a clean no-op (no prompt), -1
+// when the chosen slot wasn't a valid candidate (prompt ESC'd; illegal).
+static int nethack_do_use_item(Nethack* env, int cmd, const char* gate, const char* floor_offer, int slot) {
     env->obs.action = cmd;
     env->ctx = nle_step(env->ctx, &env->obs);
     for (int i = 0; i < NETHACK_AUTODISMISS_MAX && !env->obs.done; i++) {
         if (env->misc[NETHACK_MISC_XWAIT]) env->obs.action = ' ';
-        else if (env->misc[NETHACK_MISC_YN] && decline && nethack_msg_contains(env, decline))
-            env->obs.action = 'n';
+        else if (env->misc[NETHACK_MISC_YN] && floor_offer && nethack_msg_contains(env, floor_offer)) {
+            // quaff: decline fountain/sink offers so the potion prompt follows;
+            // eat: accept floor food except the cockatrice family
+            if (cmd == 'q' || nethack_msg_contains(env, "atrice")) env->obs.action = 'n';
+            else {
+                env->stats.floor_eats++;
+                env->obs.action = 'y';
+                env->ctx = nle_step(env->ctx, &env->obs);
+                return 1;
+            }
+        }
         else if (env->misc[NETHACK_MISC_YN] && nethack_msg_contains(env, gate)) {
-            int c = nethack_pick_candidate(env);
-            // no acceptable candidate: dismiss penalty-free
-            env->obs.action = c ? c : 27;
+            char cand[52];
+            int n = nethack_parse_candidates(env, cand, (int)sizeof(cand));
+            char want = (char)env->inv_letters[slot];
+            int ok = 0;
+            for (int j = 0; j < n; j++)
+                if (cand[j] == want) { ok = 1; break; }
+            if (ok && cmd == 'e' && nethack_letter_is_corpse(env, want)) ok = 0;
+            env->obs.action = ok ? want : 27;
             env->ctx = nle_step(env->ctx, &env->obs);
-            return c != 0;
+            return ok ? 1 : -1;
         }
         else return 0;
         env->ctx = nle_step(env->ctx, &env->obs);
