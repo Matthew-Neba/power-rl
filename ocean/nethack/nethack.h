@@ -358,9 +358,8 @@ static void nethack_pack_obs(Nethack* env) {
         unsigned char* m = env->action_mask;
         memset(m, 1, NETHACK_NUM_ACTIONS);
         if (env->blstats[NLE_BL_HUNGER] == 0) m[NETHACK_ACT_EAT] = 0;
-        // REST only while hurt: full-HP rest is a free fast-forward that
-        // enables spawn-camped XP farming (depth 1.1 @ score 1929 run)
-        if (env->blstats[NLE_BL_HP] >= env->blstats[NLE_BL_HPMAX]) m[NETHACK_ACT_REST] = 0;
+        // REST is legal at any HP: full-HP resting to bank turns is a valid
+        // score-farming strategy under the score objective, not an exploit.
         static const int head_oc[5] = {3, 7, 8, 2, 11};   // wear, eat, quaff, throw, zap
         static const int head_verb[5] = {NETHACK_ACT_WEAR, NETHACK_ACT_EAT,
             NETHACK_ACT_QUAFF, NETHACK_ACT_THROW, NETHACK_ACT_ZAP};
