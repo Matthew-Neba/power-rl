@@ -42,8 +42,13 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "prayers_low_hp", log->prayers_low_hp);
     dict_set(out, "throws", log->throws);
     dict_set(out, "zaps", log->zaps);
+    dict_set(out, "rests", log->rests);
     dict_set(out, "use_slot_mean", log->use_slot_mean);
     dict_set(out, "valid_slot_mean", log->valid_slot_mean);
+    dict_set(out, "regen_ticks", log->regen_ticks);
+    dict_set(out, "ups_hurt", log->ups_hurt);
+    dict_set(out, "burdened_frac", log->burdened_frac);
+    dict_set(out, "pack_full_frac", log->pack_full_frac);
     dict_set(out, "damage_taken", log->damage_taken);
     dict_set(out, "reward_saturated", log->reward_saturated);
     dict_set(out, "game_time", log->game_time);

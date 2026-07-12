@@ -593,5 +593,7 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
 }
 
 static void create_custom_decoder(const std::string& env_name, Decoder* dec) {
-    if (getenv("NH_PTR_DECODER") && env_name == "nethack") create_nethack_decoder(dec);
+    // nethack requires its pointer decoder: the encoder pools inventory for
+    // the trunk, so slot identity only exists in the decoder's keys
+    if (env_name == "nethack") create_nethack_decoder(dec);
 }

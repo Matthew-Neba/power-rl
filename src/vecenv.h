@@ -742,6 +742,10 @@ void static_vec_render(StaticVec* vec, int env_id) {
 int get_obs_size(void) { return OBS_SIZE; }
 int get_num_atns(void) { return NUM_ATNS; }
 static int _act_sizes[] = ACT_SIZES;
+/* env actions stride by NUM_ATNS and sampling writes one action per head:
+ * a mismatch scrambles every emitted action and overflows the buffers */
+_Static_assert(sizeof(_act_sizes) / sizeof(_act_sizes[0]) == NUM_ATNS,
+               "NUM_ATNS must equal the number of entries in ACT_SIZES");
 int* get_act_sizes(void) { return _act_sizes; }
 int get_num_act_sizes(void) { return (int)(sizeof(_act_sizes) / sizeof(_act_sizes[0])); }
 const char* get_obs_dtype(void) { return dtype_symbol; }

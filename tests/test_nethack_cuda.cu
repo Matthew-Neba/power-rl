@@ -17,6 +17,10 @@ static Encoder g_enc;
 static NethackEncoderWeights* g_w = nullptr;
 static NethackEncoderActivations* g_a = nullptr;
 static Allocator g_pa = {}, g_aa = {}, g_ga = {};
+static Decoder g_dec;
+static NethackDecoderWeights* g_dw = nullptr;
+static NethackDecoderActivations* g_da = nullptr;
+static Allocator g_dpa = {}, g_daa = {}, g_dga = {};
 static int g_hidden = 32;
 
 void nh_init(int B, int hidden) {
@@ -36,6 +40,24 @@ void nh_init(int B, int hidden) {
     alloc_create(&g_ga);
     uint64_t seed = 1234;
     g_enc.init_weights(g_w, &seed, 0);
+    // pointer decoder, fed by g_a's inv_out (nh_enc_last set by reg_train
+    // above). Its keygrad buffer feeds encoder backward — zero it so the
+    // encoder-only checks stay exact until nh_dec_backward runs.
+    g_dec = {};
+    g_dec.hidden_dim = hidden;
+    g_dec.output_dim = NH_DEC_OD;
+    create_nethack_decoder(&g_dec);
+    g_dw = (NethackDecoderWeights*)g_dec.create_weights(&g_dec);
+    g_dpa = {};
+    g_dec.reg_params(g_dw, &g_dpa);
+    alloc_create(&g_dpa);
+    g_da = (NethackDecoderActivations*)calloc(1, g_dec.activation_size);
+    g_daa = {}; g_dga = {};
+    g_dec.reg_train(g_dw, g_da, &g_daa, &g_dga, B);
+    alloc_create(&g_daa);
+    alloc_create(&g_dga);
+    g_dec.init_weights(g_dw, &seed, 0);
+    cudaMemset(g_da->keygrad.data, 0, (size_t)B * NH_INV_FLAT * sizeof(float));
     cudaDeviceSynchronize();
 }
 
@@ -45,6 +67,8 @@ int nh_glyph_vocab() { return NH_GLYPH_VOCAB; }
 int nh_embed_dim()   { return NH_EMBED_DIM; }
 int nh_concat()      { return NH_CONCAT; }
 int nh_grid()        { return NH_MGRID; }
+int nh_dec_od()      { return NH_DEC_OD; }
+int nh_heads()       { return NH_HEADS; }
 
 void nh_forward(void* out, void* obs, int B) {
     PrecisionTensor in = {.data = (precision_t*)obs, .shape = {B, NH_OBS_SIZE}};
@@ -65,6 +89,8 @@ void nh_backward(void* grad, int B) {
     void nh_set_##name(void* src) { cudaMemcpy(g_w->field.data, src, numel(g_w->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); cudaDeviceSynchronize(); } \
     int  nh_numel_##name()        { return (int)numel(g_w->field.shape); }
 TENSOR_ACC(embed_w, embed_w)
+TENSOR_ACC(ekind_w, ekind_w)
+TENSOR_ACC(esub_w,  esub_w)
 TENSOR_ACC(bl_w,    bl_w)
 TENSOR_ACC(bl_b,    bl_b)
 TENSOR_ACC(proj_w,  proj_w)
@@ -78,10 +104,15 @@ TENSOR_ACC(glb2_w,  glb2_w)
 TENSOR_ACC(glb2_b,  glb2_b)
 TENSOR_ACC(inv1_w,  inv1_w)
 TENSOR_ACC(inv1_b,  inv1_b)
+TENSOR_ACC(inv1s_w, inv1s_w)
+TENSOR_ACC(inv2_w,  inv2_w)
+TENSOR_ACC(inv2_b,  inv2_b)
 
 #define GRAD_ACC(name, field) \
     void nh_grad_##name(void* dst) { cudaMemcpy(dst, g_a->field.data, numel(g_a->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); }
 GRAD_ACC(embed_w, embed_wgrad)
+GRAD_ACC(ekind_w, ekind_wgrad)
+GRAD_ACC(esub_w,  esub_wgrad)
 GRAD_ACC(bl_w,    bl_wgrad)
 GRAD_ACC(bl_b,    bl_bgrad)
 GRAD_ACC(proj_w,  proj_wgrad)
@@ -95,5 +126,51 @@ GRAD_ACC(glb2_w,  glb2_wgrad)
 GRAD_ACC(glb2_b,  glb2_bgrad)
 GRAD_ACC(inv1_w,  inv1_wgrad)
 GRAD_ACC(inv1_b,  inv1_bgrad)
+GRAD_ACC(inv1s_w, inv1s_wgrad)
+GRAD_ACC(inv2_w,  inv2_wgrad)
+GRAD_ACC(inv2_b,  inv2_bgrad)
+
+// ---- pointer decoder (fed by the encoder's inv_out keys) ----
+// forward: encoder -> decoder directly (no mingru in the harness); the
+// decoder kernels see the same activations either way.
+
+void nh_dec_forward(void* out, void* obs, int B) {
+    PrecisionTensor in = {.data = (precision_t*)obs, .shape = {B, NH_OBS_SIZE}};
+    PrecisionTensor h = g_enc.forward(g_w, g_a, in, 0);
+    PrecisionTensor r = g_dec.forward(g_dw, g_da, h, 0);
+    cudaMemcpy(out, r.data, (size_t)B * (NH_DEC_OD + 1) * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize();
+}
+
+// glogits (B, NH_DEC_OD) + gvalue (B,) device floats; grad wrt the decoder's
+// hidden-state input lands in dinput (B, hidden)
+void nh_dec_backward(void* glogits, void* gvalue, void* dinput, int B) {
+    FloatTensor gl = {.data = (float*)glogits, .shape = {B, NH_DEC_OD}};
+    FloatTensor gs = {};
+    FloatTensor gv = {.data = (float*)gvalue, .shape = {B, 1}};
+    PrecisionTensor gi = g_dec.backward(g_dw, g_da, gl, gs, gv, 0);
+    cudaMemcpy(dinput, gi.data, (size_t)B * g_hidden * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize();
+}
+
+void nh_dec_keygrad(void* dst, int B) {
+    cudaMemcpy(dst, g_da->keygrad.data, (size_t)B * NH_INV_FLAT * sizeof(float), cudaMemcpyDeviceToDevice);
+}
+
+#define DEC_ACC(name, field) \
+    void nh_get_##name(void* dst) { cudaMemcpy(dst, g_dw->field.data, numel(g_dw->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); } \
+    void nh_set_##name(void* src) { cudaMemcpy(g_dw->field.data, src, numel(g_dw->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); cudaDeviceSynchronize(); } \
+    int  nh_numel_##name()        { return (int)numel(g_dw->field.shape); }
+DEC_ACC(dec_lin_w, lin_w)
+DEC_ACC(dec_q_w,   q_w)
+DEC_ACC(dec_k_w,   k_w)
+DEC_ACC(dec_tau,   tau)
+
+#define DEC_GRAD(name, field) \
+    void nh_grad_##name(void* dst) { cudaMemcpy(dst, g_da->field.data, numel(g_da->field.shape) * sizeof(float), cudaMemcpyDeviceToDevice); }
+DEC_GRAD(dec_lin_w, lin_wgrad)
+DEC_GRAD(dec_q_w,   q_wgrad)
+DEC_GRAD(dec_k_w,   k_wgrad)
+DEC_GRAD(dec_tau,   tau_grad)
 
 }  // extern "C"

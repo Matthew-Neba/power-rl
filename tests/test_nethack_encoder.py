@@ -1,10 +1,11 @@
-"""Numeric gradient check for the Nethack CUDA encoder (src/nethack.cu).
+"""Numeric gradient check for the Nethack CUDA encoder + pointer decoder
+(src/nethack.cu).
 
 Builds tests/test_nethack_cuda.cu as a float shared lib and verifies the
 analytic gradients from encoder backward() against central finite differences
-of a scalar loss L = sum(out * g_out). This exercises the whole hand-written
-backward chain: projection -> concat split -> conv2/conv1 (incl. conv1 input
-grad) -> glyph-embedding scatter-add, plus the blstats Linear branch.
+of a scalar loss L = sum(out * g_out), plus exact float64 torch references for
+the whole encoder and the 5-head pointer decoder (values, weight grads,
+keygrad, grad_input).
 
 Run: python tests/test_nethack_encoder.py
 """
@@ -21,6 +22,13 @@ LIB = os.path.join(HERE, "nethack_test.so")
 
 VP = ctypes.c_void_p
 
+WEIGHT_NAMES = [
+    "embed_w", "ekind_w", "esub_w", "bl_w", "bl_b", "proj_w", "proj_b", "loc_w", "loc_b",
+    "glb1_w", "glb1_xy", "glb1_b", "glb2_w", "glb2_b",
+    "inv1_w", "inv1_b", "inv1s_w", "inv2_w", "inv2_b",
+    "dec_lin_w", "dec_q_w", "dec_k_w", "dec_tau",
+]
+
 
 def build():
     cu = os.path.join(HERE, "test_nethack_cuda.cu")
@@ -35,29 +43,26 @@ def build():
 
 def load():
     lib = ctypes.CDLL(LIB)
-    for fn in ["nh_forward", "nh_backward", "nh_get_embed_w", "nh_set_embed_w",
-               "nh_get_bl_w", "nh_set_bl_w", "nh_get_bl_b", "nh_set_bl_b",
-               "nh_get_proj_w", "nh_set_proj_w", "nh_get_proj_b", "nh_set_proj_b",
-               "nh_get_loc_w", "nh_set_loc_w", "nh_get_loc_b", "nh_set_loc_b",
-               "nh_get_glb1_w", "nh_set_glb1_w", "nh_get_glb1_b", "nh_set_glb1_b",
-               "nh_get_glb1_xy", "nh_set_glb1_xy",
-               "nh_get_glb2_w", "nh_set_glb2_w", "nh_get_glb2_b", "nh_set_glb2_b",
-               "nh_grad_embed_w", "nh_grad_bl_w", "nh_grad_bl_b", "nh_grad_proj_w",
-               "nh_grad_proj_b", "nh_grad_loc_w", "nh_grad_loc_b",
-               "nh_grad_glb1_w", "nh_grad_glb1_xy", "nh_grad_glb1_b",
-               "nh_grad_glb2_w", "nh_grad_glb2_b"]:
-        getattr(lib, fn).argtypes = [VP]
-        getattr(lib, fn).restype = None
+    for name in WEIGHT_NAMES:
+        for fn in [f"nh_get_{name}", f"nh_set_{name}"]:
+            getattr(lib, fn).argtypes = [VP]
+            getattr(lib, fn).restype = None
+        if name.startswith("dec_"):
+            getattr(lib, f"nh_grad_{name}").argtypes = [VP]
+        getattr(lib, f"nh_numel_{name}").restype = ctypes.c_int
+    for name in WEIGHT_NAMES:
+        if not name.startswith("dec_"):
+            getattr(lib, f"nh_grad_{name}").argtypes = [VP]
+            getattr(lib, f"nh_grad_{name}").restype = None
     lib.nh_init.argtypes = [ctypes.c_int, ctypes.c_int]
     for fn in ["nh_obs_size", "nh_bl_feat", "nh_glyph_vocab", "nh_embed_dim",
-               "nh_concat", "nh_grid", "nh_numel_embed_w", "nh_numel_bl_w",
-               "nh_numel_bl_b", "nh_numel_proj_w", "nh_numel_proj_b",
-               "nh_numel_loc_w", "nh_numel_loc_b",
-               "nh_numel_glb1_w", "nh_numel_glb1_xy", "nh_numel_glb1_b",
-               "nh_numel_glb2_w", "nh_numel_glb2_b"]:
+               "nh_concat", "nh_grid", "nh_dec_od", "nh_heads"]:
         getattr(lib, fn).restype = ctypes.c_int
     lib.nh_forward.argtypes = [VP, VP, ctypes.c_int]
     lib.nh_backward.argtypes = [VP, ctypes.c_int]
+    lib.nh_dec_forward.argtypes = [VP, VP, ctypes.c_int]
+    lib.nh_dec_backward.argtypes = [VP, VP, VP, ctypes.c_int]
+    lib.nh_dec_keygrad.argtypes = [VP, ctypes.c_int]
     return lib
 
 
@@ -84,10 +89,10 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     u = vals.astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, :27] = ((u >> (8 * k)) & 0xFF).astype(np.float32)
-    # extra stats @ +27*4: prayer cooldown, prev action (-1..12), 18 class counts
+    # extra stats @ +27*4: prayer cooldown, prev action (-1..13), 18 class counts
     ex = np.concatenate([
         rng.integers(0, 1000, size=(B, 1)),
-        rng.integers(-1, 13, size=(B, 1)),
+        rng.integers(-1, 14, size=(B, 1)),
         rng.integers(0, 6, size=(B, 18)),
     ], axis=1).astype(np.int64).astype(np.uint32)
     for k in range(4):
@@ -100,7 +105,19 @@ def make_obs(B, obs_size, grid, max_glyph_used):
         inv[b, n_items[b]:] = 5976
     obs[:, inv_off + 0::2][:, :55] = (inv & 0xFF).astype(np.float32)
     obs[:, inv_off + 1::2][:, :55] = ((inv >> 8) & 0xFF).astype(np.float32)
-    return obs, glyphs, vals, ex.astype(np.int64).astype(np.int32), inv
+    # per-slot item state @ +55*2: 8 int8 fields, incl. the -128 spe sentinel
+    st_off = inv_off + 55 * 2
+    st = np.zeros((B, 55, 8), dtype=np.int64)
+    st[:, :, 0] = rng.integers(0, 4, size=(B, 55))
+    spe_known = rng.integers(0, 2, size=(B, 55)).astype(bool)
+    st[:, :, 1] = np.where(spe_known, rng.integers(-3, 6, size=(B, 55)), -128)
+    st[:, :, 2] = rng.integers(1, 20, size=(B, 55))
+    st[:, :, 3] = rng.integers(0, 4, size=(B, 55))
+    st[:, :, 4] = rng.integers(0, 4, size=(B, 55))
+    st[:, :, 5] = rng.integers(0, 128, size=(B, 55))
+    st[:, :, 6] = rng.integers(0, 2, size=(B, 55))
+    obs[:, st_off:st_off + 55 * 8] = (st.reshape(B, -1) & 0xFF).astype(np.float32)
+    return obs, glyphs, vals, ex.astype(np.int64).astype(np.int32), inv, st
 
 
 def dev(nbytes):
@@ -128,6 +145,130 @@ _cudart.cudaMalloc.argtypes = [VP, ctypes.c_size_t]
 _cudart.cudaMemcpy.argtypes = [VP, VP, ctypes.c_size_t, ctypes.c_int]
 
 
+def glyph_map():
+    """Parse the generated (kind, sub) mapping straight from the header."""
+    import re
+    txt = open(os.path.join(SRC, "nethack_glyph_map.h")).read()
+    def arr(name):
+        m = re.search(name + r"\[\d+\] = \{([0-9,\-]+)\};", txt)
+        return np.array([int(x) for x in m.group(1).split(",") if x], dtype=np.int64)
+    return arr("nh_glyph_kind"), arr("nh_glyph_sub")
+
+
+def getw(lib, name, shape):
+    import torch
+    fn = getattr(lib, f"nh_get_{name}")
+    n = getattr(lib, f"nh_numel_{name}")()
+    a = np.empty(n, dtype=np.float32)
+    fn(a.ctypes.data_as(VP))
+    return torch.tensor(a.astype(np.float64).reshape(shape), requires_grad=True)
+
+
+def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, H):
+    """float64 torch replica of the encoder forward. Returns (out, invh, w)
+    where invh is the (B,55,32) post-relu slot features (the decoder's keys)
+    and w maps weight names to the torch leaf tensors."""
+    import torch
+    B = glyphs.shape[0]
+    ROWS, COLS, CROP, PAD = 21, 79, 9, 5976
+    PW, PH, PX, PY = 5, 5, 16, 5
+    BL_SCALE = np.array([
+        1/79, 1/21, 1/25, 1/125, 1/25, 1/25, 1/25, 1/25, 1/25, 0.1,
+        1/200, 1/200, 1/50, 0.1, 1/100, 1/100, 1/10, 1/10, 1/30,
+        0.1, 0.1, 0.0, 1/4, 1/10, 1/50, 0.0, 1.0], dtype=np.float64)
+    BL_ISLOG = np.array([0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1,1,0,0,0,0,0,0])
+
+    w = {}
+    E_res  = w["embed_w"] = getw(lib, "embed_w", (5977, 32))
+    K_w    = w["ekind_w"] = getw(lib, "ekind_w", (14, 32))
+    S_w    = w["esub_w"]  = getw(lib, "esub_w", (getattr(lib, "nh_numel_esub_w")() // 32, 32))
+    kind_map, sub_map = glyph_map()
+    E = E_res + K_w[torch.tensor(kind_map)] + S_w[torch.tensor(sub_map)]   # E_eff
+    loc_w  = w["loc_w"]   = getw(lib, "loc_w", (256, CROP * CROP * 32))
+    loc_b  = w["loc_b"]   = getw(lib, "loc_b", (256,))
+    g1_w   = w["glb1_w"]  = getw(lib, "glb1_w", (16, PW * PH * 32))
+    g1_b   = w["glb1_b"]  = getw(lib, "glb1_b", (16,))
+    g1_xy  = w["glb1_xy"] = getw(lib, "glb1_xy", (16, 2))
+    g2_w   = w["glb2_w"]  = getw(lib, "glb2_w", (128, 16))
+    g2_b   = w["glb2_b"]  = getw(lib, "glb2_b", (128,))
+    inv1_w = w["inv1_w"]  = getw(lib, "inv1_w", (32, 32))
+    inv1_b = w["inv1_b"]  = getw(lib, "inv1_b", (32,))
+    inv1s_w = w["inv1s_w"] = getw(lib, "inv1s_w", (32, 17))
+    inv2_w = w["inv2_w"]  = getw(lib, "inv2_w", (128, 32))
+    inv2_b = w["inv2_b"]  = getw(lib, "inv2_b", (128,))
+    bl_w   = w["bl_w"]    = getw(lib, "bl_w", (64, 78))
+    bl_b   = w["bl_b"]    = getw(lib, "bl_b", (64,))
+    proj_w = w["proj_w"]  = getw(lib, "proj_w", (H, lib.nh_concat()))
+    proj_b = w["proj_b"]  = getw(lib, "proj_b", (H,))
+
+    # local: crop glyph ids with pad off-map
+    hx, hy = bl_vals[:, 0], bl_vals[:, 1]
+    crop_idx = np.full((B, CROP * CROP), PAD, dtype=np.int64)
+    for b in range(B):
+        for p in range(CROP * CROP):
+            r, c = hy[b] - 4 + p // CROP, hx[b] - 4 + p % CROP
+            if 0 <= r < ROWS and 0 <= c < COLS:
+                crop_idx[b, p] = glyphs[b, r * COLS + c]
+    x_local = E[torch.tensor(crop_idx)].reshape(B, -1)
+    loc = torch.relu(x_local @ loc_w.T + loc_b)
+    # global: per-patch flatten -> 16 -> 128, max over tokens
+    pat_idx = np.full((B, PX * PY, PW * PH), PAD, dtype=np.int64)
+    dxy = np.zeros((B, PX * PY, 2), dtype=np.float64)
+    for tk in range(PX * PY):
+        r0, c0 = (tk // PX) * PH, (tk % PX) * PW
+        dxy[:, tk, 0] = (c0 + 0.5 * (PW - 1) - hx) / COLS
+        dxy[:, tk, 1] = (r0 + 0.5 * (PH - 1) - hy) / ROWS
+        for pos in range(PW * PH):
+            r, c = r0 + pos // PW, c0 + pos % PW
+            if r < ROWS and c < COLS:
+                pat_idx[:, tk, pos] = glyphs[:, r * COLS + c]
+    xp = E[torch.tensor(pat_idx)].reshape(B, PX * PY, -1)
+    t16 = torch.relu(xp @ g1_w.T + torch.tensor(dxy) @ g1_xy.T + g1_b)
+    t128 = t16 @ g2_w.T
+    glb = torch.relu(t128.max(dim=1).values + g2_b)
+    # blstats features
+    f = np.zeros((B, 78), dtype=np.float64)
+    j = 0
+    for i in range(27):
+        if i in (21, 25):
+            continue
+        v = bl_vals[:, i].astype(np.float64)
+        f[:, j] = np.log1p(np.maximum(v, 0)) * BL_SCALE[i] if BL_ISLOG[i] else v * BL_SCALE[i]
+        j += 1
+    hunger = np.clip(bl_vals[:, 21], 0, 6)
+    for h in range(7):
+        f[:, j] = (hunger == h); j += 1
+    for k in range(13):
+        f[:, j] = (bl_vals[:, 25].astype(np.uint32) >> k) & 1; j += 1
+    f[:, j] = np.log1p(np.maximum(ex_vals[:, 0], 0)) * 0.1; j += 1
+    for h in range(14):
+        f[:, j] = (ex_vals[:, 1] == h); j += 1
+    for k in range(18):
+        f[:, j] = ex_vals[:, 2 + k] * 0.125; j += 1
+    fb = torch.tensor(f)
+    blh = torch.relu(fb @ bl_w.T + bl_b)
+    # inventory entities: per-slot embed + gated state features -> 32, relu
+    # (the decoder's keys), then pooled 32 -> 128 with max over slots
+    sf = np.zeros(st_vals.shape[:2] + (17,), dtype=np.float64)
+    for c in range(4):
+        sf[:, :, c] = (st_vals[:, :, 0] == c)
+    sk = st_vals[:, :, 1] != -128
+    sf[:, :, 4] = sk
+    sf[:, :, 5] = np.where(sk, st_vals[:, :, 1] * np.float64(np.float32(0.1)), 0.0)
+    sf[:, :, 6] = np.log1p(np.maximum(st_vals[:, :, 2], 0)) * 0.5
+    sf[:, :, 7] = st_vals[:, :, 3] / 3.0
+    sf[:, :, 8] = st_vals[:, :, 4] / 3.0
+    for c in range(7):
+        sf[:, :, 9 + c] = (st_vals[:, :, 5] >> c) & 1
+    sf[:, :, 16] = st_vals[:, :, 6]
+    xi = E[torch.tensor(inv_vals.astype(np.int64))]
+    invh = torch.relu(xi @ inv1_w.T + torch.tensor(sf) @ inv1s_w.T + inv1_b)  # (B,55,32)
+    invp = torch.relu((invh @ inv2_w.T).max(dim=1).values + inv2_b) # (B,128)
+    concat = torch.cat([loc, glb, invp, blh, fb], dim=1)
+    out = torch.relu(concat @ proj_w.T + proj_b)
+    return out, invh, w
+
+
 def run(lib):
     B, hidden = 4, 24
     lib.nh_init(B, hidden)
@@ -135,14 +276,14 @@ def run(lib):
     grid = lib.nh_grid()
     vocab = lib.nh_glyph_vocab()
     print(f"obs_size={obs_size} grid={grid} vocab={vocab} "
-          f"bl_feat={lib.nh_bl_feat()} concat={lib.nh_concat()}")
+          f"bl_feat={lib.nh_bl_feat()} concat={lib.nh_concat()} dec_od={lib.nh_dec_od()}")
 
     # glb1_xy zero-inits; randomize it so a broken dx,dy forward term is visible
     wxy = np.random.default_rng(5).standard_normal(lib.nh_numel_glb1_xy()).astype(np.float32)
     lib.nh_set_glb1_xy(wxy.ctypes.data_as(VP))
 
     max_glyph_used = 40  # keep embedding usage dense & checkable
-    obs, glyphs, bl_vals, ex_vals, inv_vals = make_obs(B, obs_size, grid, max_glyph_used)
+    obs, glyphs, bl_vals, ex_vals, inv_vals, st_vals = make_obs(B, obs_size, grid, max_glyph_used)
     obs_d, _ = h2d(obs)
     out_d = dev(B * hidden * 4)
 
@@ -160,22 +301,9 @@ def run(lib):
     grad_d, _ = h2d(g_out)  # backward mutates grad in place
     lib.nh_backward(grad_d, B)
 
-    specs = [
-        ("proj_w",  lib.nh_get_proj_w,  lib.nh_set_proj_w,  lib.nh_grad_proj_w,  lib.nh_numel_proj_w),
-        ("proj_b",  lib.nh_get_proj_b,  lib.nh_set_proj_b,  lib.nh_grad_proj_b,  lib.nh_numel_proj_b),
-        ("bl_w",    lib.nh_get_bl_w,    lib.nh_set_bl_w,    lib.nh_grad_bl_w,    lib.nh_numel_bl_w),
-        ("bl_b",    lib.nh_get_bl_b,    lib.nh_set_bl_b,    lib.nh_grad_bl_b,    lib.nh_numel_bl_b),
-        ("loc_w",   lib.nh_get_loc_w,   lib.nh_set_loc_w,   lib.nh_grad_loc_w,   lib.nh_numel_loc_w),
-        ("loc_b",   lib.nh_get_loc_b,   lib.nh_set_loc_b,   lib.nh_grad_loc_b,   lib.nh_numel_loc_b),
-        ("glb1_w",  lib.nh_get_glb1_w,  lib.nh_set_glb1_w,  lib.nh_grad_glb1_w,  lib.nh_numel_glb1_w),
-        ("glb1_xy", lib.nh_get_glb1_xy, lib.nh_set_glb1_xy, lib.nh_grad_glb1_xy, lib.nh_numel_glb1_xy),
-        ("glb1_b",  lib.nh_get_glb1_b,  lib.nh_set_glb1_b,  lib.nh_grad_glb1_b,  lib.nh_numel_glb1_b),
-        ("glb2_w",  lib.nh_get_glb2_w,  lib.nh_set_glb2_w,  lib.nh_grad_glb2_w,  lib.nh_numel_glb2_w),
-        ("glb2_b",  lib.nh_get_glb2_b,  lib.nh_set_glb2_b,  lib.nh_grad_glb2_b,  lib.nh_numel_glb2_b),
-        ("inv1_w",  lib.nh_get_inv1_w,  lib.nh_set_inv1_w,  lib.nh_grad_inv1_w,  lib.nh_numel_inv1_w),
-        ("inv1_b",  lib.nh_get_inv1_b,  lib.nh_set_inv1_b,  lib.nh_grad_inv1_b,  lib.nh_numel_inv1_b),
-        ("embed_w", lib.nh_get_embed_w, lib.nh_set_embed_w, lib.nh_grad_embed_w, lib.nh_numel_embed_w),
-    ]
+    enc_names = ["ekind_w", "esub_w", "proj_w", "proj_b", "bl_w", "bl_b", "loc_w", "loc_b",
+                 "glb1_w", "glb1_xy", "glb1_b", "glb2_w", "glb2_b",
+                 "inv1_w", "inv1_b", "inv1s_w", "inv2_w", "inv2_b", "embed_w"]
 
     # Central finite differences of L = sum(out*g_out). The encoder ends in a
     # ReLU (and the blstats branch has its own), so a perturbation that flips a
@@ -187,16 +315,20 @@ def run(lib):
     kink_tol = 2e-4      # |Lp+Lm-2*L0| above this ⇒ a ReLU flipped; skip entry.
     rel_tol = 1.5e-2
     rng = np.random.default_rng(123)
-    # glb1 is FD-unverifiable: its weights are shared by all 60 max-pooled
-    # tokens, so perturbations flip near-tied argmax winners under the kink
-    # detector's radar and bias the quotient. The torch reference covers it.
-    fd_skip = {"glb1_w", "glb1_xy", "glb1_b"}
+    # glb1/inv2 are FD-unverifiable: their weights are shared by all max-pooled
+    # tokens/slots, so perturbations flip near-tied argmax winners under the
+    # kink detector's radar and bias the quotient. The torch reference covers
+    # them.
+    fd_skip = {"glb1_w", "glb1_xy", "glb1_b", "inv2_w"}
     all_ok = True
-    for name, get, setw, gradf, numelf in specs:
+    for name in enc_names:
         if name in fd_skip:
             print(f"  [----] {name:8s} FD skipped (max-pool shared weights); torch-checked below")
             continue
-        n = numelf()
+        get = getattr(lib, f"nh_get_{name}")
+        setw = getattr(lib, f"nh_set_{name}")
+        gradf = getattr(lib, f"nh_grad_{name}")
+        n = getattr(lib, f"nh_numel_{name}")()
         w0 = np.empty(n, dtype=np.float32); get(w0.ctypes.data_as(VP))
         ga = np.empty(n, dtype=np.float32); gradf(ga.ctypes.data_as(VP))
 
@@ -234,110 +366,101 @@ def run(lib):
               f"max|analytic|={np.abs(ga).max():.4g} max_rel_err={max_rel:.2e}")
 
     # Exact reference: float64 torch autograd replica of the whole encoder.
-    # Finite differences can't cleanly verify glb1 — its weights are shared
-    # across all 60 max-pooled tokens, so any perturbation flips near-tied
-    # argmax winners below the kink detector's threshold.
-    all_ok = torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs) and all_ok
+    # Finite differences can't cleanly verify glb1/inv2 — shared max-pool
+    # weights flip near-tied argmax winners below the kink detector's
+    # threshold.
+    all_ok = torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, g_out, enc_names, hidden) and all_ok
+    all_ok = dec_check(lib, obs_d, glyphs, bl_vals, ex_vals, inv_vals, st_vals, B, hidden) and all_ok
     return all_ok
 
 
-def torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, g_out, specs):
+def torch_check(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, g_out, enc_names, H):
     import torch
-    B = glyphs.shape[0]
-    H = g_out.shape[1]
-    ROWS, COLS, CROP, PAD = 21, 79, 9, 5976
-    PW, PH, PX, PY = 5, 5, 16, 5
-    BL_SCALE = np.array([
-        1/79, 1/21, 1/25, 1/125, 1/25, 1/25, 1/25, 1/25, 1/25, 0.1,
-        1/200, 1/200, 1/50, 0.1, 1/100, 1/100, 1/10, 1/10, 1/30,
-        0.1, 0.1, 0.0, 1/4, 1/10, 1/50, 0.0, 1.0], dtype=np.float64)
-    BL_ISLOG = np.array([0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1,1,0,0,0,0,0,0])
-
-    def getw(name, shape):
-        fn = getattr(lib, f"nh_get_{name}")
-        n = getattr(lib, f"nh_numel_{name}")()
-        a = np.empty(n, dtype=np.float32)
-        fn(a.ctypes.data_as(VP))
-        return torch.tensor(a.astype(np.float64).reshape(shape), requires_grad=True)
-
-    E      = getw("embed_w", (5977, 32))
-    loc_w  = getw("loc_w", (256, CROP * CROP * 32));  loc_b = getw("loc_b", (256,))
-    g1_w   = getw("glb1_w", (16, PW * PH * 32));      g1_b  = getw("glb1_b", (16,))
-    g1_xy  = getw("glb1_xy", (16, 2))
-    g2_w   = getw("glb2_w", (128, 16));               g2_b  = getw("glb2_b", (128,))
-    inv1_w = getw("inv1_w", (32, 32));                inv1_b = getw("inv1_b", (32,))
-    bl_w   = getw("bl_w", (64, 77));                  bl_b  = getw("bl_b", (64,))
-    proj_w = getw("proj_w", (H, 2285));               proj_b = getw("proj_b", (H,))
-
-    grid_t = torch.tensor(glyphs.reshape(B, ROWS, COLS).astype(np.int64))
-    # local: crop glyph ids with pad off-map
-    hx, hy = bl_vals[:, 0], bl_vals[:, 1]
-    crop_idx = np.full((B, CROP * CROP), PAD, dtype=np.int64)
-    for b in range(B):
-        for p in range(CROP * CROP):
-            r, c = hy[b] - 4 + p // CROP, hx[b] - 4 + p % CROP
-            if 0 <= r < ROWS and 0 <= c < COLS:
-                crop_idx[b, p] = glyphs[b, r * COLS + c]
-    x_local = E[torch.tensor(crop_idx)].reshape(B, -1)
-    loc = torch.relu(x_local @ loc_w.T + loc_b)
-    # global: per-patch flatten -> 16 -> 128, max over tokens
-    pat_idx = np.full((B, PX * PY, PW * PH), PAD, dtype=np.int64)
-    dxy = np.zeros((B, PX * PY, 2), dtype=np.float64)
-    for tk in range(PX * PY):
-        r0, c0 = (tk // PX) * PH, (tk % PX) * PW
-        dxy[:, tk, 0] = (c0 + 0.5 * (PW - 1) - hx) / COLS
-        dxy[:, tk, 1] = (r0 + 0.5 * (PH - 1) - hy) / ROWS
-        for pos in range(PW * PH):
-            r, c = r0 + pos // PW, c0 + pos % PW
-            if r < ROWS and c < COLS:
-                pat_idx[:, tk, pos] = glyphs[:, r * COLS + c]
-    xp = E[torch.tensor(pat_idx)].reshape(B, PX * PY, -1)
-    t16 = torch.relu(xp @ g1_w.T + torch.tensor(dxy) @ g1_xy.T + g1_b)
-    t128 = t16 @ g2_w.T
-    glb = torch.relu(t128.max(dim=1).values + g2_b)
-    # blstats features
-    f = np.zeros((B, 77), dtype=np.float64)
-    j = 0
-    for i in range(27):
-        if i in (21, 25):
-            continue
-        v = bl_vals[:, i].astype(np.float64)
-        f[:, j] = np.log1p(np.maximum(v, 0)) * BL_SCALE[i] if BL_ISLOG[i] else v * BL_SCALE[i]
-        j += 1
-    hunger = np.clip(bl_vals[:, 21], 0, 6)
-    for h in range(7):
-        f[:, j] = (hunger == h); j += 1
-    for k in range(13):
-        f[:, j] = (bl_vals[:, 25].astype(np.uint32) >> k) & 1; j += 1
-    f[:, j] = np.log1p(np.maximum(ex_vals[:, 0], 0)) * 0.1; j += 1
-    for h in range(13):
-        f[:, j] = (ex_vals[:, 1] == h); j += 1
-    for k in range(18):
-        f[:, j] = ex_vals[:, 2 + k] * 0.125; j += 1
-    fb = torch.tensor(f)
-    blh = torch.relu(fb @ bl_w.T + bl_b)
-    # inventory entities: per-slot embed -> 16, relu, flattened in slot order
-    xi = E[torch.tensor(inv_vals.astype(np.int64))]
-    invh = torch.relu(xi @ inv1_w.T + inv1_b).reshape(B, -1)
-    concat = torch.cat([loc, glb, invh, blh, fb], dim=1)
-    out = torch.relu(concat @ proj_w.T + proj_b)
+    out, _, w = torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, H)
     (out * torch.tensor(g_out.astype(np.float64))).sum().backward()
 
-    refs = {"embed_w": E, "loc_w": loc_w, "loc_b": loc_b, "glb1_w": g1_w,
-            "glb1_xy": g1_xy, "glb1_b": g1_b, "glb2_w": g2_w, "glb2_b": g2_b,
-            "inv1_w": inv1_w, "inv1_b": inv1_b,
-            "bl_w": bl_w, "bl_b": bl_b, "proj_w": proj_w, "proj_b": proj_b}
     ok = True
-    for name, _, _, gradf, numelf in specs:
-        n = numelf()
+    for name in enc_names:
+        n = getattr(lib, f"nh_numel_{name}")()
         ga = np.empty(n, dtype=np.float32)
-        gradf(ga.ctypes.data_as(VP))
-        gt = refs[name].grad.numpy().reshape(-1)
+        getattr(lib, f"nh_grad_{name}")(ga.ctypes.data_as(VP))
+        gt = w[name].grad.numpy().reshape(-1)
         denom = max(1.0, np.abs(gt).max())
         rel = np.abs(ga - gt).max() / denom
         good = rel < 1e-3
         ok = ok and good
         print(f"  [{'OK ' if good else 'FAIL'}] torch {name:8s} max_rel_err={rel:.2e}")
+    return ok
+
+
+def dec_check(lib, obs_d, glyphs, bl_vals, ex_vals, inv_vals, st_vals, B, H):
+    """float64 torch replica of the 5-head pointer decoder: forward values,
+    weight grads, keygrad (grad into the encoder's slot features) and
+    grad_input (grad into the decoder's hidden-state input)."""
+    import torch
+    OD = lib.nh_dec_od()
+    HEADS = lib.nh_heads()
+
+    # CUDA forward (encoder+decoder) and backward (decoder only)
+    out_d = dev(B * (OD + 1) * 4)
+    lib.nh_dec_forward(out_d, obs_d, B)
+    out_cuda = d2h(out_d, B * (OD + 1)).reshape(B, OD + 1)
+    rng = np.random.default_rng(11)
+    g = rng.standard_normal((B, OD + 1)).astype(np.float32)
+    gl_d, _ = h2d(np.ascontiguousarray(g[:, :OD]))
+    gv_d, _ = h2d(np.ascontiguousarray(g[:, OD]))
+    di_d = dev(B * H * 4)
+    lib.nh_dec_backward(gl_d, gv_d, di_d, B)
+    di_cuda = d2h(di_d, B * H).reshape(B, H)
+    kg_cuda = np.empty(B * 55 * 32, dtype=np.float32)
+    lib.nh_dec_keygrad(kg_cuda.ctypes.data_as(VP), B)
+
+    # torch replica: hidden state and keys detached so grads are decoder-local,
+    # matching what the CUDA decoder backward produces (the encoder chain gets
+    # these via grad_input / keygrad separately).
+    h_full, invh, _ = torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, H)
+    h_in = h_full.detach().clone().requires_grad_(True)
+    s_k = invh.detach().clone().requires_grad_(True)
+    lin_w = getw(lib, "dec_lin_w", (24, H))
+    q_w = getw(lib, "dec_q_w", (HEADS * 32, H))
+    k_w = getw(lib, "dec_k_w", (32, 32))
+    tau = getw(lib, "dec_tau", (8,))   # padded to 8; first HEADS live
+
+    tmp = h_in @ lin_w.T                                    # (B,24), rows 23 pad
+    q = (h_in @ q_w.T).reshape(B, HEADS, 32)
+    kmat = s_k @ k_w.T                                      # (B,55,32)
+    qn = q.norm(dim=2) + 1e-6
+    kn = kmat.norm(dim=2) + 1e-6
+    cos = torch.einsum('bhk,bik->bhi', q, kmat) / (qn[:, :, None] * kn[:, None, :])
+    slot = torch.exp(tau[:HEADS])[None, :, None] * cos     # (B,5,55) log-tau
+    out = torch.cat([tmp[:, :14], slot.reshape(B, HEADS * 55), tmp[:, 14:23]], dim=1)
+    (out * torch.tensor(g.astype(np.float64))).sum().backward()
+
+    ok = True
+    rel = np.abs(out_cuda - out.detach().numpy()).max() / max(1.0, np.abs(out.detach().numpy()).max())
+    good = rel < 1e-4
+    ok = ok and good
+    print(f"  [{'OK ' if good else 'FAIL'}] torch dec_out   max_rel_err={rel:.2e}")
+
+    for name, ref in [("dec_lin_w", lin_w), ("dec_q_w", q_w),
+                      ("dec_k_w", k_w), ("dec_tau", tau)]:
+        n = getattr(lib, f"nh_numel_{name}")()
+        ga = np.empty(n, dtype=np.float32)
+        getattr(lib, f"nh_grad_{name}")(ga.ctypes.data_as(VP))
+        gt = ref.grad.numpy().reshape(-1)
+        denom = max(1.0, np.abs(gt).max())
+        rel = np.abs(ga - gt).max() / denom
+        good = rel < 1e-3
+        ok = ok and good
+        print(f"  [{'OK ' if good else 'FAIL'}] torch {name:9s} max_rel_err={rel:.2e}")
+
+    for name, cuda_g, ref in [("keygrad", kg_cuda, s_k), ("grad_input", di_cuda, h_in)]:
+        gt = ref.grad.numpy().reshape(-1)
+        denom = max(1.0, np.abs(gt).max())
+        rel = np.abs(cuda_g.reshape(-1) - gt).max() / denom
+        good = rel < 1e-3
+        ok = ok and good
+        print(f"  [{'OK ' if good else 'FAIL'}] torch dec {name:9s} max_rel_err={rel:.2e}")
     return ok
 
 

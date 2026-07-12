@@ -44,10 +44,15 @@ extern void       nle_end(nle_ctx_t*);
 #define NETHACK_OFF_EXTRA   (NETHACK_OFF_BLSTATS + NLE_BLSTATS_SIZE * 4)
 #define NETHACK_EXTRA_INTS  (2 + NETHACK_NUM_OCLASSES)
 // inventory entity block: 55 slot glyphs int16 LE, in inventory order (the
-// item-slot action head indexes these positions); empty slots = pad glyph
+// item-slot action head indexes these positions); empty slots = pad glyph.
+// Followed by the identification-gated per-slot state block (obs v4): 8
+// int8 fields per slot [buc, spe, quan, ero1, ero2, flags, typeknown, rsvd]
+// — exactly what doname displays, nothing privileged (engine gates on
+// bknown/known/rknown/oc_name_known).
 #define NETHACK_INV_SLOTS   NLE_INVENTORY_SIZE
 #define NETHACK_OFF_INV     (NETHACK_OFF_EXTRA + NETHACK_EXTRA_INTS * 4)
-#define NETHACK_OBS_SIZE    (NETHACK_OFF_INV + NETHACK_INV_SLOTS * 2)
+#define NETHACK_OFF_INVST   (NETHACK_OFF_INV + NETHACK_INV_SLOTS * 2)
+#define NETHACK_OBS_SIZE    (NETHACK_OFF_INVST + NETHACK_INV_SLOTS * NLE_INV_STATE_FIELDS)
 #define NETHACK_INTERNAL_UBLESSCNT 5   // u.ublesscnt, vendored winrl.cc patch
 #define NETHACK_INTERNAL_KILLER_MNUM 9 // killer monster index + 1 (0 = not a monster), death only
 #define NETHACK_INTERNAL_KILLER_MLEV 10 // killer monster level, death only
@@ -69,7 +74,7 @@ enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 // Factored action space: verb head (12) + item-slot head (55) + direction
 // head (8, vi-key order). MOVE/RUN/KICK/THROW consume the direction; the
 // direction head trains dense on every move, so directional verbs inherit it.
-#define NETHACK_NUM_ACTIONS 13
+#define NETHACK_NUM_ACTIONS 14
 #define NETHACK_NUM_DIRS    8
 static const int NETHACK_DIR_KEYS[NETHACK_NUM_DIRS] =
     {'k','j','h','l','y','u','b','n'};   // N S W E NW NE SW SE
@@ -88,6 +93,7 @@ enum {
     NETHACK_ACT_PRAY     = 10,
     NETHACK_ACT_THROW    = 11,
     NETHACK_ACT_ZAP      = 12,
+    NETHACK_ACT_REST     = 13,
 };
 
 // !status_updates skips the status renderer + recalc_mapseen (~25% of engine)
@@ -119,10 +125,16 @@ typedef struct Log {
     float prayers_low_hp;     // prayers at <=25% max HP
     float throws;             // throw presses that launched an item
     float zaps;               // zap presses that fired a wand
+    float rests;              // REST presses (20s occupation; game interrupts on danger)
     // slot position-dependence diagnostic: if uses sit far below where valid
     // items live, the flat slot head isn't generalizing across positions
     float use_slot_mean;      // mean slot index of successful item uses
     float valid_slot_mean;    // mean slot index of mask-legal slots
+    // rest/retreat/burden diagnostics (log-only)
+    float regen_ticks;        // +1-HP steps: natural regen actually banked
+    float ups_hurt;           // UP presses at <50% max HP (retreat attempts)
+    float burdened_frac;      // steps with encumbrance > Unencumbered
+    float pack_full_frac;     // steps with the autopickup "carrying too much" refusal
     float damage_taken;
     float reward_saturated;   // fraction of steps with |reward| > 1
     float game_time;          // NetHack turns survived
@@ -160,6 +172,8 @@ typedef struct Stats {
     long prayers;
     long throws;
     long zaps;
+    long rests;
+    long regen_ticks, ups_hurt, burdened_steps, pack_full;
     long use_slot_sum, use_cnt;       // slot indices of successful item uses
     long valid_slot_sum, valid_cnt;   // slot indices legal in the mask, per step
     long last_ok_turn;   // last turn with HP >= 75% max
@@ -206,6 +220,7 @@ typedef struct Nethack {
     short          inv_glyphs[NLE_INVENTORY_SIZE];
     unsigned char  inv_letters[NLE_INVENTORY_SIZE];
     unsigned char  inv_oclasses[NLE_INVENTORY_SIZE];
+    signed char    inv_state[NLE_INVENTORY_SIZE * NLE_INV_STATE_FIELDS];
 
     Stats stats;
 
@@ -255,6 +270,7 @@ static void nethack_bind_obs(Nethack* env) {
     o->inv_glyphs   = env->inv_glyphs;
     o->inv_letters  = env->inv_letters;
     o->inv_oclasses = env->inv_oclasses;
+    o->inv_state    = env->inv_state;
 }
 
 static void nethack_init_settings(Nethack* env) {
@@ -330,6 +346,8 @@ static void nethack_pack_obs(Nethack* env) {
         iv[2*i + 0] = (unsigned char)(g & 0xffu);
         iv[2*i + 1] = (unsigned char)((g >> 8) & 0xffu);
     }
+    // per-slot item state, raw int8 as filled (and gated) by the engine
+    memcpy(env->observations + NETHACK_OFF_INVST, env->inv_state, sizeof(env->inv_state));
 
     // action mask, aligned with this obs: verbs all legal except EAT while
     // Satiated; four PER-VERB slot heads, each legal only for its own item
@@ -340,7 +358,12 @@ static void nethack_pack_obs(Nethack* env) {
         unsigned char* m = env->action_mask;
         memset(m, 1, NETHACK_NUM_ACTIONS);
         if (env->blstats[NLE_BL_HUNGER] == 0) m[NETHACK_ACT_EAT] = 0;
+        // REST only while hurt: full-HP rest is a free fast-forward that
+        // enables spawn-camped XP farming (depth 1.1 @ score 1929 run)
+        if (env->blstats[NLE_BL_HP] >= env->blstats[NLE_BL_HPMAX]) m[NETHACK_ACT_REST] = 0;
         static const int head_oc[5] = {3, 7, 8, 2, 11};   // wear, eat, quaff, throw, zap
+        static const int head_verb[5] = {NETHACK_ACT_WEAR, NETHACK_ACT_EAT,
+            NETHACK_ACT_QUAFF, NETHACK_ACT_THROW, NETHACK_ACT_ZAP};
         for (int h = 0; h < 5; h++) {
             unsigned char* s = m + NETHACK_NUM_ACTIONS + h * NETHACK_INV_SLOTS;
             memset(s, 0, NETHACK_INV_SLOTS);
@@ -353,7 +376,13 @@ static void nethack_pack_obs(Nethack* env) {
                     env->stats.valid_slot_sum += i; env->stats.valid_cnt++;
                 }
             }
-            if (!any) s[0] = 1;   // sampling needs >=1 legal entry per head
+            if (!any) {
+                s[0] = 1;   // sampling needs >=1 legal entry per head
+                // no usable item -> the verb itself is illegal: an ESC'd
+                // prompt is a zero-turn no-op the policy spams as an idle
+                // button once other free waits are masked
+                m[head_verb[h]] = 0;
+            }
         }
         memset(m + NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS, 1, NETHACK_NUM_DIRS);
     }
@@ -377,8 +406,15 @@ static void nethack_add_log(Nethack* env, int how) {
     env->log.prayers_low_hp  += (float)env->stats.prayers_low_hp;
     env->log.throws          += (float)env->stats.throws;
     env->log.zaps            += (float)env->stats.zaps;
+    env->log.rests           += (float)env->stats.rests;
     env->log.floor_eats      += (float)env->stats.floor_eats;
     env->log.damage_taken    += (float)env->stats.damage;
+    env->log.regen_ticks += (float)env->stats.regen_ticks;
+    env->log.ups_hurt    += (float)env->stats.ups_hurt;
+    env->log.burdened_frac += env->stats.length > 0
+        ? (float)env->stats.burdened_steps / (float)env->stats.length : 0.0f;
+    env->log.pack_full_frac += env->stats.length > 0
+        ? (float)env->stats.pack_full / (float)env->stats.length : 0.0f;
     env->log.use_slot_mean += env->stats.use_cnt > 0
         ? (float)env->stats.use_slot_sum / (float)env->stats.use_cnt : 0.0f;
     env->log.valid_slot_mean += env->stats.valid_cnt > 0
@@ -467,6 +503,9 @@ static void nethack_update_stats(Nethack* env) {
 
     long hp = env->blstats[NLE_BL_HP];
     if (hp < env->prev_hp) env->stats.damage += env->prev_hp - hp;
+    if (hp == env->prev_hp + 1) env->stats.regen_ticks++;   // natural regen is +1
+    if (env->blstats[NLE_BL_CAP] > 0) env->stats.burdened_steps++;
+    if (nethack_msg_contains(env, "arrying too much")) env->stats.pack_full++;
 
     // combat-death anatomy trackers, read back at death (blstats zero then)
     long hpmax = env->blstats[NLE_BL_HPMAX];
@@ -592,6 +631,8 @@ void c_step(Nethack* env) {
         env->ctx = nle_step(env->ctx, &env->obs);
         break;
     case NETHACK_ACT_UP:
+        if (2 * env->blstats[NLE_BL_HP] < env->blstats[NLE_BL_HPMAX])
+            env->stats.ups_hurt++;   // retreat attempt while hurt
         env->obs.action = '<';
         env->ctx = nle_step(env->ctx, &env->obs);
         break;
@@ -658,6 +699,21 @@ void c_step(Nethack* env) {
             }
         }
         else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_REST:
+        // count-prefixed search "20s": one occupation, ~20 turns of rest;
+        // NetHack's own interruption aborts it the moment danger appears
+        env->stats.rests++;
+        env->obs.action = '2';
+        env->ctx = nle_step(env->ctx, &env->obs);
+        if (!env->obs.done) {
+            env->obs.action = '0';
+            env->ctx = nle_step(env->ctx, &env->obs);
+        }
+        if (!env->obs.done) {
+            env->obs.action = 's';
+            env->ctx = nle_step(env->ctx, &env->obs);
+        }
         break;
     case NETHACK_ACT_ZAP:
         used = nethack_do_use_item(env, 'z', "want to zap", NULL, slot);
