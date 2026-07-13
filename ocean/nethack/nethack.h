@@ -52,7 +52,11 @@ extern void       nle_end(nle_ctx_t*);
 #define NETHACK_INV_SLOTS   NLE_INVENTORY_SIZE
 #define NETHACK_OFF_INV     (NETHACK_OFF_EXTRA + NETHACK_EXTRA_INTS * 4)
 #define NETHACK_OFF_INVST   (NETHACK_OFF_INV + NETHACK_INV_SLOTS * 2)
-#define NETHACK_OBS_SIZE    (NETHACK_OFF_INVST + NETHACK_INV_SLOTS * NLE_INV_STATE_FIELDS)
+// trigram message branch: raw topline chars (GPU hashes char-trigrams into a
+// bag). Null-padded; NETHACK_MSG_LEN must match NH_MSG_LEN in src/nethack.cu.
+#define NETHACK_OFF_MSG     (NETHACK_OFF_INVST + NETHACK_INV_SLOTS * NLE_INV_STATE_FIELDS)
+#define NETHACK_MSG_LEN     128
+#define NETHACK_OBS_SIZE    (NETHACK_OFF_MSG + NETHACK_MSG_LEN)
 #define NETHACK_INTERNAL_UBLESSCNT 5   // u.ublesscnt, vendored winrl.cc patch
 #define NETHACK_INTERNAL_KILLER_MNUM 9 // killer monster index + 1 (0 = not a monster), death only
 #define NETHACK_INTERNAL_KILLER_MLEV 10 // killer monster level, death only
@@ -348,6 +352,12 @@ static void nethack_pack_obs(Nethack* env) {
     }
     // per-slot item state, raw int8 as filled (and gated) by the engine
     memcpy(env->observations + NETHACK_OFF_INVST, env->inv_state, sizeof(env->inv_state));
+    // raw topline chars (the encoder hashes char-trigrams), null-padded. This
+    // is env->message, the last captured topline — exactly what a player reads.
+    unsigned char* mv = env->observations + NETHACK_OFF_MSG;
+    size_t mlen = strnlen((const char*)env->message, NETHACK_MSG_LEN);
+    memcpy(mv, env->message, mlen);
+    if (mlen < (size_t)NETHACK_MSG_LEN) memset(mv + mlen, 0, NETHACK_MSG_LEN - mlen);
 
     // action mask, aligned with this obs: verbs all legal except EAT while
     // Satiated; four PER-VERB slot heads, each legal only for its own item

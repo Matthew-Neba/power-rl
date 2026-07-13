@@ -119,14 +119,27 @@ static constexpr int NH_BL_HID = 64;
 // identity lives there); the trunk only gets the pooled summary below. Fused
 // per-glyph table T_inv = E @ inv1_w^T (5977xNH_INV_HID) rebuilt per forward.
 static constexpr int NH_INV = 55;                  // NETHACK_INV_SLOTS
-static constexpr int NH_INV_HID = 32;
+// 16-dim per-slot rep: doubles as the pooled-summary bottleneck AND the
+// decoder pointer key (unified, patch-encoder style). Halves the pool max
+// MACs, the deterministic max-backward atomics, and the max-kernel smem
+// footprint (better occupancy) vs the old 32; also shrinks the decoder.
+static constexpr int NH_INV_HID = 16;
 static constexpr int NH_INV_FLAT = NH_INV * NH_INV_HID;
 // The trunk sees a pooled inventory summary, not the 1760-dim flatten: per
 // slot 32 -> 128 with the elementwise max folded in (patch-encoder trick, the
 // (B,55,128) intermediate never exists). Slot identity for the action heads
 // comes from the pointer decoder's keys (inv_out), not the trunk.
 static constexpr int NH_INV_POOL = 128;
-static constexpr int NH_CONCAT = NH_LOC_HID + NH_GLB_HID + NH_INV_POOL + NH_BL_HID + NH_BL_FEAT;
+// Trigram message branch: char-trigram bag over the raw topline. Each trigram
+// hashes into NH_MSG_VOCAB buckets, its NH_MSG_HID-dim embed row summed, then
+// scaled by 1/sqrt(count+1) (normalized bag / EmbeddingBag sum). The summary
+// is concatenated raw (signed, no relu) like the blstats raw features.
+static constexpr int NH_MSG_LEN = 128;             // raw topline chars in obs tail
+static constexpr int NH_MSG_VOCAB = 4096;          // trigram hash buckets
+static constexpr int NH_MSG_LOG2V = 12;            // log2(NH_MSG_VOCAB)
+static constexpr int NH_MSG_HID = 32;              // trigram embed = message summary dim
+static constexpr int NH_MSG_CONCAT_OFF = NH_LOC_HID + NH_GLB_HID + NH_INV_POOL + NH_BL_HID + NH_BL_FEAT;
+static constexpr int NH_CONCAT = NH_MSG_CONCAT_OFF + NH_MSG_HID;
 static constexpr int NH_BL_OFF = 2 * NH_MGRID;     // blstats offset, obs elements
 static constexpr int NH_INV_OFF = NH_BL_OFF + (NH_BL_RAW + NH_EX_RAW) * 4;
 // obs v4: per-slot identification-gated state, 8 int8 fields per slot
@@ -135,7 +148,8 @@ static constexpr int NH_INV_OFF = NH_BL_OFF + (NH_BL_RAW + NH_EX_RAW) * 4;
 static constexpr int NH_INVST_OFF = NH_INV_OFF + NH_INV * 2;
 static constexpr int NH_ST_RAW = 8;                // NLE_INV_STATE_FIELDS
 static constexpr int NH_SFEAT = 17;                // buc4 + known+spe + quan + ero2 + flags7 + tk
-static constexpr int NH_OBS_SIZE = NH_INVST_OFF + NH_INV * NH_ST_RAW;
+static constexpr int NH_MSG_OFF  = NH_INVST_OFF + NH_INV * NH_ST_RAW;   // message block start
+static constexpr int NH_OBS_SIZE = NH_MSG_OFF + NH_MSG_LEN;
 static constexpr int NH_SORT_BLOCKS = 256;         // hist grid (smem histograms)
 static constexpr int NH_HOT_T = 16;                // hot-glyph smem rows (16x32 int64 = 4KB)
 
@@ -456,10 +470,72 @@ __global__ void nh_blstats_kernel(
 }
 
 // concat = [local hid | global hid | bl hid | bl raw feats]
+// ---- trigram message branch ----
+__device__ __forceinline__ int nh_msg_lc(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;   // lowercase; keep spaces/punct
+}
+__device__ __forceinline__ int nh_msg_hash(int c0, int c1, int c2) {
+    unsigned key = ((unsigned)c0 << 16) | ((unsigned)c1 << 8) | (unsigned)c2;
+    return (int)((key * 2654435761u) >> (32 - NH_MSG_LOG2V));   // top log2V bits
+}
+// per-position trigram bucket id (-1 for the padded tail / past the null). Ids
+// stay contiguous because the topline is null-terminated, so consumers break
+// at the first -1.
+__global__ void nh_msg_ids_kernel(
+    float* __restrict__ ids, const precision_t* __restrict__ obs, int B) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * NH_MSG_LEN) return;
+    int b = i / NH_MSG_LEN, t = i % NH_MSG_LEN;
+    if (t > NH_MSG_LEN - 3) { ids[i] = -1.0f; return; }
+    const precision_t* m = obs + (int64_t)b * NH_OBS_SIZE + NH_MSG_OFF;
+    int c0 = (int)to_float(m[t]), c1 = (int)to_float(m[t + 1]), c2 = (int)to_float(m[t + 2]);
+    if (c0 == 0 || c1 == 0 || c2 == 0) { ids[i] = -1.0f; return; }
+    ids[i] = (float)nh_msg_hash(nh_msg_lc(c0), nh_msg_lc(c1), nh_msg_lc(c2));
+}
+// normalized-sum bag: block per sample, one warp = NH_MSG_HID lanes (lane d
+// owns output dim d). Each trigram is one coalesced read of msg_w[id]; sum
+// scaled by 1/sqrt(count+1). No relu (raw signed summary).
+__global__ void nh_msg_pool_kernel(
+    precision_t* __restrict__ out, const precision_t* __restrict__ msg_w,
+    const float* __restrict__ ids, int B) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int d = threadIdx.x;
+    const float* mi = ids + (int64_t)b * NH_MSG_LEN;
+    int count = 0; float acc = 0.0f;
+    for (int t = 0; t < NH_MSG_LEN; t++) {
+        int id = (int)mi[t];
+        if (id < 0) break;
+        count++;
+        acc += to_float(msg_w[(int64_t)id * NH_MSG_HID + d]);
+    }
+    out[(int64_t)b * NH_MSG_HID + d] = from_float(acc * rsqrtf((float)count + 1.0f));
+}
+// backward: scatter scale*dout into the trigram-table grad (fixed-point,
+// deterministic). Lane d writes bucket dim d, so the warp hits distinct
+// addresses (no intra-block contention); cross-block collisions on hot
+// buckets are bounded. dout read straight from the concat-grad slice.
+__global__ void nh_msg_bwd_kernel(
+    long long* __restrict__ dmsg_acc, const precision_t* __restrict__ grad_concat,
+    const float* __restrict__ ids, int B) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int d = threadIdx.x;
+    const float* mi = ids + (int64_t)b * NH_MSG_LEN;
+    int count = 0;
+    for (int t = 0; t < NH_MSG_LEN; t++) { if ((int)mi[t] < 0) break; count++; }
+    float g = to_float(grad_concat[(int64_t)b * NH_CONCAT + NH_MSG_CONCAT_OFF + d])
+              * rsqrtf((float)count + 1.0f);
+    if (g == 0.0f) return;
+    for (int t = 0; t < count; t++)
+        nh_fxp_atomic_add(&dmsg_acc[(int64_t)(int)mi[t] * NH_MSG_HID + d], g);
+}
+
 __global__ void nh_concat_kernel(
     precision_t* __restrict__ out, const precision_t* __restrict__ loc,
     const precision_t* __restrict__ glb, const precision_t* __restrict__ inv,
-    const precision_t* __restrict__ bl_out, const precision_t* __restrict__ bl_feats, int B) {
+    const precision_t* __restrict__ bl_out, const precision_t* __restrict__ bl_feats,
+    const precision_t* __restrict__ msg, int B) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * NH_CONCAT) return;
     int b = idx / NH_CONCAT, c = idx % NH_CONCAT;
@@ -472,8 +548,10 @@ __global__ void nh_concat_kernel(
         val = inv[(int64_t)b * NH_INV_POOL + (c - NH_LOC_HID - NH_GLB_HID)];
     else if (c < NH_LOC_HID + NH_GLB_HID + NH_INV_POOL + NH_BL_HID)
         val = bl_out[(int64_t)b * NH_BL_HID + (c - NH_LOC_HID - NH_GLB_HID - NH_INV_POOL)];
-    else
+    else if (c < NH_MSG_CONCAT_OFF)
         val = bl_feats[(int64_t)b * NH_BL_FEAT + (c - NH_LOC_HID - NH_GLB_HID - NH_INV_POOL - NH_BL_HID)];
+    else
+        val = msg[(int64_t)b * NH_MSG_HID + (c - NH_MSG_CONCAT_OFF)];
     out[idx] = val;
 }
 
@@ -864,6 +942,7 @@ struct NethackEncoderWeights {
     PrecisionTensor glb1_w, glb1_xy, glb1_b, glb2_w, glb2_b;
     PrecisionTensor inv1_w, inv1_b, inv1s_w, inv2_w, inv2_b;
     PrecisionTensor bl_w, bl_b, proj_w, proj_b;
+    PrecisionTensor msg_w;                 // trigram embedding table (NH_MSG_VOCAB, NH_MSG_HID)
     int obs_size, hidden;
 };
 
@@ -882,6 +961,8 @@ struct NethackEncoderActivations {
     IntTensor inv_amax;                    // winning slot per (sample, pool dim)
     PrecisionTensor loc_out, glb_out;
     PrecisionTensor bl_feats, bl_out;
+    FloatTensor msg_ids;                   // per-position trigram bucket ids (-1 pad)
+    PrecisionTensor msg_out;               // normalized trigram-bag summary (B, NH_MSG_HID)
     PrecisionTensor concat, out;
     PrecisionTensor loc_grad, glb_grad, inv_grad, bl_grad;   // contiguous concat slices
     PrecisionTensor inv_pool_grad;         // pooled-summary slice of concat grad
@@ -891,12 +972,14 @@ struct NethackEncoderActivations {
     LongTensor dE_i;                       // fixed-point local embed-grad staging
     LongTensor dw2_acc;                    // fixed-point glb2 wgrad staging
     LongTensor dw2i_acc;                   // fixed-point inv2 wgrad staging
+    LongTensor dmsg_acc;                   // fixed-point trigram-table wgrad staging
     LongTensor bias_acc;                   // fixed-point bias grads: proj | loc | glb2 | bl | glb1 | inv1 | inv2
     IntTensor sort_local, sort_grid;       // counts | hot_map | hot_list | hot_n
     PrecisionTensor embed_wgrad, ekind_wgrad, esub_wgrad, loc_wgrad, loc_bgrad;
     PrecisionTensor glb1_wgrad, glb1_xygrad, glb1_bgrad, glb2_wgrad, glb2_bgrad;
     PrecisionTensor inv1_wgrad, inv1_bgrad, inv1s_wgrad, inv2_wgrad, inv2_bgrad;
     PrecisionTensor bl_wgrad, bl_bgrad, proj_wgrad, proj_bgrad;
+    PrecisionTensor msg_wgrad;
 };
 
 static NethackEncoderWeights* nethack_encoder_create(int obs_size, int hidden) {
@@ -971,9 +1054,14 @@ static PrecisionTensor nethack_encoder_forward(void* w, void* activations, Preci
     nh_bias_relu_kernel<<<grid_size(B * NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
         a->bl_out.data, ew->bl_b.data, B * NH_BL_HID, NH_BL_HID);
 
+    nh_msg_ids_kernel<<<grid_size(B * NH_MSG_LEN), BLOCK_SIZE, 0, stream>>>(
+        a->msg_ids.data, input.data, B);
+    nh_msg_pool_kernel<<<B, NH_MSG_HID, 0, stream>>>(
+        a->msg_out.data, ew->msg_w.data, a->msg_ids.data, B);
+
     nh_concat_kernel<<<grid_size(B * NH_CONCAT), BLOCK_SIZE, 0, stream>>>(
         a->concat.data, a->loc_out.data, a->glb_out.data, a->inv_pool.data,
-        a->bl_out.data, a->bl_feats.data, B);
+        a->bl_out.data, a->bl_feats.data, a->msg_out.data, B);
     puf_mm(&a->concat, &ew->proj_w, &a->out, stream);
     nh_bias_relu_kernel<<<grid_size(B * ew->hidden), BLOCK_SIZE, 0, stream>>>(
         a->out.data, ew->proj_b.data, B * ew->hidden, ew->hidden);
@@ -1068,6 +1156,15 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     PrecisionTensor blg = {.data = a->bl_grad.data, .shape = {B, NH_BL_HID}};
     puf_mm_tn(&blg, &a->bl_feats, &a->bl_wgrad, stream);
 
+    // Message branch: scatter (1/sqrt(count+1))*dout into the trigram embedding
+    // grad (fixed-point). Reads its grad straight off the concat-grad slice;
+    // ids saved from the forward, so no obs re-read.
+    cudaMemsetAsync(a->dmsg_acc.data, 0, (size_t)NH_MSG_VOCAB * NH_MSG_HID * sizeof(long long), stream);
+    nh_msg_bwd_kernel<<<B, NH_MSG_HID, 0, stream>>>(
+        (long long*)a->dmsg_acc.data, grad_concat.data, a->msg_ids.data, B);
+    nh_fxp_to_precision_kernel<<<grid_size(NH_MSG_VOCAB * NH_MSG_HID), BLOCK_SIZE, 0, stream>>>(
+        a->msg_wgrad.data, (long long*)a->dmsg_acc.data, NH_MSG_VOCAB * NH_MSG_HID);
+
     // Global branch to the embed table + glb1: scatter dt16 occurrences into
     // dT, then dE = dT @ W' and dW' = dT^T @ E (the fused-table backward).
     int* counts_g = a->sort_grid.data;
@@ -1151,6 +1248,7 @@ static void nethack_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t s
     cudaMemsetAsync(ew->bl_b.data, 0, numel(ew->bl_b.shape) * sizeof(precision_t), stream);
     puf_kaiming_init(&ew->proj_w, 1.0f, (*seed)++, stream);
     cudaMemsetAsync(ew->proj_b.data, 0, numel(ew->proj_b.shape) * sizeof(precision_t), stream);
+    puf_normal_init(&ew->msg_w, 1.0f, (*seed)++, stream);   // trigram embedding
 }
 
 // Param and grad registration orders must match pairwise (muon walks both flat).
@@ -1175,6 +1273,7 @@ static void nethack_encoder_reg_params(void* w, Allocator* alloc) {
     ew->bl_b    = {.shape = {NH_BL_HID}};
     ew->proj_w  = {.shape = {ew->hidden, NH_CONCAT}};
     ew->proj_b  = {.shape = {ew->hidden}};
+    ew->msg_w   = {.shape = {NH_MSG_VOCAB, NH_MSG_HID}};   // 4096x32=131072, mult of 8
     alloc_register(alloc,&ew->embed_w);
     alloc_register(alloc,&ew->ekind_w); alloc_register(alloc,&ew->esub_w);
     alloc_register(alloc,&ew->loc_w);   alloc_register(alloc,&ew->loc_b);
@@ -1186,6 +1285,7 @@ static void nethack_encoder_reg_params(void* w, Allocator* alloc) {
     alloc_register(alloc,&ew->inv2_w);  alloc_register(alloc,&ew->inv2_b);
     alloc_register(alloc,&ew->bl_w);    alloc_register(alloc,&ew->bl_b);
     alloc_register(alloc,&ew->proj_w);  alloc_register(alloc,&ew->proj_b);
+    alloc_register(alloc,&ew->msg_w);
 }
 
 static void nethack_encoder_reg_train(void* w, void* activations, Allocator* acts, Allocator* grads, int B_TT) {
@@ -1211,6 +1311,8 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     a->glb_out    = {.shape = {B_TT, NH_GLB_HID}};
     a->bl_feats   = {.shape = {B_TT, NH_BL_FEAT}};
     a->bl_out     = {.shape = {B_TT, NH_BL_HID}};
+    a->msg_ids    = {.shape = {B_TT, NH_MSG_LEN}};
+    a->msg_out    = {.shape = {B_TT, NH_MSG_HID}};
     a->concat     = {.shape = {B_TT, NH_CONCAT}};
     a->out        = {.shape = {B_TT, ew->hidden}};
     alloc_register(acts,&a->glyph_idx); alloc_register(acts,&a->crop_glyph);
@@ -1224,6 +1326,7 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     alloc_register(acts,&a->inv_pool);  alloc_register(acts,&a->inv_amax);
     alloc_register(acts,&a->loc_out);   alloc_register(acts,&a->glb_out);
     alloc_register(acts,&a->bl_feats);  alloc_register(acts,&a->bl_out);
+    alloc_register(acts,&a->msg_ids);   alloc_register(acts,&a->msg_out);
     alloc_register(acts,&a->concat);    alloc_register(acts,&a->out);
     a->loc_grad   = {.shape = {B_TT, NH_LOC_HID}};
     a->glb_grad   = {.shape = {B_TT, NH_GLB_HID}};
@@ -1239,6 +1342,7 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     a->dE_i       = {.shape = {NH_GLYPH_VOCAB, NH_EMBED_DIM}};
     a->dw2_acc    = {.shape = {NH_GLB_HID * NH_P1}};
     a->dw2i_acc   = {.shape = {NH_INV_POOL * NH_INV_HID}};
+    a->dmsg_acc   = {.shape = {NH_MSG_VOCAB * NH_MSG_HID}};
     a->sort_local = {.shape = {2 * NH_GLYPH_VOCAB + NH_HOT_T + 1}};
     a->sort_grid  = {.shape = {2 * NH_GLYPH_VOCAB + NH_HOT_G + 1}};
     a->bias_acc   = {.shape = {ew->hidden + NH_LOC_HID + NH_GLB_HID + NH_BL_HID + NH_P1 + NH_INV_HID + NH_INV_POOL}};
@@ -1250,6 +1354,7 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     alloc_register(acts,&a->dE_tmp);
     alloc_register(acts,&a->dw_perm);   alloc_register(acts,&a->dE_i);
     alloc_register(acts,&a->dw2_acc);   alloc_register(acts,&a->dw2i_acc);
+    alloc_register(acts,&a->dmsg_acc);
     alloc_register(acts,&a->sort_local); alloc_register(acts,&a->sort_grid);
     alloc_register(acts,&a->bias_acc);
     a->embed_wgrad = {.shape = {NH_GLYPH_VOCAB, NH_EMBED_DIM}};
@@ -1271,6 +1376,7 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     a->bl_bgrad    = {.shape = {NH_BL_HID}};
     a->proj_wgrad  = {.shape = {ew->hidden, NH_CONCAT}};
     a->proj_bgrad  = {.shape = {ew->hidden}};
+    a->msg_wgrad   = {.shape = {NH_MSG_VOCAB, NH_MSG_HID}};
     alloc_register(grads,&a->embed_wgrad);
     alloc_register(grads,&a->ekind_wgrad); alloc_register(grads,&a->esub_wgrad);
     alloc_register(grads,&a->loc_wgrad);   alloc_register(grads,&a->loc_bgrad);
@@ -1282,6 +1388,7 @@ static void nethack_encoder_reg_train(void* w, void* activations, Allocator* act
     alloc_register(grads,&a->inv2_wgrad);  alloc_register(grads,&a->inv2_bgrad);
     alloc_register(grads,&a->bl_wgrad);    alloc_register(grads,&a->bl_bgrad);
     alloc_register(grads,&a->proj_wgrad);  alloc_register(grads,&a->proj_bgrad);
+    alloc_register(grads,&a->msg_wgrad);
     nh_enc_last = a;
 }
 
@@ -1307,6 +1414,8 @@ static void nethack_encoder_reg_rollout(void* w, void* activations, Allocator* a
     a->glb_out    = {.shape = {B, NH_GLB_HID}};
     a->bl_feats   = {.shape = {B, NH_BL_FEAT}};
     a->bl_out     = {.shape = {B, NH_BL_HID}};
+    a->msg_ids    = {.shape = {B, NH_MSG_LEN}};
+    a->msg_out    = {.shape = {B, NH_MSG_HID}};
     a->concat     = {.shape = {B, NH_CONCAT}};
     a->out        = {.shape = {B, ew->hidden}};
     alloc_register(alloc,&a->glyph_idx); alloc_register(alloc,&a->crop_glyph);
@@ -1320,6 +1429,7 @@ static void nethack_encoder_reg_rollout(void* w, void* activations, Allocator* a
     alloc_register(alloc,&a->inv_pool);  alloc_register(alloc,&a->inv_amax);
     alloc_register(alloc,&a->loc_out);   alloc_register(alloc,&a->glb_out);
     alloc_register(alloc,&a->bl_feats);  alloc_register(alloc,&a->bl_out);
+    alloc_register(alloc,&a->msg_ids);   alloc_register(alloc,&a->msg_out);
     alloc_register(alloc,&a->concat);    alloc_register(alloc,&a->out);
     nh_enc_last = a;
 }

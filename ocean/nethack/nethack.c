@@ -36,7 +36,7 @@ static void env_close(Nethack* env) {
 #define DEMO_VOCAB   5977
 #define DEMO_EMBED   32
 #define DEMO_BL_FEAT (25 + 7 + 13 + 1 + NETHACK_NUM_ACTIONS + NETHACK_NUM_OCLASSES)
-#define DEMO_INV_HID 32
+#define DEMO_INV_HID 16   // 16-dim slot rep: pool bottleneck + decoder key (unified)
 #define DEMO_INV_FLAT (NETHACK_INV_SLOTS * DEMO_INV_HID)
 #define DEMO_INV_POOL 128
 #define DEMO_SFEAT 17    // buc4 + known+spe + quan + ero2 + flags7 + tk
