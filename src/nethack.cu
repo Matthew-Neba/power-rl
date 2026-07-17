@@ -108,11 +108,14 @@ static constexpr int NH_PAD_PER_SAMPLE = NH_TOK * NH_PCELLS - NH_MGRID;
 static constexpr int NH_HOT_G = 10;                // hot-glyph dT smem slots (10x400 int64 = 32KB)
 static constexpr int NH_BL_RAW = 27;               // NLE_BLSTATS_SIZE
 static constexpr int NH_BL_HUNGER = 21, NH_BL_CONDITION = 25;
+static constexpr int NH_BL_HP = 10, NH_BL_ENE = 14;  // hp/hpmax at 10/11, ene/enemax at 14/15
 static constexpr int NH_ACTIONS = 14;              // NETHACK_NUM_ACTIONS
 static constexpr int NH_OCLASSES = 18;             // MAXOCLASSES
 static constexpr int NH_EX_RAW = 2 + NH_OCLASSES;  // NETHACK_EXTRA_INTS
-// scalars + hunger onehot + condition bits + cooldown + prev-action onehot + counts
-static constexpr int NH_BL_FEAT = 25 + 7 + 13 + 1 + NH_ACTIONS + NH_OCLASSES;
+// scalars + hunger onehot + condition bits + cooldown + prev-action onehot +
+// counts + 2 ratios (hp_frac, ene_frac): danger salience the linear bl_w can't
+// synthesize from separate hp/hpmax scalars
+static constexpr int NH_BL_FEAT = 25 + 7 + 13 + 1 + NH_ACTIONS + NH_OCLASSES + 2;
 static constexpr int NH_BL_HID = 64;
 // Inventory entity branch: 55 slot glyphs, each embed -> shared 32->32
 // linear -> relu. The per-slot vectors are the pointer decoder's keys (slot
@@ -462,8 +465,14 @@ __global__ void nh_blstats_kernel(
             f = log1pf(fmaxf((float)nh_bl_read_i32(ex), 0.0f)) * 0.1f;
         } else if (j < 46 + NH_ACTIONS) {
             f = (j - 46 == nh_bl_read_i32(ex + 4)) ? 1.0f : 0.0f;
-        } else {
+        } else if (j < 46 + NH_ACTIONS + NH_OCLASSES) {
             f = (float)nh_bl_read_i32(ex + 4*(j - 44 - NH_ACTIONS)) * 0.125f;
+        } else {
+            // hp_frac / ene_frac in [0,1]: the "how close to death/empty" ratio
+            int base = (j == 46 + NH_ACTIONS + NH_OCLASSES) ? NH_BL_HP : NH_BL_ENE;
+            int cur = nh_bl_read_i32(src + 4*base);
+            int mx  = nh_bl_read_i32(src + 4*(base + 1));
+            f = fminf(fmaxf((float)cur / (float)(mx > 1 ? mx : 1), 0.0f), 1.0f);
         }
         dst[j] = from_float(f);
     }

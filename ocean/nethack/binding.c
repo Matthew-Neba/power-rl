@@ -40,6 +40,8 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "quaffs", log->quaffs);
     dict_set(out, "prayers", log->prayers);
     dict_set(out, "prayers_low_hp", log->prayers_low_hp);
+    dict_set(out, "prayers_starving", log->prayers_starving);
+    dict_set(out, "prayers_trouble", log->prayers_trouble);
     dict_set(out, "throws", log->throws);
     dict_set(out, "zaps", log->zaps);
     dict_set(out, "rests", log->rests);

@@ -238,7 +238,7 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
     t128 = t16 @ g2_w.T
     glb = torch.relu(t128.max(dim=1).values + g2_b)
     # blstats features
-    f = np.zeros((B, 78), dtype=np.float64)
+    f = np.zeros((B, 80), dtype=np.float64)
     j = 0
     for i in range(27):
         if i in (21, 25):
@@ -256,6 +256,11 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
         f[:, j] = (ex_vals[:, 1] == h); j += 1
     for k in range(18):
         f[:, j] = ex_vals[:, 2 + k] * 0.125; j += 1
+    # hp_frac (hp/hpmax), ene_frac (ene/enemax), clamped to [0,1]
+    hp = bl_vals[:, 10].astype(np.float64); hpmax = bl_vals[:, 11].astype(np.float64)
+    ene = bl_vals[:, 14].astype(np.float64); enemax = bl_vals[:, 15].astype(np.float64)
+    f[:, j] = np.clip(hp / np.maximum(hpmax, 1), 0, 1); j += 1
+    f[:, j] = np.clip(ene / np.maximum(enemax, 1), 0, 1); j += 1
     fb = torch.tensor(f)
     blh = torch.relu(fb @ bl_w.T + bl_b)
     # inventory entities: per-slot embed + gated state features -> 32, relu

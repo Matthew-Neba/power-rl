@@ -82,6 +82,17 @@ enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 #define NETHACK_NUM_DIRS    8
 static const int NETHACK_DIR_KEYS[NETHACK_NUM_DIRS] =
     {'k','j','h','l','y','u','b','n'};   // N S W E NW NE SW SE
+static const int NETHACK_DIR_DX[NETHACK_NUM_DIRS] = { 0, 0,-1, 1,-1, 1,-1, 1};
+static const int NETHACK_DIR_DY[NETHACK_NUM_DIRS] = {-1, 1, 0, 0,-1,-1, 1, 1};
+// wall cmap glyphs: GLYPH_CMAP_OFF(2359) + S_vwall(1)..S_trwall(11). EXCLUDES
+// S_stone(2359), which also means "unexplored" — masking it would forbid
+// legitimate exploration into unseen cells.
+#define NETHACK_WALL_GLYPH_LO 2360
+#define NETHACK_WALL_GLYPH_HI 2370
+// hunger states (hack.h): SATIATED 0, NOT_HUNGRY 1, HUNGRY 2, WEAK 3, FAINTING 4
+#define NETHACK_HUNGER_WEAK 3
+// major-trouble condition bits (botl.h BL_MASK_): STONE|SLIME|STRNGL|FOODPOIS|TERMILL
+#define NETHACK_COND_MAJOR 0x1Fu
 // stair/ladder cmap glyphs: GLYPH_CMAP_OFF(2359) + S_upstair(23)..S_dnladder(26)
 #define NETHACK_GLYPH_UPSTAIR  2382
 #define NETHACK_GLYPH_DNSTAIR  2383
@@ -131,7 +142,9 @@ typedef struct Log {
     float floor_eats;         // eats that accepted a floor "eat it?" offer
     float quaffs;             // quaff presses that drank a potion
     float prayers;
-    float prayers_low_hp;     // prayers at <=25% max HP
+    float prayers_low_hp;     // prayers at <=25% max HP (looser than real trouble)
+    float prayers_starving;   // prayers at hunger >= Weak: TROUBLE_STARVING, prayer feeds you
+    float prayers_trouble;    // prayers at a real, observable in_trouble() (pray.c)
     float throws;             // throw presses that launched an item
     float zaps;               // zap presses that fired a wand
     float rests;              // REST presses (20s occupation; game interrupts on danger)
@@ -189,6 +202,8 @@ typedef struct Stats {
     long last_maxhp;
     int  last_adj;       // hostile monsters adjacent, last obs
     long prayers_low_hp;
+    long prayers_starving;
+    long prayers_trouble;
     long floor_eats;
     long damage;
     long saturated;
@@ -411,8 +426,39 @@ static void nethack_pack_obs(Nethack* env) {
                 m[head_verb[h]] = 0;
             }
         }
-        memset(m + NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS, 1, NETHACK_NUM_DIRS);
+        // direction head (shared by MOVE/RUN/KICK/THROW/ZAP): mask a direction
+        // whose adjacent cell is a definitively-seen wall or off-map. A move
+        // there costs an RL step without advancing the game clock — 32% of a
+        // diver's steps are such no-ops, and 4% of episodes hit the 10K cap.
+        // Observable glyphs only. >=1 direction kept legal for sampling.
+        unsigned char* dirs = m + NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS;
+        memset(dirs, 1, NETHACK_NUM_DIRS);
+        long dhx = env->blstats[NLE_BL_X], dhy = env->blstats[NLE_BL_Y];
+        int nlegal = 0;
+        for (int d = 0; d < NETHACK_NUM_DIRS; d++) {
+            long c = dhx + NETHACK_DIR_DX[d], r = dhy + NETHACK_DIR_DY[d];
+            if (r < 0 || r >= NH_ROWS || c < 0 || c >= NH_COLS) { dirs[d] = 0; continue; }
+            int g = env->glyphs[r * NH_COLS + c];
+            if (g >= NETHACK_WALL_GLYPH_LO && g <= NETHACK_WALL_GLYPH_HI) dirs[d] = 0;
+            else nlegal++;
+        }
+        if (!nlegal) memset(dirs, 1, NETHACK_NUM_DIRS);   // never leave 0 legal dirs
     }
+}
+
+// NetHack's major troubles that prayer actually fixes (pray.c in_trouble),
+// restricted to what blstats exposes — HP/HPMAX/XP, hunger, condition bits, all
+// of it on the status line, so no privileged info. TROUBLE_LAVA/REGION and
+// lycanthropy aren't observable and are not covered.
+static int nethack_in_trouble(const Nethack* env) {
+    if (env->blstats[NLE_BL_HUNGER] >= NETHACK_HUNGER_WEAK) return 1;   // TROUBLE_STARVING
+    if ((unsigned)env->blstats[NLE_BL_CONDITION] & NETHACK_COND_MAJOR) return 1;  // SICK/STONED/...
+    // TROUBLE_HIT = critically_low_hp(FALSE): maxhp capped at 15*xlev, divisor by exp rank
+    long hp = env->blstats[NLE_BL_HP], hpmax = env->blstats[NLE_BL_HPMAX];
+    long xlev = env->blstats[NLE_BL_XP], hplim = 15 * xlev;
+    if (hpmax > hplim) hpmax = hplim;
+    long d = xlev <= 5 ? 5 : xlev <= 13 ? 6 : xlev <= 21 ? 7 : xlev <= 29 ? 8 : 9;
+    return hp <= 5 || hp * d <= hpmax;
 }
 
 // how = nle_obs.how_done, or -1 when truncated at the step cap
@@ -431,6 +477,8 @@ static void nethack_add_log(Nethack* env, int how) {
     env->log.quaffs          += (float)env->stats.quaffs;
     env->log.prayers         += (float)env->stats.prayers;
     env->log.prayers_low_hp  += (float)env->stats.prayers_low_hp;
+    env->log.prayers_starving += (float)env->stats.prayers_starving;
+    env->log.prayers_trouble  += (float)env->stats.prayers_trouble;
     env->log.throws          += (float)env->stats.throws;
     env->log.zaps            += (float)env->stats.zaps;
     env->log.rests           += (float)env->stats.rests;
@@ -456,13 +504,16 @@ static void nethack_add_log(Nethack* env, int how) {
     else if (how == 0) env->log.death_combat   += 1.0f;
     else if (how == 3) env->log.death_starved  += 1.0f;
     else if (how == NLE_HOW_WRATH) env->log.death_smited += 1.0f;
+    else               env->log.death_other    += 1.0f;
+    // the anatomy block is combat-only and must NOT own the else above: it used
+    // to, which made death_other mean "not combat" and silently double-count
+    // starved/smited/truncated on top of their own buckets
     if (how == 0) {
         env->log.death_mon_level    += (float)env->internal[NETHACK_INTERNAL_KILLER_MLEV];
         env->log.death_burst_turns  += (float)(env->prev_time - env->stats.last_ok_turn);
         env->log.death_adj_monsters += (float)env->stats.last_adj;
         env->log.death_maxhp        += (float)env->stats.last_maxhp;
     }
-    else               env->log.death_other    += 1.0f;
     env->log.reach_mines      += (env->stats.areas & NETHACK_AREA_MINES)      ? 1.0f : 0.0f;
     env->log.reach_minetown   += (env->stats.areas & NETHACK_AREA_MINETOWN)   ? 1.0f : 0.0f;
     env->log.reach_deep_mines += (env->stats.areas & NETHACK_AREA_DEEP_MINES) ? 1.0f : 0.0f;
@@ -759,6 +810,10 @@ void c_step(Nethack* env) {
     case NETHACK_ACT_PRAY: {
         long hp = env->blstats[NLE_BL_HP], hpmax = env->blstats[NLE_BL_HPMAX];
         if (4 * hp <= hpmax) env->stats.prayers_low_hp++;   // HP at decision time
+        // was this prayer actually useful? starving -> god feeds you; in_trouble
+        // -> god fixes it; neither -> the prayer is burnt and the timeout resets
+        if (env->blstats[NLE_BL_HUNGER] >= NETHACK_HUNGER_WEAK) env->stats.prayers_starving++;
+        if (nethack_in_trouble(env)) env->stats.prayers_trouble++;
         env->stats.prayers++;
         env->obs.action = 0x80 | 'p';
         env->ctx = nle_step(env->ctx, &env->obs);
