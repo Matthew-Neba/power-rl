@@ -57,7 +57,13 @@ static void env_close(Nethack* env) {
 #define DEMO_P1      16
 #define DEMO_GLB_IN  (DEMO_PCELLS * DEMO_EMBED)         // per-patch flatten (glyph slice)
 #define DEMO_GLB_HID 128
-#define DEMO_CONCAT  (DEMO_LOC_HID + DEMO_GLB_HID + DEMO_INV_POOL + 64 + DEMO_BL_FEAT)
+// trigram message branch, mirroring NH_MSG_* in src/nethack.cu
+#define DEMO_MSG_LEN   NETHACK_MSG_LEN
+#define DEMO_MSG_VOCAB 4096
+#define DEMO_MSG_LOG2V 12
+#define DEMO_MSG_HID   32
+#define DEMO_MSG_CONCAT_OFF (DEMO_LOC_HID + DEMO_GLB_HID + DEMO_INV_POOL + 64 + DEMO_BL_FEAT)
+#define DEMO_CONCAT  (DEMO_MSG_CONCAT_OFF + DEMO_MSG_HID)
 
 // per-blstat normalization, mirroring NH_BL_SCALE / NH_BL_ISLOG in src/nethack.cu
 static const float DEMO_BL_SCALE[27] = {
@@ -82,6 +88,7 @@ typedef struct {
     float *inv2_w, *inv2_b;     // (128, 32), (128): pooled trunk summary (max over slots)
     float *bl_w, *bl_b;         // (64, DEMO_BL_FEAT), (64)
     float *proj_w, *proj_b;     // (H, DEMO_CONCAT), (H)
+    float *msg_w;               // (4096, 32) trigram embedding table
     float *dec_lin;             // (24, H) bias-free; rows [14 verb | 8 dir | value], 23 used
     float *dec_q;               // (160, H): five stacked 32-dim query projections
     float *dec_k;               // (32, 32): key projection over slot features
@@ -94,7 +101,7 @@ typedef struct {
     float t16[DEMO_P1];
     float t128[DEMO_GLB_HID];
     float slots[DEMO_INV_FLAT]; // per-slot post-relu features (decoder keys)
-    float concat[DEMO_CONCAT];  // [local hid | global hid | inv pool | bl hidden | bl feats]
+    float concat[DEMO_CONCAT];  // [local hid | global hid | inv pool | bl hidden | bl feats | msg]
     float logits[DEMO_OD + 1];  // assembled decoder output; last entry is value
     float* hidden;              // (hidden_size)
 } NethackNet;
@@ -110,7 +117,8 @@ typedef struct {
                         + DEMO_INV_HID*DEMO_EMBED + DEMO_INV_HID \
                         + DEMO_INV_HID*DEMO_SFEAT \
                         + DEMO_INV_POOL*DEMO_INV_HID + DEMO_INV_POOL \
-                        + 64*DEMO_BL_FEAT + 64)
+                        + 64*DEMO_BL_FEAT + 64 \
+                        + DEMO_MSG_VOCAB*DEMO_MSG_HID)
 #define DEMO_DEC_FIXED (DEMO_INV_HID*DEMO_INV_HID + 8)   // k_w + tau padded 5->8
 // ambiguities are possible; prefer the fewest layers (real configs have <= 8)
 static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
@@ -157,6 +165,7 @@ static NethackNet* make_nethack_net(Weights* w) {
     net->bl_b    = get_weights_aligned(w, 64);
     net->proj_w  = get_weights_aligned(w, net->hidden_size * DEMO_CONCAT);
     net->proj_b  = get_weights_aligned(w, net->hidden_size);
+    net->msg_w   = get_weights_aligned(w, DEMO_MSG_VOCAB * DEMO_MSG_HID);
     net->dec_lin = get_weights_aligned(w, DEMO_DEC_PAD * net->hidden_size);
     net->dec_q   = get_weights_aligned(w, DEMO_QDIM * net->hidden_size);
     net->dec_k   = get_weights_aligned(w, DEMO_INV_HID * DEMO_INV_HID);
@@ -175,6 +184,31 @@ static NethackNet* make_nethack_net(Weights* w) {
                 + net->ekind_w[nh_glyph_kind[g] * DEMO_EMBED + d]
                 + net->esub_w[nh_glyph_sub[g] * DEMO_EMBED + d];
     return net;
+}
+
+static inline int demo_msg_lc(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;   // lowercase; keep spaces/punct
+}
+static inline int demo_msg_hash(int c0, int c1, int c2) {
+    unsigned key = ((unsigned)c0 << 16) | ((unsigned)c1 << 8) | (unsigned)c2;
+    return (int)((key * 2654435761u) >> (32 - DEMO_MSG_LOG2V));
+}
+// normalized-sum trigram bag over the null-terminated topline; scaled by
+// 1/sqrt(count+1), no relu (raw signed summary)
+static void demo_msg_pool(NethackNet* net, const unsigned char* obs, float* out) {
+    const unsigned char* m = obs + NETHACK_OFF_MSG;
+    for (int d = 0; d < DEMO_MSG_HID; d++) out[d] = 0.0f;
+    int count = 0;
+    for (int t = 0; t <= DEMO_MSG_LEN - 3; t++) {
+        int c0 = m[t], c1 = m[t + 1], c2 = m[t + 2];
+        if (c0 == 0 || c1 == 0 || c2 == 0) break;
+        int id = demo_msg_hash(demo_msg_lc(c0), demo_msg_lc(c1), demo_msg_lc(c2));
+        count++;
+        for (int d = 0; d < DEMO_MSG_HID; d++)
+            out[d] += net->msg_w[(size_t)id * DEMO_MSG_HID + d];
+    }
+    float scale = 1.0f / sqrtf((float)count + 1.0f);
+    for (int d = 0; d < DEMO_MSG_HID; d++) out[d] *= scale;
 }
 
 static int demo_glyph_at(const int16_t* glyphs, int r, int c) {
@@ -288,6 +322,8 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {   //
     _linear(f, net->bl_w, net->bl_b, blout, 1, DEMO_BL_FEAT, 64);
     _relu(blout, blout, 64);
 
+    demo_msg_pool(net, obs, net->concat + DEMO_MSG_CONCAT_OFF);
+
     _linear(net->concat, net->proj_w, net->proj_b, net->hidden, 1, DEMO_CONCAT, net->hidden_size);
     _relu(net->hidden, net->hidden, net->hidden_size);
 
@@ -351,23 +387,33 @@ static void demo_sample(NethackNet* net, const unsigned char* mask, float* out_a
 }
 
 static void run_demo(long max_steps, int frame_ms) {
-    Weights* w = load_weights("resources/nethack/nethack_weights.bin");
+    const char* wpath = getenv("NH_WEIGHTS");
+    if (!wpath) wpath = "resources/nethack/nethack_weights.bin";
+    Weights* w = load_weights((char*)wpath);
     if (!w) {
-        fprintf(stderr, "nethack demo: resources/nethack/nethack_weights.bin missing.\n"
+        fprintf(stderr, "nethack demo: %s missing.\n"
                 "Train first, then copy a checkpoint:\n"
-                "  cp checkpoints/nethack/<run>/<final>.bin resources/nethack/nethack_weights.bin\n");
+                "  cp checkpoints/nethack/<run>/<final>.bin resources/nethack/nethack_weights.bin\n",
+                wpath);
         exit(1);
     }
     NethackNet* net = make_nethack_net(w);
 
     Nethack env;
     env_open(&env);
-    srand((unsigned)time(NULL));
+    const char* seed_env = getenv("NH_SEED");   // fixed seed pairs A/B sampling
+    srand(seed_env ? (unsigned)strtoul(seed_env, NULL, 10) : (unsigned)time(NULL));
 
     long max_dlvl = 1;
     long acts[NETHACK_NUM_ACTIONS] = {0};
     float ep_score = 0.0f, ep_len = 0.0f;   // log totals at last episode end
+    float p_comb=0, p_starv=0, p_smite=0, p_trunc=0, p_mdep=0, p_xp=0,
+          p_klvl=0, p_mhp=0, p_adj=0, p_burst=0;   // per-episode death deltas
     float acts_f[DEMO_NUM_HEADS];
+    const int keep_state = getenv("NH_KEEP_STATE") != NULL;
+    const char* max_ep_env = getenv("NH_MAX_EPISODES");
+    const long max_episodes = max_ep_env ? strtol(max_ep_env, NULL, 10) : 0;   // 0 = unbounded
+    long nep = 0;
     for (long t = 0; t < max_steps; t++) {
         nethack_net_forward(net, env.observations);
         demo_sample(net, env.action_mask, acts_f);
@@ -386,13 +432,27 @@ static void run_demo(long max_steps, int frame_ms) {
         }
         if (env.terminals[0] > 0.5f) {
             // c_step already reset the env; per-episode values via log deltas
-            fprintf(stderr, "episode end: score=%.0f len=%.0f\n",
-                    env.log.score - ep_score, env.log.episode_length - ep_len);
+            float dc=env.log.death_combat-p_comb, dst=env.log.death_starved-p_starv,
+                  dsm=env.log.death_smited-p_smite, dtr=env.log.truncated-p_trunc;
+            const char* how = dc>0.5f?"combat": dst>0.5f?"starved":
+                              dsm>0.5f?"smited": dtr>0.5f?"trunc":"other";
+            fprintf(stderr, "episode end: score=%.0f len=%.0f how=%s mdepth=%.0f xp=%.0f "
+                    "klvl=%.0f maxhp=%.0f adj=%.0f burst=%.0f\n",
+                    env.log.score - ep_score, env.log.episode_length - ep_len, how,
+                    env.log.max_depth - p_mdep, env.log.max_xp_level - p_xp,
+                    env.log.death_mon_level - p_klvl, env.log.death_maxhp - p_mhp,
+                    env.log.death_adj_monsters - p_adj, env.log.death_burst_turns - p_burst);
             ep_score = env.log.score;
             ep_len = env.log.episode_length;
-            if (!getenv("NH_KEEP_STATE"))
+            p_comb=env.log.death_combat; p_starv=env.log.death_starved;
+            p_smite=env.log.death_smited; p_trunc=env.log.truncated;
+            p_mdep=env.log.max_depth; p_xp=env.log.max_xp_level;
+            p_klvl=env.log.death_mon_level; p_mhp=env.log.death_maxhp;
+            p_adj=env.log.death_adj_monsters; p_burst=env.log.death_burst_turns;
+            if (!keep_state)
                 memset(net->mingru->state, 0,
                        (size_t)net->num_layers * net->hidden_size * sizeof(float));
+            if (max_episodes && ++nep >= max_episodes) break;
         }
     }
     fprintf(stderr, "actions:");

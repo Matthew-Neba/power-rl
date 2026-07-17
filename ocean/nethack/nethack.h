@@ -82,6 +82,11 @@ enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 #define NETHACK_NUM_DIRS    8
 static const int NETHACK_DIR_KEYS[NETHACK_NUM_DIRS] =
     {'k','j','h','l','y','u','b','n'};   // N S W E NW NE SW SE
+// stair/ladder cmap glyphs: GLYPH_CMAP_OFF(2359) + S_upstair(23)..S_dnladder(26)
+#define NETHACK_GLYPH_UPSTAIR  2382
+#define NETHACK_GLYPH_DNSTAIR  2383
+#define NETHACK_GLYPH_UPLADDER 2384
+#define NETHACK_GLYPH_DNLADDER 2385
 
 enum {
     NETHACK_ACT_MOVE     = 0,
@@ -368,6 +373,19 @@ static void nethack_pack_obs(Nethack* env) {
         unsigned char* m = env->action_mask;
         memset(m, 1, NETHACK_NUM_ACTIONS);
         if (env->blstats[NLE_BL_HUNGER] == 0) m[NETHACK_ACT_EAT] = 0;
+        // DOWN/UP are no-ops unless standing on the matching stairs/ladder. Left
+        // unmasked, off-stairs DOWN is a wasted turn the policy drives to ~zero
+        // probability (measured: 3 picks / 26300 in a farming policy vs 5455 in a
+        // diving one), so it won't press '>' even when ON a staircase. Gating it
+        // removes that suppression signal. underfoot_glyphs=1 puts the terrain
+        // under the hero in the obs -> observable, no privileged info.
+        long hx = env->blstats[NLE_BL_X], hy = env->blstats[NLE_BL_Y];
+        int gu = (hx >= 0 && hx < NH_COLS && hy >= 0 && hy < NH_ROWS)
+               ? env->glyphs[hy * NH_COLS + hx] : -1;
+        if (gu != NETHACK_GLYPH_DNSTAIR && gu != NETHACK_GLYPH_DNLADDER)
+            m[NETHACK_ACT_DOWN] = 0;
+        if (gu != NETHACK_GLYPH_UPSTAIR && gu != NETHACK_GLYPH_UPLADDER)
+            m[NETHACK_ACT_UP] = 0;
         // REST is legal at any HP: full-HP resting to bank turns is a valid
         // score-farming strategy under the score objective, not an exploit.
         static const int head_oc[5] = {3, 7, 8, 2, 11};   // wear, eat, quaff, throw, zap
