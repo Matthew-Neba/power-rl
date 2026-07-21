@@ -1,9 +1,13 @@
 #include "nethack.h"
 #define OBS_SIZE NETHACK_OBS_SIZE
-#define NUM_ATNS 7
-#define ACT_SIZES {NETHACK_NUM_ACTIONS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_NUM_DIRS}
+#define NUM_ATNS 14
+#define ACT_SIZES {NETHACK_NUM_ACTIONS, \
+    NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, \
+    NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, \
+    NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, \
+    NETHACK_NUM_DIRS}
 #define OBS_TENSOR_T ByteTensor
-#define MY_ACTION_MASK (NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS)
+#define MY_ACTION_MASK (NETHACK_NUM_ACTIONS + 12 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS)
 
 #define Env Nethack
 #include "vecenv.h"
@@ -20,6 +24,9 @@ void my_init(Env* env, Dict* kwargs) {
     env->hunger_coef = dict_get(kwargs, "hunger_coef")->value;
     env->illegal_penalty = dict_get(kwargs, "illegal_penalty")->value;
     env->death_penalty = dict_get(kwargs, "death_penalty")->value;
+    env->ac_coef = dict_get(kwargs, "ac_coef")->value;
+    env->heal_coef = dict_get(kwargs, "heal_coef")->value;
+    env->status_coef = dict_get(kwargs, "status_coef")->value;
 }
 
 void my_log(Log* log, Dict* out) {
@@ -44,6 +51,14 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "prayers_trouble", log->prayers_trouble);
     dict_set(out, "throws", log->throws);
     dict_set(out, "zaps", log->zaps);
+    dict_set(out, "pickups", log->pickups);
+    dict_set(out, "takeoffs", log->takeoffs);
+    dict_set(out, "putons", log->putons);
+    dict_set(out, "removes", log->removes);
+    dict_set(out, "wields", log->wields);
+    dict_set(out, "applies", log->applies);
+    dict_set(out, "reads", log->reads);
+    dict_set(out, "drops", log->drops);
     dict_set(out, "rests", log->rests);
     dict_set(out, "use_slot_mean", log->use_slot_mean);
     dict_set(out, "valid_slot_mean", log->valid_slot_mean);
@@ -52,6 +67,11 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "burdened_frac", log->burdened_frac);
     dict_set(out, "pack_full_frac", log->pack_full_frac);
     dict_set(out, "damage_taken", log->damage_taken);
+    dict_set(out, "ac", log->ac);
+    dict_set(out, "min_ac", log->min_ac);
+    dict_set(out, "swaps", log->swaps);
+    dict_set(out, "heal_hp", log->heal_hp);
+    dict_set(out, "cures", log->cures);
     dict_set(out, "reward_saturated", log->reward_saturated);
     dict_set(out, "game_time", log->game_time);
     dict_set(out, "max_xp_level", log->max_xp_level);

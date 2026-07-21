@@ -109,13 +109,16 @@ static constexpr int NH_HOT_G = 10;                // hot-glyph dT smem slots (1
 static constexpr int NH_BL_RAW = 27;               // NLE_BLSTATS_SIZE
 static constexpr int NH_BL_HUNGER = 21, NH_BL_CONDITION = 25;
 static constexpr int NH_BL_HP = 10, NH_BL_ENE = 14;  // hp/hpmax at 10/11, ene/enemax at 14/15
-static constexpr int NH_ACTIONS = 14;              // NETHACK_NUM_ACTIONS
+static constexpr int NH_ACTIONS = 22;              // NETHACK_NUM_ACTIONS
 static constexpr int NH_OCLASSES = 18;             // MAXOCLASSES
 static constexpr int NH_EX_RAW = 2 + NH_OCLASSES;  // NETHACK_EXTRA_INTS
 // scalars + hunger onehot + condition bits + cooldown + prev-action onehot +
 // counts + 2 ratios (hp_frac, ene_frac): danger salience the linear bl_w can't
 // synthesize from separate hp/hpmax scalars
-static constexpr int NH_BL_FEAT = 25 + 7 + 13 + 1 + NH_ACTIONS + NH_OCLASSES + 2;
+// + 8 = dnum one-hot: dungeon branch is nominal (0 main, 2 mines, 4 soko...);
+// the scalar imposed fake ordinality, its scale is zeroed
+static constexpr int NH_BL_FEAT = 25 + 7 + 13 + 1 + NH_ACTIONS + NH_OCLASSES + 2 + 8;
+static constexpr int NH_BL_DNUM = 23;
 static constexpr int NH_BL_HID = 64;
 // Inventory entity branch: 55 slot glyphs, each embed -> shared 32->32
 // linear -> relu. The per-slot vectors are the pointer decoder's keys (slot
@@ -213,7 +216,7 @@ __constant__ float NH_BL_SCALE[NH_BL_RAW] = {
     1.f/100, 1.f/100, 1.f/10, 1.f/10, 1.f/30,        // ene, enemax, ac, hd, xp level
     0.1f, 0.1f,                                      // exp points, time (log)
     0.f,                                             // hunger (expanded)
-    1.f/4, 1.f/10, 1.f/50,                           // cap, dnum, dlevel
+    1.f/4, 0.f, 1.f/50,                              // cap, dnum (one-hot), dlevel
     0.f,                                             // condition (expanded)
     1.f,                                             // align
 };
@@ -467,14 +470,19 @@ __global__ void nh_blstats_kernel(
             f = (j - 46 == nh_bl_read_i32(ex + 4)) ? 1.0f : 0.0f;
         } else if (j < 46 + NH_ACTIONS + NH_OCLASSES) {
             f = (float)nh_bl_read_i32(ex + 4*(j - 44 - NH_ACTIONS)) * 0.125f;
-        } else {
+        } else if (j < 48 + NH_ACTIONS + NH_OCLASSES) {
             // hp_frac / ene_frac in [0,1]: the "how close to death/empty" ratio
             int base = (j == 46 + NH_ACTIONS + NH_OCLASSES) ? NH_BL_HP : NH_BL_ENE;
             int cur = nh_bl_read_i32(src + 4*base);
             int mx  = nh_bl_read_i32(src + 4*(base + 1));
             f = fminf(fmaxf((float)cur / (float)(mx > 1 ? mx : 1), 0.0f), 1.0f);
+        } else {
+            int v = nh_bl_read_i32(src + 4*NH_BL_DNUM);
+            f = (j - (48 + NH_ACTIONS + NH_OCLASSES) == max(0, min(v, 7))) ? 1.0f : 0.0f;
         }
-        dst[j] = from_float(f);
+        // strict [-1,1]: bounds deep-play excursions (AC -15 -> -1.5, hp 300 ->
+        // 1.5, stacked inv counts) — validated neutral-now, deep-safe (n=4)
+        dst[j] = from_float(fminf(fmaxf(f, -1.0f), 1.0f));
     }
 }
 
@@ -1477,17 +1485,17 @@ static void create_nethack_encoder(Encoder* enc) {
 // every item use trains the same projections.
 
 static constexpr int NH_DIRS    = 8;
-static constexpr int NH_HEADS   = 5;                                 // wear|eat|quaff|throw|zap
-static constexpr int NH_SLOT_OD = NH_HEADS * NH_INV;                 // 275 slot logits
-static constexpr int NH_DEC_OD  = NH_ACTIONS + NH_SLOT_OD + NH_DIRS; // 297 logits
-static constexpr int NH_DEC_LIN = NH_ACTIONS + NH_DIRS + 1;          // verb|dir|value rows
-static constexpr int NH_DEC_PAD = 24;                                // lin rows padded (cublasLt alignment)
+static constexpr int NH_HEADS   = 12;                                // wear|eat|quaff|throw|zap|takeoff|puton|remove|wield|apply|read|drop
+static constexpr int NH_SLOT_OD = NH_HEADS * NH_INV;                 // 660 slot logits
+static constexpr int NH_DEC_OD  = NH_ACTIONS + NH_SLOT_OD + NH_DIRS; // 690 logits
+static constexpr int NH_DEC_LIN = NH_ACTIONS + NH_DIRS + 1;          // 31 verb|dir|value rows
+static constexpr int NH_DEC_PAD = 32;                                // lin rows padded to mult of 8 (cublasLt alignment)
 static constexpr int NH_QDIM    = NH_HEADS * NH_INV_HID;             // stacked queries
 // tau is padded to 8 entries (first NH_HEADS live): checkpoints are saved
 // compactly and the puffernet loader assumes every tensor is a multiple of
 // 8 floats (16-byte bf16 alignment). Pad slots are dead but NOT frozen
 // (optimizer weight decay can drift them from init) — never read.
-static constexpr int NH_TAU_PAD = 8;
+static constexpr int NH_TAU_PAD = 16;
 
 struct NethackDecoderWeights {
     // Header mirrors DecoderWeights EXACTLY: the framework casts decoder

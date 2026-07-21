@@ -16,6 +16,8 @@
 
 // nletypes.h, not nle.h: nle.h's `settings` macro would rewrite env->settings
 #include "nletypes.h"
+// baked object-type -> armor slot (ARM_*), for atomic WEAR swap; -1 if not armor
+#include "nethack_obj_armcat.h"
 
 extern nle_ctx_t* nle_start(nle_obs*, FILE*, nle_settings*);
 extern nle_ctx_t* nle_step(nle_ctx_t*, nle_obs*);
@@ -75,10 +77,11 @@ extern void       nle_end(nle_ctx_t*);
 // nle_obs.misc[] prompt-state flags
 enum { NETHACK_MISC_YN = 0, NETHACK_MISC_GETLIN = 1, NETHACK_MISC_XWAIT = 2 };
 
-// Factored action space: verb head (12) + item-slot head (55) + direction
-// head (8, vi-key order). MOVE/RUN/KICK/THROW consume the direction; the
-// direction head trains dense on every move, so directional verbs inherit it.
-#define NETHACK_NUM_ACTIONS 14
+// Factored action space: verb head (22) + 12 item-slot heads (55 each, one per
+// item-verb) + direction head (8, vi-key order). MOVE/RUN/KICK/THROW consume
+// the direction; the direction head trains dense on every move, so directional
+// verbs inherit it.
+#define NETHACK_NUM_ACTIONS 22
 #define NETHACK_NUM_DIRS    8
 static const int NETHACK_DIR_KEYS[NETHACK_NUM_DIRS] =
     {'k','j','h','l','y','u','b','n'};   // N S W E NW NE SW SE
@@ -93,11 +96,17 @@ static const int NETHACK_DIR_DY[NETHACK_NUM_DIRS] = {-1, 1, 0, 0,-1,-1, 1, 1};
 #define NETHACK_HUNGER_WEAK 3
 // major-trouble condition bits (botl.h BL_MASK_): STONE|SLIME|STRNGL|FOODPOIS|TERMILL
 #define NETHACK_COND_MAJOR 0x1Fu
+#define NETHACK_COND_BAD   0x3FFu  // all afflictions STONE..HALLU; excludes LEV/FLY/RIDE
 // stair/ladder cmap glyphs: GLYPH_CMAP_OFF(2359) + S_upstair(23)..S_dnladder(26)
 #define NETHACK_GLYPH_UPSTAIR  2382
 #define NETHACK_GLYPH_DNSTAIR  2383
 #define NETHACK_GLYPH_UPLADDER 2384
 #define NETHACK_GLYPH_DNLADDER 2385
+// object glyphs occupy [GLYPH_OBJ_OFF, GLYPH_CMAP_OFF) = [1906, 2359): with
+// underfoot_glyphs, an object on the hero tile shows here (vobj_at wins over
+// terrain). PICKUP legality + the "is an item hiding my stairs?" test key off it.
+#define NETHACK_GLYPH_OBJ_LO 1906
+#define NETHACK_GLYPH_OBJ_HI 2359
 
 enum {
     NETHACK_ACT_MOVE     = 0,
@@ -114,6 +123,14 @@ enum {
     NETHACK_ACT_THROW    = 11,
     NETHACK_ACT_ZAP      = 12,
     NETHACK_ACT_REST     = 13,
+    NETHACK_ACT_PICKUP   = 14,   // no slot: grab the pile underfoot (beyond narrow autopickup)
+    NETHACK_ACT_TAKEOFF  = 15,
+    NETHACK_ACT_PUTON    = 16,
+    NETHACK_ACT_REMOVE   = 17,
+    NETHACK_ACT_WIELD    = 18,
+    NETHACK_ACT_APPLY    = 19,
+    NETHACK_ACT_READ     = 20,
+    NETHACK_ACT_DROP     = 21,
 };
 
 // !status_updates skips the status renderer + recalc_mapseen (~25% of engine)
@@ -147,6 +164,14 @@ typedef struct Log {
     float prayers_trouble;    // prayers at a real, observable in_trouble() (pray.c)
     float throws;             // throw presses that launched an item
     float zaps;               // zap presses that fired a wand
+    float pickups;            // ',' presses that grabbed the pile underfoot
+    float takeoffs;           // T presses that removed a worn armor piece
+    float putons;             // P presses that donned a ring/amulet
+    float removes;            // R presses that removed a worn ring/amulet
+    float wields;             // w presses that (un)wielded a weapon
+    float applies;            // a presses that applied a tool (dig / horn / lamp)
+    float reads;              // r presses that read a scroll/spellbook
+    float drops;              // d presses that dropped an item
     float rests;              // REST presses (20s occupation; game interrupts on danger)
     // slot position-dependence diagnostic: if uses sit far below where valid
     // items live, the flat slot head isn't generalizing across positions
@@ -158,6 +183,11 @@ typedef struct Log {
     float burdened_frac;      // steps with encumbrance > Unencumbered
     float pack_full_frac;     // steps with the autopickup "carrying too much" refusal
     float damage_taken;
+    float ac;                 // mean armor class over the episode (lower = better)
+    float min_ac;             // best (lowest) AC reached this episode
+    float swaps;              // atomic WEAR swaps (auto-takeoff + wear in one step)
+    float heal_hp;            // HP restored by heal actions (quaff/pray) this episode
+    float cures;              // bad conditions cleared this episode
     float reward_saturated;   // fraction of steps with |reward| > 1
     float game_time;          // NetHack turns survived
     float max_xp_level;
@@ -194,6 +224,11 @@ typedef struct Stats {
     long prayers;
     long throws;
     long zaps;
+    long pickups, takeoffs, putons, removes, wields, applies, reads, drops;
+    long swaps;               // atomic WEAR that auto-took-off an occupant
+    long heal_hp;             // HP restored by heal actions (quaff/pray)
+    long cures;               // bad conditions cleared
+    int  min_ac;              // best (lowest) AC reached this episode
     long rests;
     long regen_ticks, ups_hurt, burdened_steps, pack_full;
     long use_slot_sum, use_cnt;       // slot indices of successful item uses
@@ -206,6 +241,7 @@ typedef struct Stats {
     long prayers_trouble;
     long floor_eats;
     long damage;
+    long ac_sum;            // sum of AC over living steps; mean = ac_sum/length
     long saturated;
     int max_depth;
     int max_xp;
@@ -258,6 +294,8 @@ typedef struct Nethack {
     long prev_hunger;   // clamped to [1,6]; Satiated counts as NotHungry
     long prev_time;
     int prev_depth;
+    long prev_ac;       // armor class (lower=better); reward Delta-AC potential
+    int  prev_bad_cond; // popcount of bad condition bits, prev step (status potential)
     unsigned int rng;   // required by vecenv.h (seeded with env index)
 
     // reward coefs from config/nethack.ini, 0 disables a term. gold/exp/descent
@@ -274,6 +312,9 @@ typedef struct Nethack {
     float hunger_coef;
     float illegal_penalty;
     float death_penalty;
+    float ac_coef;       // Delta-AC potential: equipping armor (AC drops) pays
+    float heal_coef;     // gain-only: HP restored by a heal action (quaff/pray)
+    float status_coef;   // status-affliction potential: curing bad conditions pays
 
     // advanced each reset; NetHack's own seeding can hang mklev/topologize
     unsigned long seed;
@@ -379,51 +420,72 @@ static void nethack_pack_obs(Nethack* env) {
     memcpy(mv, env->message, mlen);
     if (mlen < (size_t)NETHACK_MSG_LEN) memset(mv + mlen, 0, NETHACK_MSG_LEN - mlen);
 
-    // action mask, aligned with this obs: verbs all legal except EAT while
-    // Satiated; four PER-VERB slot heads, each legal only for its own item
-    // class (wear=armor 3, eat=food 7, quaff=potion 8, throw=weapon 2) —
-    // verb-conditioned selection with class-tight masks. The prompt-answer
-    // path still ESCs residual mismatches (worn armor, carried corpses).
+    // action mask, aligned with this obs. LEGALITY only (human-observable
+    // state), never strategy: each item-verb slot head is legal iff a carried
+    // item of its class is in the right worn state; PICKUP iff an object sits
+    // underfoot; DOWN/UP iff on the matching stairs. 12 slot heads: wear/eat/
+    // quaff/throw/zap + takeoff/puton/remove/wield/apply/read/drop. The prompt-
+    // answer path still ESCs residual mismatches.
     if (env->action_mask != NULL) {
         unsigned char* m = env->action_mask;
         memset(m, 1, NETHACK_NUM_ACTIONS);
         if (env->blstats[NLE_BL_HUNGER] == 0) m[NETHACK_ACT_EAT] = 0;
-        // DOWN/UP are no-ops unless standing on the matching stairs/ladder. Left
-        // unmasked, off-stairs DOWN is a wasted turn the policy drives to ~zero
-        // probability (measured: 3 picks / 26300 in a farming policy vs 5455 in a
-        // diving one), so it won't press '>' even when ON a staircase. Gating it
-        // removes that suppression signal. underfoot_glyphs=1 puts the terrain
-        // under the hero in the obs -> observable, no privileged info.
+        // underfoot glyph: with underfoot_glyphs an object on the hero tile wins
+        // over terrain (vobj_at). DOWN/UP are strictly stair-gated: an object
+        // covering the stairs masks them until PICKUP clears it (PICKUP is legal
+        // there, so descent is never wedged). Observable, no privileged info.
         long hx = env->blstats[NLE_BL_X], hy = env->blstats[NLE_BL_Y];
         int gu = (hx >= 0 && hx < NH_COLS && hy >= 0 && hy < NH_ROWS)
                ? env->glyphs[hy * NH_COLS + hx] : -1;
+        int gu_obj = (gu >= NETHACK_GLYPH_OBJ_LO && gu < NETHACK_GLYPH_OBJ_HI);
+        int gu_corpse = (gu >= NETHACK_GLYPH_BODY_OFF
+                         && gu < NETHACK_GLYPH_BODY_OFF + NETHACK_NUMMONS);
         if (gu != NETHACK_GLYPH_DNSTAIR && gu != NETHACK_GLYPH_DNLADDER)
             m[NETHACK_ACT_DOWN] = 0;
         if (gu != NETHACK_GLYPH_UPSTAIR && gu != NETHACK_GLYPH_UPLADDER)
             m[NETHACK_ACT_UP] = 0;
+        if (!gu_obj && !gu_corpse) m[NETHACK_ACT_PICKUP] = 0;
         // REST is legal at any HP: full-HP resting to bank turns is a valid
         // score-farming strategy under the score objective, not an exploit.
-        static const int head_oc[5] = {3, 7, 8, 2, 11};   // wear, eat, quaff, throw, zap
-        static const int head_verb[5] = {NETHACK_ACT_WEAR, NETHACK_ACT_EAT,
-            NETHACK_ACT_QUAFF, NETHACK_ACT_THROW, NETHACK_ACT_ZAP};
-        for (int h = 0; h < 5; h++) {
+        // per-head class masks: oclass bitmask + worn requirement
+        // (0=any, 1=must-worn, 2=must-unworn). worn bit = inv_state[i] byte 5 &1.
+        static const unsigned int head_ocmask[12] = {
+            1u<<3, 1u<<7, 1u<<8, 1u<<2, 1u<<11,        // wear eat quaff throw zap
+            1u<<3, (1u<<4)|(1u<<5), (1u<<4)|(1u<<5),    // takeoff puton remove
+            1u<<2, 1u<<6, (1u<<9)|(1u<<10), 0x3FFFFu,   // wield apply read drop
+        };
+        static const int head_wornreq[12] = {2,0,0,0,0, 1,2,1, 0,0,0,2};
+        static const int head_verb[12] = {
+            NETHACK_ACT_WEAR, NETHACK_ACT_EAT, NETHACK_ACT_QUAFF,
+            NETHACK_ACT_THROW, NETHACK_ACT_ZAP, NETHACK_ACT_TAKEOFF,
+            NETHACK_ACT_PUTON, NETHACK_ACT_REMOVE, NETHACK_ACT_WIELD,
+            NETHACK_ACT_APPLY, NETHACK_ACT_READ, NETHACK_ACT_DROP,
+        };
+        for (int h = 0; h < 12; h++) {
             unsigned char* s = m + NETHACK_NUM_ACTIONS + h * NETHACK_INV_SLOTS;
             memset(s, 0, NETHACK_INV_SLOTS);
             int any = 0;
             for (int i = 0; i < NETHACK_INV_SLOTS && env->inv_letters[i]; i++) {
                 int oc = env->inv_oclasses[i];
                 if (oc >= NETHACK_NUM_OCLASSES) break;
-                if (oc == head_oc[h]) {
-                    s[i] = 1; any = 1;
-                    env->stats.valid_slot_sum += i; env->stats.valid_cnt++;
-                }
+                if (!(head_ocmask[h] & (1u << oc))) continue;
+                int worn = env->inv_state[i * NLE_INV_STATE_FIELDS + 5] & 1;
+                if (head_wornreq[h] == 1 && !worn) continue;
+                if (head_wornreq[h] == 2 && worn) continue;
+                s[i] = 1; any = 1;
+                env->stats.valid_slot_sum += i; env->stats.valid_cnt++;
             }
             if (!any) {
                 s[0] = 1;   // sampling needs >=1 legal entry per head
-                // no usable item -> the verb itself is illegal: an ESC'd
-                // prompt is a zero-turn no-op the policy spams as an idle
-                // button once other free waits are masked
-                m[head_verb[h]] = 0;
+                // no usable item -> the verb is illegal (ESC'd prompt is a
+                // zero-turn no-op the policy spams as an idle button). EAT is the
+                // exception: floor food/corpses underfoot are edible with an
+                // empty food inventory, so keep EAT legal when standing on them.
+                if (head_verb[h] == NETHACK_ACT_EAT) {
+                    if (!gu_obj && !gu_corpse) m[NETHACK_ACT_EAT] = 0;
+                } else {
+                    m[head_verb[h]] = 0;
+                }
             }
         }
         // direction head (shared by MOVE/RUN/KICK/THROW/ZAP): mask a direction
@@ -431,7 +493,7 @@ static void nethack_pack_obs(Nethack* env) {
         // there costs an RL step without advancing the game clock — 32% of a
         // diver's steps are such no-ops, and 4% of episodes hit the 10K cap.
         // Observable glyphs only. >=1 direction kept legal for sampling.
-        unsigned char* dirs = m + NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS;
+        unsigned char* dirs = m + NETHACK_NUM_ACTIONS + 12 * NETHACK_INV_SLOTS;
         memset(dirs, 1, NETHACK_NUM_DIRS);
         long dhx = env->blstats[NLE_BL_X], dhy = env->blstats[NLE_BL_Y];
         int nlegal = 0;
@@ -481,9 +543,23 @@ static void nethack_add_log(Nethack* env, int how) {
     env->log.prayers_trouble  += (float)env->stats.prayers_trouble;
     env->log.throws          += (float)env->stats.throws;
     env->log.zaps            += (float)env->stats.zaps;
+    env->log.pickups         += (float)env->stats.pickups;
+    env->log.takeoffs        += (float)env->stats.takeoffs;
+    env->log.putons          += (float)env->stats.putons;
+    env->log.removes         += (float)env->stats.removes;
+    env->log.wields          += (float)env->stats.wields;
+    env->log.applies         += (float)env->stats.applies;
+    env->log.reads           += (float)env->stats.reads;
+    env->log.drops           += (float)env->stats.drops;
     env->log.rests           += (float)env->stats.rests;
     env->log.floor_eats      += (float)env->stats.floor_eats;
     env->log.damage_taken    += (float)env->stats.damage;
+    env->log.ac += env->stats.length > 0
+        ? (float)env->stats.ac_sum / (float)env->stats.length : 0.0f;
+    env->log.min_ac += (float)env->stats.min_ac;
+    env->log.swaps  += (float)env->stats.swaps;
+    env->log.heal_hp += (float)env->stats.heal_hp;
+    env->log.cures   += (float)env->stats.cures;
     env->log.regen_ticks += (float)env->stats.regen_ticks;
     env->log.ups_hurt    += (float)env->stats.ups_hurt;
     env->log.burdened_frac += env->stats.length > 0
@@ -554,11 +630,14 @@ static void nethack_do_reset(Nethack* env) {
     if (env->prev_hunger < 1) env->prev_hunger = 1;
     else if (env->prev_hunger > 6) env->prev_hunger = 6;
     env->prev_depth = (int)env->blstats[NLE_BL_DEPTH];
+    env->prev_ac = env->blstats[NLE_BL_AC];
+    env->prev_bad_cond = __builtin_popcount((unsigned)env->blstats[NLE_BL_CONDITION] & NETHACK_COND_BAD);
     env->prev_time = env->blstats[NLE_BL_TIME];
     env->prev_action = -1;
     memset(&env->stats, 0, sizeof(env->stats));
     env->stats.max_depth = env->prev_depth;
     env->stats.max_xp = (int)env->blstats[NLE_BL_XP];
+    env->stats.min_ac = (int)env->blstats[NLE_BL_AC];
     nethack_pack_obs(env);
 }
 
@@ -635,8 +714,32 @@ static float nethack_shaped_reward(Nethack* env, int illegal) {
 
     // HP potential: heals repay damage; the death step cashes out the rest
     long hp = env->blstats[NLE_BL_HP];
-    r += env->hp_coef * (float)(hp - env->prev_hp);
+    long hp_delta = hp - env->prev_hp;
+    r += env->hp_coef * (float)hp_delta;
+    // heal-throughput: gain-only credit for HP restored by a heal action
+    // (quaff/pray). gain-only sidesteps the symmetric-HP cowardice (penalizing
+    // combat damage -> turtling). prev_action == current verb here (set pre-reward).
+    if (hp_delta > 0 && (env->prev_action == NETHACK_ACT_QUAFF
+                      || env->prev_action == NETHACK_ACT_PRAY)) {
+        r += env->heal_coef * (float)hp_delta;
+        env->stats.heal_hp += hp_delta;
+    }
     env->prev_hp = hp;
+
+    // AC potential: lower AC is better, so equipping armor (AC drops) pays.
+    // Monk's unarmored intrinsic is baked into AC, so the net effect is captured.
+    long ac = env->blstats[NLE_BL_AC];
+    r += env->ac_coef * (float)(env->prev_ac - ac);
+    env->prev_ac = ac;
+    env->stats.ac_sum += ac;   // log-only: accumulate for mean AC over the episode
+    if ((int)ac < env->stats.min_ac) env->stats.min_ac = (int)ac;
+
+    // status-affliction potential: curing bad conditions pays, contracting them
+    // costs (symmetric); lights up APPLY(unicorn horn)/PRAY/QUAFF-cure
+    int bad_cond = __builtin_popcount((unsigned)env->blstats[NLE_BL_CONDITION] & NETHACK_COND_BAD);
+    r += env->status_coef * (float)(env->prev_bad_cond - bad_cond);
+    if (bad_cond < env->prev_bad_cond) env->stats.cures += env->prev_bad_cond - bad_cond;
+    env->prev_bad_cond = bad_cond;
 
     // hunger potential, linear below NotHungry (Satiated == NotHungry, so
     // overeating toward choke earns nothing): eating pays at the meal, decay
@@ -670,6 +773,19 @@ static float nethack_shaped_reward(Nethack* env, int illegal) {
     return r;
 }
 
+// selection menus (pickup pile, identify) yield inside xwaitforspace: answer
+// select-all + RET. On a plain --More-- the '.' just bells and RET dismisses,
+// so this is safe on every xwait variant.
+static void nethack_answer_menu(Nethack* env) {
+    for (int r = 0; r < 2 && !env->obs.done && env->misc[NETHACK_MISC_XWAIT]; r++) {
+        env->obs.action = '.';
+        env->ctx = nle_step(env->ctx, &env->obs);
+        if (env->obs.done || !env->misc[NETHACK_MISC_XWAIT]) break;
+        env->obs.action = '\r';
+        env->ctx = nle_step(env->ctx, &env->obs);
+    }
+}
+
 void c_step(Nethack* env) {
     if (env->pending_reset) {
         env->pending_reset = 0;
@@ -678,18 +794,26 @@ void c_step(Nethack* env) {
 
     int a = (int)env->actions[0];
     if (a < 0 || a >= NETHACK_NUM_ACTIONS) a = 0;
-    // per-verb slot heads (verb-conditioned item selection): actions[1..4] =
-    // wear/eat/quaff/throw slots; only the sampled verb's head is consumed
+    // per-verb slot heads (verb-conditioned item selection): actions[1..12] =
+    // wear/eat/quaff/throw/zap/takeoff/puton/remove/wield/apply/read/drop slots;
+    // only the sampled verb's head is consumed
     int slot = 0;
     switch (a) {
-    case NETHACK_ACT_WEAR:  slot = (int)env->actions[1]; break;
-    case NETHACK_ACT_EAT:   slot = (int)env->actions[2]; break;
-    case NETHACK_ACT_QUAFF: slot = (int)env->actions[3]; break;
-    case NETHACK_ACT_THROW: slot = (int)env->actions[4]; break;
-    case NETHACK_ACT_ZAP:   slot = (int)env->actions[5]; break;
+    case NETHACK_ACT_WEAR:    slot = (int)env->actions[1];  break;
+    case NETHACK_ACT_EAT:     slot = (int)env->actions[2];  break;
+    case NETHACK_ACT_QUAFF:   slot = (int)env->actions[3];  break;
+    case NETHACK_ACT_THROW:   slot = (int)env->actions[4];  break;
+    case NETHACK_ACT_ZAP:     slot = (int)env->actions[5];  break;
+    case NETHACK_ACT_TAKEOFF: slot = (int)env->actions[6];  break;
+    case NETHACK_ACT_PUTON:   slot = (int)env->actions[7];  break;
+    case NETHACK_ACT_REMOVE:  slot = (int)env->actions[8];  break;
+    case NETHACK_ACT_WIELD:   slot = (int)env->actions[9];  break;
+    case NETHACK_ACT_APPLY:   slot = (int)env->actions[10]; break;
+    case NETHACK_ACT_READ:    slot = (int)env->actions[11]; break;
+    case NETHACK_ACT_DROP:    slot = (int)env->actions[12]; break;
     }
     if (slot < 0 || slot >= NETHACK_INV_SLOTS) slot = 0;
-    int dir = (int)env->actions[6];    // direction head, consumed by MOVE/RUN/KICK/THROW/ZAP
+    int dir = (int)env->actions[13];   // direction head: MOVE/RUN/KICK/THROW/ZAP
     if (dir < 0 || dir >= NETHACK_NUM_DIRS) dir = 0;
     int dirkey = NETHACK_DIR_KEYS[dir];
 
@@ -733,7 +857,24 @@ void c_step(Nethack* env) {
         env->stats.engraves++;
         nethack_do_elbereth(env);
         break;
-    case NETHACK_ACT_WEAR:
+    case NETHACK_ACT_WEAR: {
+        // atomic swap: if the target armor slot is already occupied by a worn
+        // piece, take that off first (same env step) so upgrading isn't a
+        // penalized two-step. Same-slot only; body-under-cloak just fails.
+        int gn = env->inv_glyphs[slot] - NH_GLYPH_OBJ_OFF;
+        int cat_new = (gn >= 0 && gn < NH_NUM_OBJECTS) ? nh_obj_armcat[gn] : -1;
+        if (cat_new >= 0) {
+            for (int i = 0; i < NETHACK_INV_SLOTS && env->inv_letters[i]; i++) {
+                if (!(env->inv_state[i * NLE_INV_STATE_FIELDS + 5] & 1)) continue;
+                int gi = env->inv_glyphs[i] - NH_GLYPH_OBJ_OFF;
+                int cat_i = (gi >= 0 && gi < NH_NUM_OBJECTS) ? nh_obj_armcat[gi] : -1;
+                if (cat_i == cat_new && i != slot) {
+                    nethack_do_use_item(env, 'T', "take off", NULL, i);
+                    env->stats.swaps++;
+                    break;
+                }
+            }
+        }
         used = nethack_do_use_item(env, 'W', "want to wear", NULL, slot);
         if (used > 0) {
             env->stats.wears++;
@@ -741,6 +882,7 @@ void c_step(Nethack* env) {
         }
         else if (used < 0) bad_pick = 1;
         break;
+    }
     case NETHACK_ACT_EAT:
         // satiated gate: eating past Satiated is NetHack's choke() death
         if (env->blstats[NLE_BL_HUNGER] == 0) stepped = 0;
@@ -804,6 +946,99 @@ void c_step(Nethack* env) {
                 env->obs.action = dirkey;
                 env->ctx = nle_step(env->ctx, &env->obs);
             }
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_PICKUP:
+        // ',' grabs the pile underfoot (items narrow autopickup skips). Multi-item
+        // piles yield inside the selection menu: answer select-all + RET so one
+        // press takes the whole pile.
+        env->stats.pickups++;
+        env->obs.action = ',';
+        env->ctx = nle_step(env->ctx, &env->obs);
+        nethack_answer_menu(env);
+        break;
+    case NETHACK_ACT_TAKEOFF:
+        used = nethack_do_use_item(env, 'T', "take off", NULL, slot);
+        if (used > 0) {
+            env->stats.takeoffs++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_PUTON:
+        used = nethack_do_use_item(env, 'P', "put on", NULL, slot);
+        if (used > 0) {
+            env->stats.putons++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_REMOVE:
+        used = nethack_do_use_item(env, 'R', "remove", NULL, slot);
+        if (used > 0) {
+            env->stats.removes++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_WIELD:
+        // reversible: re-selecting the wielded weapon (W_WEP bit, inv_state
+        // byte5 &2) unwields to bare hands (w then '-') instead of a no-op
+        // re-wield -- else WIELD is a one-way trap for a martial-arts Monk.
+        if (env->inv_state[slot * NLE_INV_STATE_FIELDS + 5] & 2) {
+            env->obs.action = 'w';
+            env->ctx = nle_step(env->ctx, &env->obs);
+            if (!env->obs.done && env->misc[NETHACK_MISC_YN]
+                && nethack_msg_contains(env, "wield")) {
+                env->obs.action = '-';
+                env->ctx = nle_step(env->ctx, &env->obs);
+            }
+            env->stats.wields++;
+        } else {
+            used = nethack_do_use_item(env, 'w', "wield", NULL, slot);
+            if (used > 0) {
+                env->stats.wields++;
+                env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+            }
+            else if (used < 0) bad_pick = 1;
+        }
+        break;
+    case NETHACK_ACT_APPLY:
+        used = nethack_do_use_item(env, 'a', "apply", NULL, slot);
+        if (used > 0) {
+            env->stats.applies++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+            // direction-asking tools answer in-step (atomic, like THROW).
+            // Digging tools force '>' (dig down = stairs-free descent, the
+            // reward-aligned dig); others (mirror, stethoscope) use the
+            // sampled direction. Direct tools never raise the prompt.
+            if (!env->obs.done && env->misc[NETHACK_MISC_YN]
+                && nethack_msg_contains(env, "n what direction")) {
+                int ga = env->inv_glyphs[slot] - NH_GLYPH_OBJ_OFF;
+                int digger = (ga == 234 /* PICK_AXE */ || ga == 50 /* MATTOCK */);
+                env->obs.action = digger ? '>' : dirkey;
+                env->ctx = nle_step(env->ctx, &env->obs);
+            }
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_READ:
+        used = nethack_do_use_item(env, 'r', "read", NULL, slot);
+        if (used > 0) {
+            env->stats.reads++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
+            // scroll of identify raises a selection menu (previously ESC'd =
+            // scroll wasted): select-all identifies up to the roll's limit
+            nethack_answer_menu(env);
+        }
+        else if (used < 0) bad_pick = 1;
+        break;
+    case NETHACK_ACT_DROP:
+        used = nethack_do_use_item(env, 'd', "drop", NULL, slot);
+        if (used > 0) {
+            env->stats.drops++;
+            env->stats.use_slot_sum += slot; env->stats.use_cnt++;
         }
         else if (used < 0) bad_pick = 1;
         break;

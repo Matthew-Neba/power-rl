@@ -40,9 +40,12 @@ static int nethack_handle_prompts(Nethack* env) {
         return 0;
     // the pray confirm is a deliberate action's own prompt: commit, no penalty
     int praying = env->misc[NETHACK_MISC_YN] && nethack_msg_contains(env, "to pray");
-    int illegal = !praying && (env->misc[NETHACK_MISC_YN] || env->misc[NETHACK_MISC_GETLIN]
+    // ring PUTON asks "Which ring-finger, Right or Left?" ("rl" choices — 'y' is
+    // invalid and aborts the puton). The action's own prompt: answer 'r', no penalty.
+    int ringq = env->misc[NETHACK_MISC_YN] && nethack_msg_contains(env, "ight or Left");
+    int illegal = !praying && !ringq && (env->misc[NETHACK_MISC_YN] || env->misc[NETHACK_MISC_GETLIN]
                || nethack_msg_is_prompt(env));
-    if (!illegal && !praying) {
+    if (!illegal && !praying && !ringq) {
         if (env->misc[NETHACK_MISC_XWAIT]) nethack_drain_prompts(env);
         return 0;
     }
@@ -50,9 +53,10 @@ static int nethack_handle_prompts(Nethack* env) {
         int yn = env->misc[NETHACK_MISC_YN];
         if (!yn && !env->misc[NETHACK_MISC_GETLIN] && !env->misc[NETHACK_MISC_XWAIT]
             && !nethack_msg_is_prompt(env)) break;
+        int ring = yn && nethack_msg_contains(env, "ight or Left");
         int commit = yn && !nethack_msg_contains(env, "no return")
                         && !nethack_msg_contains(env, "eally attack");
-        env->obs.action = commit ? 'y' : 27;
+        env->obs.action = ring ? 'r' : (commit ? 'y' : 27);
         env->ctx = nle_step(env->ctx, &env->obs);
     }
     if (illegal) env->stats.illegal_actions++;
