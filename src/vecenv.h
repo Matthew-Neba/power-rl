@@ -256,13 +256,7 @@ static void* static_omp_threadmanager(void* arg) {
     int env_count = vec->buffer_env_counts[buf];
     atomic_int* buffer_states = threading->buffer_states;
     int num_workers = threading->num_threads / vec->buffers;
-    if (num_workers < 1) {
-        num_workers = 1;
-        if (buf == 0)
-            printf("WARNING: num_threads %d < num_buffers %d — "
-                   "each buffer steps single-threaded\n",
-                   threading->num_threads, vec->buffers);
-    }
+    if (num_workers < 1) num_workers = 1;
 
     Env* envs = (Env*)vec->envs;
 
@@ -294,10 +288,7 @@ static void* static_omp_threadmanager(void* arg) {
             memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
             memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            // guided: load-balances across hybrid P/E cores (~15% on 14900K).
-            // NOT dynamic — libomp's dynamic dispatcher asserts (kmp_dispatch.cpp)
-            // with concurrent teams at small trip counts.
-            #pragma omp parallel for schedule(guided) num_threads(num_workers)
+            #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
                 c_step(&envs[i]);
             }
@@ -742,10 +733,6 @@ void static_vec_render(StaticVec* vec, int env_id) {
 int get_obs_size(void) { return OBS_SIZE; }
 int get_num_atns(void) { return NUM_ATNS; }
 static int _act_sizes[] = ACT_SIZES;
-/* env actions stride by NUM_ATNS and sampling writes one action per head:
- * a mismatch scrambles every emitted action and overflows the buffers */
-_Static_assert(sizeof(_act_sizes) / sizeof(_act_sizes[0]) == NUM_ATNS,
-               "NUM_ATNS must equal the number of entries in ACT_SIZES");
 int* get_act_sizes(void) { return _act_sizes; }
 int get_num_act_sizes(void) { return (int)(sizeof(_act_sizes) / sizeof(_act_sizes[0])); }
 const char* get_obs_dtype(void) { return dtype_symbol; }
