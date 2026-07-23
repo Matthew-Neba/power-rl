@@ -58,6 +58,7 @@ struct Decoder {
     free_activations_fn free_activations;
     int hidden_dim, output_dim;
     bool continuous;
+    int activation_size;   // sizeof the impl's activations struct (custom decoders differ)
 };
 
 struct Network {
@@ -808,7 +809,7 @@ PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
         Allocator* acts, Allocator* grads, int B_TT) {
     PolicyActivations a;
     a.encoder = calloc(1, p->encoder.activation_size);
-    a.decoder = calloc(1, sizeof(DecoderActivations));
+    a.decoder = calloc(1, p->decoder.activation_size);
     a.network = calloc(1, sizeof(MinGRUActivations));
     p->encoder.reg_train(w.encoder, a.encoder, acts, grads, B_TT);
     p->decoder.reg_train(w.decoder, a.decoder, acts, grads, B_TT);
@@ -819,7 +820,7 @@ PolicyActivations policy_reg_train(Policy* p, PolicyWeights& w,
 PolicyActivations policy_reg_rollout(Policy* p, PolicyWeights& w, Allocator* acts, int B_inf) {
     PolicyActivations a;
     a.encoder = calloc(1, p->encoder.activation_size);
-    a.decoder = calloc(1, sizeof(DecoderActivations));
+    a.decoder = calloc(1, p->decoder.activation_size);
     a.network = calloc(1, sizeof(MinGRUActivations));
     p->encoder.reg_rollout(w.encoder, a.encoder, acts, B_inf);
     p->decoder.reg_rollout(w.decoder, a.decoder, acts, B_inf);

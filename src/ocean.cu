@@ -2,6 +2,7 @@
 // Included by pufferlib.cu — requires precision_t, PrecisionTensor, Allocator, puf_mm, etc.
 
 #include "cudnn_conv2d.cu"
+#include "nethack.cu"
 
 // ---- NMMO3 constants ----
 
@@ -586,5 +587,11 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
             .in_dim = enc->in_dim, .out_dim = enc->out_dim,
             .activation_size = sizeof(NMMO3EncoderActivations),
         };
+    } else if (env_name == "nethack") {
+        create_nethack_encoder(enc);
     }
+}
+
+static void create_custom_decoder(const std::string& env_name, Decoder* dec) {
+    if (env_name == "nethack") create_nethack_decoder(dec);
 }
