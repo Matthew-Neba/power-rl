@@ -2,70 +2,8 @@
 // full 79x21 map — an egocentric 9x9 crop at per-cell detail (flatten-linear)
 // and a global 5x5-patch view (fused embed+flatten->16->128 max over 16x5 = 80 tokens) — plus
 // the blstats MLP. Included by ocean.cu — requires kernels.cu, models.cu.
-// Bit-deterministic backward: fixed-point integer atomics and split-K GEMMs
-// with atomic reduction schemes masked out.
-
-#include <cublasLt.h>
-
-// cublasGemmExDense through cublasLt's heuristic + workspace. GemmEx picks
-// near-serial kernels for skinny or odd shapes (tiny-output/huge-K weight
-// grads, muon's Newton-Schulz on wide encoder projections); the Lt heuristic
-// split-Ks them properly. Same math, fp32 accumulation either way.
-static inline void cublasLtGemmDense(
-        cublasOperation_t op_a, cublasOperation_t op_b,
-        int M, int N, int K, void* A, void* B, void* C,
-        cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
-    static thread_local cublasLtHandle_t lt = nullptr;
-    static thread_local void* lt_ws = nullptr;
-    static const size_t LT_WS_BYTES = 64 * 1024 * 1024;
-    if (!lt) {
-        cublasLtCreate(&lt);
-        cudaMalloc(&lt_ws, LT_WS_BYTES);
-    }
-    // Row-major C(M,N) = op(A) @ op(B) is column-major C'(N,M) = op(B') @ op(A')
-    int lda = (op_a == CUBLAS_OP_N) ? K : M;
-    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
-    cublasLtMatmulDesc_t op;
-    cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_PRECISION, CUDA_R_32F);
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &op_b, sizeof(op_b));
-    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &op_a, sizeof(op_a));
-    cublasLtMatrixLayout_t la, lb, lc;
-    cublasLtMatrixLayoutCreate(&la, CUBLAS_PRECISION,
-        op_b == CUBLAS_OP_N ? N : K, op_b == CUBLAS_OP_N ? K : N, ldb);
-    cublasLtMatrixLayoutCreate(&lb, CUBLAS_PRECISION,
-        op_a == CUBLAS_OP_N ? K : M, op_a == CUBLAS_OP_N ? M : K, lda);
-    cublasLtMatrixLayoutCreate(&lc, CUBLAS_PRECISION, N, M, N);
-    cublasLtMatmulPreference_t pref;
-    cublasLtMatmulPreferenceCreate(&pref);
-    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-        &LT_WS_BYTES, sizeof(LT_WS_BYTES));
-    // exclude INPLACE split-K (atomics): nondeterministic accumulation order
-    uint32_t red_mask = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE | CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE;
-    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-        &red_mask, sizeof(red_mask));
-    cublasLtMatmulHeuristicResult_t heur;
-    int nheur = 0;
-    cublasLtMatmulAlgoGetHeuristic(lt, op, la, lb, lc, lc, pref, 1, &heur, &nheur);
-    if (nheur > 0) {
-        cublasLtMatmul(lt, op, &alpha, B, la, A, lb, &beta,
-            C, lc, C, lc, &heur.algo, lt_ws, LT_WS_BYTES, stream);
-    } else {
-        cublasGemmExDense(op_a, op_b, M, N, K, A, B, C, stream, alpha, beta);
-    }
-    cublasLtMatmulPreferenceDestroy(pref);
-    cublasLtMatrixLayoutDestroy(lc);
-    cublasLtMatrixLayoutDestroy(lb);
-    cublasLtMatrixLayoutDestroy(la);
-    cublasLtMatmulDescDestroy(op);
-}
-
-// puf_mm_tn for tiny-output/huge-K weight grads (e.g. M,N < 256, K > 100k).
-void puf_mm_tn_splitk(PrecisionTensor* a, PrecisionTensor* b, PrecisionTensor* out, cudaStream_t stream) {
-    int M = a->shape[ndim(a->shape)-1];
-    int K = batch_size(a->shape) * a->shape[ndim(a->shape)-2];
-    int N = b->shape[ndim(b->shape)-1];
-    cublasLtGemmDense(CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, a->data, b->data, out->data, stream);
-}
+// Bit-deterministic backward: scatter/bias sums via fixed-point integer
+// atomics; GEMMs through the shared puf_mm cublas path.
 
 __global__ void nh_bias_relu_kernel(
     precision_t* __restrict__ data, const precision_t* __restrict__ bias, int total, int dim) {
@@ -1141,7 +1079,7 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     cudaMemsetAsync(bacc, 0, (H + NH_LOC_HID + NH_GLB_HID + NH_BL_HID + NH_P1 + NH_INV_HID + NH_INV_POOL) * sizeof(long long), stream);
     nh_relu_bias_bwd_kernel<<<nh_colsum_grid((int64_t)B * H, H), BLOCK_SIZE, H * sizeof(long long), stream>>>(
         grad.data, a->out.data, bacc, (int64_t)B * H, H);
-    puf_mm_tn_splitk(&grad, &a->concat, &a->proj_wgrad, stream);  // tall-K, tiny output
+    puf_mm_tn(&grad, &a->concat, &a->proj_wgrad, stream);
 
     PrecisionTensor grad_concat = {.data = a->concat.data, .shape = {B, NH_CONCAT}};
     puf_mm_nn(&grad, &ew->proj_w, &grad_concat, stream);
@@ -1174,7 +1112,7 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     // (dx,dy) weight slice: dW_xy = dt16^T @ dxy (tall-K, 16x2 output)
     PrecisionTensor dt16v = {.data = a->t16.data, .shape = {B * NH_TOK, NH_P1}};
     PrecisionTensor dxyv  = {.data = a->dxy.data, .shape = {B * NH_TOK, 2}};
-    puf_mm_tn_splitk(&dt16v, &dxyv, &a->glb1_xygrad, stream);
+    puf_mm_tn(&dt16v, &dxyv, &a->glb1_xygrad, stream);
 
     // Inventory branch: slice the pooled-summary grad, relu-mask it (inv2
     // bias grad rides along), backprop the fused max into inv_grad (dW2 via
@@ -1203,13 +1141,13 @@ static void nethack_encoder_backward(void* w, void* activations, PrecisionTensor
     // state-path weight grad: dW_s = dslot^T @ sfeat over the B*55 slot rows
     PrecisionTensor dsflat = {.data = a->inv_grad.data, .shape = {B * NH_INV, NH_INV_HID}};
     PrecisionTensor sfflat = {.data = a->inv_sfeat.data, .shape = {B * NH_INV, NH_SFEAT}};
-    puf_mm_tn_splitk(&dsflat, &sfflat, &a->inv1s_wgrad, stream);
+    puf_mm_tn(&dsflat, &sfflat, &a->inv1s_wgrad, stream);
     cudaMemsetAsync(a->dTinv_i.data, 0, (size_t)NH_GLYPH_VOCAB * NH_INV_HID * sizeof(long long), stream);
     nh_dTinv_scatter_kernel<<<grid_size((int64_t)B * NH_INV_FLAT), BLOCK_SIZE, 0, stream>>>(
         (long long*)a->dTinv_i.data, a->inv_grad.data, a->inv_idx.data, (int64_t)B * NH_INV_FLAT);
     nh_fxp_to_precision_kernel<<<grid_size(NH_GLYPH_VOCAB * NH_INV_HID), BLOCK_SIZE, 0, stream>>>(
         a->dTinv.data, (long long*)a->dTinv_i.data, NH_GLYPH_VOCAB * NH_INV_HID);
-    puf_mm_tn_splitk(&a->dTinv, &a->e_eff, &a->inv1_wgrad, stream);
+    puf_mm_tn(&a->dTinv, &a->e_eff, &a->inv1_wgrad, stream);
 
     // Blstats branch (raw-feature slice of concat has no upstream params)
     nh_slice_kernel<<<grid_size(B * NH_BL_HID), BLOCK_SIZE, 0, stream>>>(
@@ -1741,7 +1679,7 @@ static PrecisionTensor nethack_decoder_backward(void* w, void* activations,
     PrecisionTensor dkflat = {.data = a->dkmat.data, .shape = {B * NH_INV, NH_INV_HID}};
     PrecisionTensor sflat = {.data = ea->inv_out.data, .shape = {B * NH_INV, NH_INV_HID}};
     PrecisionTensor kgflat = {.data = a->keygrad.data, .shape = {B * NH_INV, NH_INV_HID}};
-    puf_mm_tn_splitk(&dkflat, &sflat, &a->k_wgrad, stream);
+    puf_mm_tn(&dkflat, &sflat, &a->k_wgrad, stream);
     puf_mm_nn(&dkflat, &dw->k_w, &kgflat, stream);
     puf_mm_tn(&a->dtmp, &a->saved_input, &a->lin_wgrad, stream);
     puf_mm_tn(&a->dq, &a->saved_input, &a->q_wgrad, stream);

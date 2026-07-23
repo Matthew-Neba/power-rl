@@ -300,7 +300,7 @@ if [ -z "$MODE" ]; then
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         "${EXTRA_LDFLAGS[@]}"
-        -lcudart -lnccl -lnvidia-ml -lcublas -lcublasLt -lcusolver -lcurand -lcudnn
+        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
         $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
@@ -343,7 +343,7 @@ elif [ "$MODE" = "profile" ]; then
         -Xcompiler=-fopenmp \
         tests/profile_kernels.cu vendor/ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcublasLt -lcurand -lcudnn \
+        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
         -lGL -lm -lpthread $OMP_LIB \
         -o profile
     echo "Built: ./profile"
