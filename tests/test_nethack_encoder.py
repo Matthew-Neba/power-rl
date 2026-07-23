@@ -89,11 +89,11 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     u = vals.astype(np.uint32)
     for k in range(4):
         obs[:, bl_off + k::4][:, :27] = ((u >> (8 * k)) & 0xFF).astype(np.float32)
-    # extra stats @ +27*4: prayer cooldown, prev action (-1..21 valid; sampled
-    # -1..13 to preserve the original FD test batch — the 14..21 onehot columns
+    # extra stats @ +27*4: engraving state, prev action (-1..21 valid; sampled
+    # -1..13 to preserve the original FD test batch — the higher onehot columns
     # are linear and covered by the analytic torch check), 18 class counts
     ex = np.concatenate([
-        rng.integers(0, 1000, size=(B, 1)),
+        rng.integers(0, 3, size=(B, 1)),      # engraving state 0/1/2
         rng.integers(-1, 14, size=(B, 1)),
         rng.integers(0, 6, size=(B, 18)),
     ], axis=1).astype(np.int64).astype(np.uint32)
@@ -102,6 +102,7 @@ def make_obs(B, obs_size, grid, max_glyph_used):
     # inventory entities @ +47*4: 55 slot glyphs int16 LE, tail padded (5976)
     inv_off = bl_off + 47 * 4
     inv = rng.integers(0, max_glyph_used, size=(B, 55)).astype(np.int32)
+    inv[:, ::2] = rng.integers(1906, 2359, size=(B, 28))  # object glyphs: armcat coverage
     n_items = rng.integers(3, 12, size=B)
     for b in range(B):
         inv[b, n_items[b]:] = 5976
@@ -160,7 +161,7 @@ _cudart.cudaMemcpy.argtypes = [VP, VP, ctypes.c_size_t, ctypes.c_int]
 def glyph_map():
     """Parse the generated (kind, sub) mapping straight from the header."""
     import re
-    txt = open(os.path.join(SRC, "nethack_glyph_map.h")).read()
+    txt = open(os.path.join(HERE, "..", "ocean", "nethack", "glyph_map.h")).read()
     def arr(name):
         m = re.search(name + r"\[\d+\] = \{([0-9,\-]+)\};", txt)
         return np.array([int(x) for x in m.group(1).split(",") if x], dtype=np.int64)
@@ -205,7 +206,7 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
     g2_b   = w["glb2_b"]  = getw(lib, "glb2_b", (128,))
     inv1_w = w["inv1_w"]  = getw(lib, "inv1_w", (16, 32))
     inv1_b = w["inv1_b"]  = getw(lib, "inv1_b", (16,))
-    inv1s_w = w["inv1s_w"] = getw(lib, "inv1s_w", (16, 17))
+    inv1s_w = w["inv1s_w"] = getw(lib, "inv1s_w", (16, 24))
     inv2_w = w["inv2_w"]  = getw(lib, "inv2_w", (128, 16))
     inv2_b = w["inv2_b"]  = getw(lib, "inv2_b", (128,))
     bl_w   = w["bl_w"]    = getw(lib, "bl_w", (64, lib.nh_bl_feat()))
@@ -240,7 +241,7 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
     t128 = t16 @ g2_w.T
     glb = torch.relu(t128.max(dim=1).values + g2_b)
     # blstats features
-    f = np.zeros((B, 96), dtype=np.float64)
+    f = np.zeros((B, 97), dtype=np.float64)
     j = 0
     for i in range(27):
         if i in (21, 25):
@@ -253,7 +254,6 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
         f[:, j] = (hunger == h); j += 1
     for k in range(13):
         f[:, j] = (bl_vals[:, 25].astype(np.uint32) >> k) & 1; j += 1
-    f[:, j] = np.log1p(np.maximum(ex_vals[:, 0], 0)) * 0.1; j += 1
     for h in range(22):
         f[:, j] = (ex_vals[:, 1] == h); j += 1
     for k in range(18):
@@ -267,12 +267,15 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
     dnum = np.clip(bl_vals[:, 23], 0, 7)
     for h in range(8):
         f[:, j] = (dnum == h); j += 1
+    # underfoot engraving bits: any-engraving, active-Elbereth
+    f[:, j] = (ex_vals[:, 0] >= 1); j += 1
+    f[:, j] = (ex_vals[:, 0] >= 2); j += 1
     f = np.clip(f, -1.0, 1.0)   # strict clamp, mirrors the kernel
     fb = torch.tensor(f)
     blh = torch.relu(fb @ bl_w.T + bl_b)
     # inventory entities: per-slot embed + gated state features -> 32, relu
     # (the decoder's keys), then pooled 32 -> 128 with max over slots
-    sf = np.zeros(st_vals.shape[:2] + (17,), dtype=np.float64)
+    sf = np.zeros(st_vals.shape[:2] + (24,), dtype=np.float64)
     for c in range(4):
         sf[:, :, c] = (st_vals[:, :, 0] == c)
     sk = st_vals[:, :, 1] != -128
@@ -284,6 +287,15 @@ def torch_encoder(lib, glyphs, bl_vals, ex_vals, inv_vals, st_vals, msg, H):
     for c in range(7):
         sf[:, :, 9 + c] = (st_vals[:, :, 5] >> c) & 1
     sf[:, :, 16] = st_vals[:, :, 6]
+    # armor slot category one-hot from the slot glyph (baked otyp->ARM_* table)
+    import re as _re
+    _src = open("ocean/nethack/netlib.h").read()
+    _body = _re.search(r"nh_obj_armcat\[NH_NUM_OBJECTS\] = \{(.*?)\};", _src, _re.S).group(1)
+    _tbl = np.array([int(x) for x in _re.findall(r"-?\d+", _body)], dtype=np.int64)
+    ot = inv_vals.astype(np.int64) - 1906
+    cat = np.where((ot >= 0) & (ot < len(_tbl)), _tbl[np.clip(ot, 0, len(_tbl) - 1)], -1)
+    for c in range(7):
+        sf[:, :, 17 + c] = (cat == c)
     xi = E[torch.tensor(inv_vals.astype(np.int64))]
     invh = torch.relu(xi @ inv1_w.T + torch.tensor(sf) @ inv1s_w.T + inv1_b)  # (B,55,16)
     invp = torch.relu((invh @ inv2_w.T).max(dim=1).values + inv2_b) # (B,128)
@@ -352,7 +364,7 @@ def run(lib):
     # (|L+ + L- - 2*L0| is O(eps) at a kink vs O(eps^2) on a smooth region)
     # and skip those entries. eps is small so smooth curvature stays negligible.
     eps = 1e-3
-    kink_tol = 2e-4      # |Lp+Lm-2*L0| above this ⇒ a ReLU flipped; skip entry.
+    kink_tol = 2e-5      # |Lp+Lm-2*L0| above this ⇒ a ReLU flipped; skip entry.
     rel_tol = 1.5e-2
     rng = np.random.default_rng(123)
     # glb1/inv2/inv1 are FD-unverifiable: their weights feed the max-pool, so

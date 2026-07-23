@@ -1,5 +1,5 @@
-// One private vardir per env instance (NetHack expects nhdat + writable
-// files), under a per-process parent on tmpfs, with orphan sweeping.
+// Filesystem plumbing: one private vardir per env (NetHack wants nhdat +
+// writable files) under a per-process tmpfs parent, plus the shared options rc.
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,14 +11,15 @@
 #include <dirent.h>
 #include <signal.h>
 
+// helpers
+
 static void nethack_touch(const char* path) {
     int fd = open(path, O_CREAT | O_WRONLY, 0644);
     if (fd >= 0) close(fd);
 }
 
-// recursive remove, depth-capped (vardir trees are at most base/env/save/files)
 static void nethack_rm_rf(const char* path, int depth) {
-    if (depth > 3) return;
+    if (depth > 3) return;   // vardir trees are at most base/env/save/files
     DIR* d = opendir(path);
     if (d) {
         struct dirent* e;
@@ -33,8 +34,9 @@ static void nethack_rm_rf(const char* path, int depth) {
     rmdir(path);
 }
 
-// per-process parent on tmpfs (level/lock I/O never hits disk); on first use,
-// sweep parents whose owning pid is dead — a killed run leaks one dir per env
+// vardirs
+
+// per-process parent on tmpfs; first use sweeps parents whose owner pid died
 static const char* nethack_vardir_base(void) {
     static char base[256] = "";
     if (base[0]) return base;
@@ -78,8 +80,8 @@ static int nethack_make_vardir(const char* source_hackdir, char* out_buf, size_t
     snprintf(src, sizeof(src), "%s/nhdat", abs_source);
     snprintf(dst, sizeof(dst), "%s/nhdat", dir);
 
-    // fail fast on a broken NETHACKDIR: symlink(2) succeeds for dangling links
-    // and the error would surface later as a cryptic init_dungeons panic
+    // fail fast on a dangling nhdat symlink: symlink(2) would succeed and the
+    // error surface later as a cryptic init_dungeons panic
     char resolved[4096];   // realpath(3) requires a PATH_MAX buffer
     if (realpath(src, resolved) == NULL || access(resolved, R_OK) != 0) {
         fprintf(stderr,
@@ -105,10 +107,11 @@ static void nethack_rm_vardir(const char* dir) {
     nethack_rm_rf(dir, 1);
 }
 
-// Options rc file, one per process: AUTOPICKUP_EXCEPTION is a config-FILE-only
-// directive (never a NETHACKOPTIONS token), so the options string becomes
-// "@<this file>" and the file carries the OPTIONS line + exceptions. Written
-// atomically (tmp + rename); concurrent env inits write identical content.
+// options rc
+
+// one rc per process: AUTOPICKUP_EXCEPTION is a config-file-only directive, so
+// the options string becomes "@<this file>"; written atomically (tmp + rename),
+// concurrent env inits write identical content
 static const char* nethack_rc_path(const char* default_options) {
     static char path[512] = "";
     if (path[0]) return path;
@@ -119,9 +122,8 @@ static const char* nethack_rc_path(const char* default_options) {
         FILE* f = fopen(tmp, "w");
         if (f) {
             fprintf(f, "OPTIONS=%s\n", default_options);
-            // corpses stay on the floor ('>' = never pick up): fresh-kill
-            // eating is the food source (carried corpses age invisibly and
-            // are excluded from EAT)
+            // corpses are never AUTO-picked: acquiring one is a deliberate
+            // PICKUP, and eating carried corpses stays policy-learnable
             fprintf(f, "AUTOPICKUP_EXCEPTION=\">corpse\"\n");
             fclose(f);
             rename(tmp, p);
@@ -130,4 +132,3 @@ static const char* nethack_rc_path(const char* default_options) {
     strncpy(path, p, sizeof(path) - 1);
     return path;
 }
-

@@ -112,12 +112,18 @@ static constexpr int NH_BL_HP = 10, NH_BL_ENE = 14;  // hp/hpmax at 10/11, ene/e
 static constexpr int NH_ACTIONS = 22;              // NETHACK_NUM_ACTIONS
 static constexpr int NH_OCLASSES = 18;             // MAXOCLASSES
 static constexpr int NH_EX_RAW = 2 + NH_OCLASSES;  // NETHACK_EXTRA_INTS
-// scalars + hunger onehot + condition bits + cooldown + prev-action onehot +
-// counts + 2 ratios (hp_frac, ene_frac): danger salience the linear bl_w can't
-// synthesize from separate hp/hpmax scalars
-// + 8 = dnum one-hot: dungeon branch is nominal (0 main, 2 mines, 4 soko...);
-// the scalar imposed fake ordinality, its scale is zeroed
-static constexpr int NH_BL_FEAT = 25 + 7 + 13 + 1 + NH_ACTIONS + NH_OCLASSES + 2 + 8;
+// blstats feature map (cumulative offsets; each block documented at its
+// kernel branch). hp/ene fracs are the danger ratios the linear bl_w can't
+// synthesize from separate cur/max scalars; dnum is one-hot because dungeon
+// branch is nominal, not ordinal.
+static constexpr int NH_F_HUNGER = 25;                          // 7-way one-hot
+static constexpr int NH_F_COND   = NH_F_HUNGER + 7;             // 13 condition bits
+static constexpr int NH_F_PREV   = NH_F_COND + 13;              // prev-action one-hot
+static constexpr int NH_F_INV    = NH_F_PREV + NH_ACTIONS;      // inv class counts
+static constexpr int NH_F_FRAC   = NH_F_INV + NH_OCLASSES;      // hp_frac, ene_frac
+static constexpr int NH_F_DNUM   = NH_F_FRAC + 2;               // 8-way one-hot
+static constexpr int NH_F_ENGR   = NH_F_DNUM + 8;               // engraving bits
+static constexpr int NH_BL_FEAT  = NH_F_ENGR + 2;
 static constexpr int NH_BL_DNUM = 23;
 static constexpr int NH_BL_HID = 64;
 // Inventory entity branch: 55 slot glyphs, each embed -> shared 32->32
@@ -153,7 +159,7 @@ static constexpr int NH_INV_OFF = NH_BL_OFF + (NH_BL_RAW + NH_EX_RAW) * 4;
 // expanded to NH_SFEAT features feeding the slot MLP beside the embed
 static constexpr int NH_INVST_OFF = NH_INV_OFF + NH_INV * 2;
 static constexpr int NH_ST_RAW = 8;                // NLE_INV_STATE_FIELDS
-static constexpr int NH_SFEAT = 17;                // buc4 + known+spe + quan + ero2 + flags7 + tk
+static constexpr int NH_SFEAT = 24;   // buc4 + known+spe + quan + ero2 + flags7 + tk + armcat7
 static constexpr int NH_MSG_OFF  = NH_INVST_OFF + NH_INV * NH_ST_RAW;   // message block start
 static constexpr int NH_OBS_SIZE = NH_MSG_OFF + NH_MSG_LEN;
 static constexpr int NH_SORT_BLOCKS = 256;         // hist grid (smem histograms)
@@ -166,8 +172,38 @@ static constexpr int NH_HOT_T = 16;                // hot-glyph smem rows (16x32
 // rare forms inherit what common forms learn. Zero-init factors make the
 // initial function identical to the unfactorized baseline.
 #define NH_GM_QUAL static __device__ const
-#include "nethack_glyph_map.h"
+#include "../ocean/nethack/glyph_map.h"
 #undef NH_GM_QUAL
+
+// armor slot per otyp (ARM_SUIT=0..ARM_SHIRT=6, -1 not armor), device copy of
+// nh_obj_armcat in ocean/nethack/netlib.h (NetHack 3.6.6)
+static constexpr int NH_NUM_OBJECTS = 453;
+static constexpr int NH_GLYPH_OBJ_OFF = 1906;
+static __device__ const signed char nh_obj_armcat_dev[NH_NUM_OBJECTS] = {
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,2,2,2,2,2,2,2,2,2,
+  2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,6,6,5,5,5,
+  5,5,5,5,5,5,5,5,5,1,1,1,1,1,1,1,3,3,3,3,
+  4,4,4,4,4,4,4,4,4,4,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+  -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
 static_assert(NH_GM_VOCAB == 5977, "glyph map vocab mismatch");
 static constexpr int NH_NKIND = NH_GM_NKIND;
 static constexpr int NH_NSUB  = NH_GM_NSUB;
@@ -440,9 +476,8 @@ __global__ void nh_patch_max_bwd_kernel(
 }
 
 // Decode int32 LE blstats + extra stats and expand to NH_BL_FEAT normalized
-// features. Warp per sample: one serial thread per sample is a 200-op latency
-// chain. Layout: 25 scalars | 7 hunger | 13 cond | cooldown | NH_ACTIONS
-// prev-act | 18 inv counts.
+// features (block map = the NH_F_* offsets). Warp per sample: one serial
+// thread per sample is a 200-op latency chain.
 __global__ void nh_blstats_kernel(
     precision_t* __restrict__ out, const precision_t* __restrict__ obs, int B) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -453,32 +488,35 @@ __global__ void nh_blstats_kernel(
     precision_t* dst = out + (int64_t)b * NH_BL_FEAT;
     for (int j = lane; j < NH_BL_FEAT; j += 32) {
         float f;
-        if (j < 25) {
-            int i = j + (j >= 21) + (j >= 24);   // skip hunger(21), condition(25)
+        if (j < NH_F_HUNGER) {
+            // 25 scaled scalars: blstats minus hunger(21) and condition(25)
+            int i = j + (j >= 21) + (j >= 24);
             int v = nh_bl_read_i32(src + 4*i);
             f = NH_BL_ISLOG[i] ? log1pf(fmaxf((float)v, 0.0f)) * NH_BL_SCALE[i]
                                : (float)v * NH_BL_SCALE[i];
-        } else if (j < 32) {
+        } else if (j < NH_F_COND) {
             int v = nh_bl_read_i32(src + 4*NH_BL_HUNGER);
-            f = (j - 25 == max(0, min(v, 6))) ? 1.0f : 0.0f;
-        } else if (j < 45) {
+            f = (j - NH_F_HUNGER == max(0, min(v, 6))) ? 1.0f : 0.0f;
+        } else if (j < NH_F_PREV) {
             unsigned int cond = (unsigned int)nh_bl_read_i32(src + 4*NH_BL_CONDITION);
-            f = (float)((cond >> (j - 32)) & 1u);
-        } else if (j == 45) {
-            f = log1pf(fmaxf((float)nh_bl_read_i32(ex), 0.0f)) * 0.1f;
-        } else if (j < 46 + NH_ACTIONS) {
-            f = (j - 46 == nh_bl_read_i32(ex + 4)) ? 1.0f : 0.0f;
-        } else if (j < 46 + NH_ACTIONS + NH_OCLASSES) {
-            f = (float)nh_bl_read_i32(ex + 4*(j - 44 - NH_ACTIONS)) * 0.125f;
-        } else if (j < 48 + NH_ACTIONS + NH_OCLASSES) {
+            f = (float)((cond >> (j - NH_F_COND)) & 1u);
+        } else if (j < NH_F_INV) {
+            f = (j - NH_F_PREV == nh_bl_read_i32(ex + 4)) ? 1.0f : 0.0f;
+        } else if (j < NH_F_FRAC) {
+            f = (float)nh_bl_read_i32(ex + 4*(2 + j - NH_F_INV)) * 0.125f;
+        } else if (j < NH_F_DNUM) {
             // hp_frac / ene_frac in [0,1]: the "how close to death/empty" ratio
-            int base = (j == 46 + NH_ACTIONS + NH_OCLASSES) ? NH_BL_HP : NH_BL_ENE;
+            int base = (j == NH_F_FRAC) ? NH_BL_HP : NH_BL_ENE;
             int cur = nh_bl_read_i32(src + 4*base);
             int mx  = nh_bl_read_i32(src + 4*(base + 1));
             f = fminf(fmaxf((float)cur / (float)(mx > 1 ? mx : 1), 0.0f), 1.0f);
-        } else {
+        } else if (j < NH_F_ENGR) {
             int v = nh_bl_read_i32(src + 4*NH_BL_DNUM);
-            f = (j - (48 + NH_ACTIONS + NH_OCLASSES) == max(0, min(v, 7))) ? 1.0f : 0.0f;
+            f = (j - NH_F_DNUM == max(0, min(v, 7))) ? 1.0f : 0.0f;
+        } else {
+            // underfoot engraving from ex[0]: any engraving, active Elbereth
+            int v = nh_bl_read_i32(ex);
+            f = (j == NH_F_ENGR) ? (v >= 1 ? 1.0f : 0.0f) : (v >= 2 ? 1.0f : 0.0f);
         }
         // strict [-1,1]: bounds deep-play excursions (AC -15 -> -1.5, hp 300 ->
         // 1.5, stacked inv counts) — validated neutral-now, deep-safe (n=4)
@@ -629,6 +667,14 @@ __global__ void nh_inv_sfeat_kernel(precision_t* __restrict__ out,
     for (int c = 0; c < 7; c++)
         f[9 + c] = from_float((float)((st[5] >> c) & 1));
     f[16] = from_float((float)st[6]);
+    // armor slot category one-hot (suit/shield/helm/gloves/boots/cloak/shirt)
+    // from the slot glyph via the engine's baked otyp->ARM_* table
+    const precision_t* gsrc = obs + (int64_t)b * NH_OBS_SIZE + NH_INV_OFF + 2 * s;
+    int g = (int)to_float(gsrc[0]) + ((int)to_float(gsrc[1]) << 8);
+    int ot = g - NH_GLYPH_OBJ_OFF;
+    int cat = (ot >= 0 && ot < NH_NUM_OBJECTS) ? nh_obj_armcat_dev[ot] : -1;
+    for (int c = 0; c < 7; c++)
+        f[17 + c] = from_float(cat == c ? 1.0f : 0.0f);
 }
 
 __global__ void nh_inv_gather_kernel(precision_t* __restrict__ out,

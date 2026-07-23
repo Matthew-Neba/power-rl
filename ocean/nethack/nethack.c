@@ -3,22 +3,16 @@
 #include <string.h>
 #include "nethack.h"
 #include "../../src/puffernet.h"
-#include "../../src/nethack_glyph_map.h"
-
-// labels for the end-of-run histogram, in NETHACK_ACTION_TABLE order
-static const char* NETHACK_ACTION_NAMES[NETHACK_NUM_ACTIONS] = {
-    "MOVE","RUN","DOWN_STAIRS","UP_STAIRS","KICK","SEARCH",
-    "ELBERETH","WEAR","EAT","QUAFF","PRAY","THROW","ZAP","REST",
-};
+#include "glyph_map.h"
 
 // single-agent env, reset immediately (training's c_reset is lazy)
 static void env_open(Nethack* env) {
     memset(env, 0, sizeof(*env));
     env->num_agents = 1;
     env->observations = (unsigned char*)calloc(NETHACK_OBS_SIZE, 1);
-    env->actions      = (float*)calloc(7, sizeof(float));   // {verb, 5 per-verb slots, direction}
+    env->actions      = (float*)calloc(14, sizeof(float));   // {verb, 12 per-verb slots, direction}
     env->action_mask  = (unsigned char*)calloc(NETHACK_NUM_ACTIONS
-                        + 5 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS, 1);
+                        + 12 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS, 1);
     env->rewards      = (float*)calloc(1, sizeof(float));
     env->terminals    = (float*)calloc(1, sizeof(float));
     init(env);
@@ -35,16 +29,16 @@ static void env_close(Nethack* env) {
 // weight order matches param registration: encoder, decoder, mingru
 #define DEMO_VOCAB   5977
 #define DEMO_EMBED   32
-#define DEMO_BL_FEAT (25 + 7 + 13 + 1 + NETHACK_NUM_ACTIONS + NETHACK_NUM_OCLASSES)
+#define DEMO_BL_FEAT (25 + 7 + 13 + NETHACK_NUM_ACTIONS + NETHACK_NUM_OCLASSES + 2 + 8 + 2)
 #define DEMO_INV_HID 16   // 16-dim slot rep: pool bottleneck + decoder key (unified)
 #define DEMO_INV_FLAT (NETHACK_INV_SLOTS * DEMO_INV_HID)
 #define DEMO_INV_POOL 128
-#define DEMO_SFEAT 17    // buc4 + known+spe + quan + ero2 + flags7 + tk
-#define DEMO_OD (NETHACK_NUM_ACTIONS + 5 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS)
-#define DEMO_NUM_HEADS 7
-#define DEMO_PTR_HEADS 5
+#define DEMO_SFEAT 24    // buc4 + known+spe + quan + ero2 + flags7 + tk + armcat7
+#define DEMO_OD (NETHACK_NUM_ACTIONS + 12 * NETHACK_INV_SLOTS + NETHACK_NUM_DIRS)
+#define DEMO_NUM_HEADS 14
+#define DEMO_PTR_HEADS 12
 #define DEMO_QDIM (DEMO_PTR_HEADS * DEMO_INV_HID)
-#define DEMO_DEC_PAD 24
+#define DEMO_DEC_PAD 32
 #define DEMO_DEC_LIN (NETHACK_NUM_ACTIONS + NETHACK_NUM_DIRS + 1)
 #define DEMO_LOC_IN  (NETHACK_CROP_GRID * DEMO_EMBED)   // 9x9 crop, per-cell embeds
 #define DEMO_LOC_HID 256
@@ -71,7 +65,7 @@ static const float DEMO_BL_SCALE[27] = {
     1.f/25, 1.f/125, 1.f/25, 1.f/25, 1.f/25, 1.f/25, 1.f/25,
     0.1f, 1.f/200, 1.f/200, 1.f/50, 0.1f,
     1.f/100, 1.f/100, 1.f/10, 1.f/10, 1.f/30,
-    0.1f, 0.1f, 0.f, 1.f/4, 1.f/10, 1.f/50, 0.f, 1.f,
+    0.1f, 0.1f, 0.f, 1.f/4, 0.f, 1.f/50, 0.f, 1.f,   // dnum one-hot (scale dead)
 };
 static const int DEMO_BL_ISLOG[27] =
     {0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,1,1,0,0,0,0,0,0};
@@ -83,16 +77,16 @@ typedef struct {
     float *loc_w, *loc_b;       // (256, 2592), (256)
     float *g1_w, *g1_xy, *g1_b; // (16, 800), (16, 2), (16): per-patch embed+flatten + hero dx,dy -> 16
     float *g2_w, *g2_b;         // (128, 16), (128): 16 -> 128, maxed over tokens
-    float *inv1_w, *inv1_b;     // (32, 32), (32): per-slot features (pointer keys)
-    float *inv1s_w;             // (32, 17): gated item-state path into the slot MLP
-    float *inv2_w, *inv2_b;     // (128, 32), (128): pooled trunk summary (max over slots)
+    float *inv1_w, *inv1_b;     // (16, 32), (16): per-slot features (pointer keys)
+    float *inv1s_w;             // (16, 24): gated item-state path into the slot MLP
+    float *inv2_w, *inv2_b;     // (128, 16), (128): pooled trunk summary (max over slots)
     float *bl_w, *bl_b;         // (64, DEMO_BL_FEAT), (64)
     float *proj_w, *proj_b;     // (H, DEMO_CONCAT), (H)
     float *msg_w;               // (4096, 32) trigram embedding table
-    float *dec_lin;             // (24, H) bias-free; rows [14 verb | 8 dir | value], 23 used
-    float *dec_q;               // (160, H): five stacked 32-dim query projections
-    float *dec_k;               // (32, 32): key projection over slot features
-    float *dec_tau;             // (5,): per-head log cosine temperature
+    float *dec_lin;             // (32, H) bias-free; rows [22 verb | 8 dir | value], 31 used
+    float *dec_q;               // (192, H): twelve stacked 16-dim query projections
+    float *dec_k;               // (16, 16): key projection over slot features
+    float *dec_tau;             // (12,): per-head log cosine temperature
     MinGRU* mingru;
     Multidiscrete* md;
     int hidden_size, num_layers, num_actions;
@@ -107,8 +101,8 @@ typedef struct {
 } NethackNet;
 
 // (hidden, layers) from the checkpoint float count:
-//   total = ENC_FIXED + H*(DEMO_CONCAT + 1) + H*(24 + 160) + DEC_FIXED + L * 3*H*H
-// All tensors land on 8-float boundaries; only tau (5) needs padding (+3).
+//   total = ENC_FIXED + H*(DEMO_CONCAT + 1) + H*(32 + 192) + DEC_FIXED + L * 3*H*H
+// All tensors land on 8-float boundaries; only tau (12) needs padding (+4).
 #define DEMO_ENC_FIXED (DEMO_VOCAB*DEMO_EMBED \
                         + NH_GM_NKIND*DEMO_EMBED + NH_GM_NSUB*DEMO_EMBED \
                         + DEMO_LOC_HID*DEMO_LOC_IN + DEMO_LOC_HID \
@@ -119,7 +113,7 @@ typedef struct {
                         + DEMO_INV_POOL*DEMO_INV_HID + DEMO_INV_POOL \
                         + 64*DEMO_BL_FEAT + 64 \
                         + DEMO_MSG_VOCAB*DEMO_MSG_HID)
-#define DEMO_DEC_FIXED (DEMO_INV_HID*DEMO_INV_HID + 8)   // k_w + tau padded 5->8
+#define DEMO_DEC_FIXED (DEMO_INV_HID*DEMO_INV_HID + 16)   // k_w + tau padded 12->16
 // ambiguities are possible; prefer the fewest layers (real configs have <= 8)
 static int demo_infer_arch(int total, int* hidden, int* layers, int* actions) {
     int best_l = 1 << 30;
@@ -172,8 +166,10 @@ static NethackNet* make_nethack_net(Weights* w) {
     net->dec_tau = get_weights_aligned(w, DEMO_PTR_HEADS);
     net->mingru  = make_mingru(w, 1, net->hidden_size, net->num_layers);
     static int logit_sizes[DEMO_NUM_HEADS] = {
-        NETHACK_NUM_ACTIONS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS,
-        NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_NUM_DIRS};
+        NETHACK_NUM_ACTIONS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS,
+        NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS,
+        NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS, NETHACK_INV_SLOTS,
+        NETHACK_INV_SLOTS, NETHACK_NUM_DIRS};
     net->md = make_multidiscrete(1, logit_sizes, DEMO_NUM_HEADS);
     assert(w->idx == w->size - 7);
     // materialize the residual-factorized embedding once (host, load time)
@@ -211,6 +207,13 @@ static void demo_msg_pool(NethackNet* net, const unsigned char* obs, float* out)
     for (int d = 0; d < DEMO_MSG_HID; d++) out[d] *= scale;
 }
 
+// blstats/extra live at unaligned byte offsets: assemble, don't cast
+static int32_t demo_i32(const unsigned char* p) {
+    int32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
 static int demo_glyph_at(const int16_t* glyphs, int r, int c) {
     if (r < 0 || r >= NH_ROWS || c < 0 || c >= NH_COLS) return NETHACK_PAD_GLYPH;
     int g = glyphs[r * NH_COLS + c];
@@ -221,10 +224,10 @@ static int demo_glyph_at(const int16_t* glyphs, int r, int c) {
 
 static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {   // fills decoder->output
     const int16_t* glyphs = (const int16_t*)(obs + NETHACK_OFF_GLYPHS);
-    const int32_t* bl = (const int32_t*)(obs + NETHACK_OFF_BLSTATS);
+    const unsigned char* bl = obs + NETHACK_OFF_BLSTATS;
 
     // local view: per-cell embeds of the egocentric crop, flattened
-    int hx = bl[0], hy = bl[1];
+    int hx = demo_i32(bl), hy = demo_i32(bl + 4);
     int half = NETHACK_CROP / 2;
     for (int p = 0; p < NETHACK_CROP_GRID; p++) {
         int g = demo_glyph_at(glyphs, hy - half + p / NETHACK_CROP,
@@ -280,6 +283,9 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {   //
         sf[8] = (float)st[4] * (1.0f / 3.0f);
         for (int c = 0; c < 7; c++) sf[9 + c] = (float)((st[5] >> c) & 1);
         sf[16] = (float)st[6];
+        int ot = inv[slot] - NH_GLYPH_OBJ_OFF;   // armor slot category one-hot
+        int cat = (ot >= 0 && ot < NH_NUM_OBJECTS) ? nh_obj_armcat[ot] : -1;
+        for (int c = 0; c < 7; c++) sf[17 + c] = cat == c ? 1.0f : 0.0f;
         float* h32 = net->slots + slot * DEMO_INV_HID;
         _linear(net->e_eff + g * DEMO_EMBED, net->inv1_w, net->inv1_b,
                 h32, 1, DEMO_EMBED, DEMO_INV_HID);
@@ -300,23 +306,34 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {   //
         invp[o] = fmaxf(best + net->inv2_b[o], 0.0f);
     }
 
-    // blstats+extra features (25 scalars, hunger 7, cond bits 13, cooldown,
-    // prev verb one-hot, inv class counts)
+    // blstats+extra features (25 scalars, hunger 7, cond bits 13, prev verb
+    // one-hot, inv class counts, hp/ene frac, dnum one-hot, engraving bits)
     float* f = net->concat + DEMO_LOC_HID + DEMO_GLB_HID + DEMO_INV_POOL + 64;
     int j = 0;
     for (int i = 0; i < 27; i++) {
         if (i == 21 || i == 25) continue;   // hunger, condition: expanded below
-        float v = (float)bl[i];
+        float v = (float)demo_i32(bl + 4*i);
         f[j++] = DEMO_BL_ISLOG[i] ? log1pf(fmaxf(v, 0.f)) * DEMO_BL_SCALE[i]
                                   : v * DEMO_BL_SCALE[i];
     }
-    int hunger = bl[21] < 0 ? 0 : (bl[21] > 6 ? 6 : bl[21]);
+    int h21 = demo_i32(bl + 4*21);
+    int hunger = h21 < 0 ? 0 : (h21 > 6 ? 6 : h21);
     for (int h = 0; h < 7; h++) f[j++] = (h == hunger) ? 1.f : 0.f;
-    for (int k = 0; k < 13; k++) f[j++] = (float)(((uint32_t)bl[25] >> k) & 1u);
-    const int32_t* ex = (const int32_t*)(obs + NETHACK_OFF_EXTRA);
-    f[j++] = log1pf(fmaxf((float)ex[0], 0.f)) * 0.1f;   // prayer cooldown
-    for (int h = 0; h < NETHACK_NUM_ACTIONS; h++) f[j++] = (h == ex[1]) ? 1.f : 0.f;
-    for (int k = 0; k < NETHACK_NUM_OCLASSES; k++) f[j++] = (float)ex[2 + k] * 0.125f;
+    for (int k = 0; k < 13; k++) f[j++] = (float)(((uint32_t)demo_i32(bl + 4*25) >> k) & 1u);
+    const unsigned char* ex = obs + NETHACK_OFF_EXTRA;
+    for (int h = 0; h < NETHACK_NUM_ACTIONS; h++) f[j++] = (h == demo_i32(ex + 4)) ? 1.f : 0.f;
+    for (int k = 0; k < NETHACK_NUM_OCLASSES; k++) f[j++] = (float)demo_i32(ex + 4*(2 + k)) * 0.125f;
+    for (int p = 0; p < 2; p++) {   // hp_frac, ene_frac
+        int cur = demo_i32(bl + 4*(p ? 14 : 10)), mx = demo_i32(bl + 4*(p ? 15 : 11));
+        f[j++] = fminf(fmaxf((float)cur / (float)(mx > 1 ? mx : 1), 0.f), 1.f);
+    }
+    int d23 = demo_i32(bl + 4*23);
+    int dnum = d23 < 0 ? 0 : (d23 > 7 ? 7 : d23);
+    for (int d = 0; d < 8; d++) f[j++] = (d == dnum) ? 1.f : 0.f;
+    int engr = demo_i32(ex);
+    f[j++] = engr >= 1 ? 1.f : 0.f;   // any engraving underfoot
+    f[j++] = engr >= 2 ? 1.f : 0.f;   // active Elbereth
+    for (int k = 0; k < DEMO_BL_FEAT; k++) f[k] = fminf(fmaxf(f[k], -1.f), 1.f);
 
     float* blout = net->concat + DEMO_LOC_HID + DEMO_GLB_HID + DEMO_INV_POOL;
     _linear(f, net->bl_w, net->bl_b, blout, 1, DEMO_BL_FEAT, 64);
@@ -329,7 +346,7 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {   //
 
     mingru(net->mingru, net->hidden);
 
-    // pointer decoder: [14 verb | 5x55 slots | 8 dir | value]. verb/dir/value
+    // pointer decoder: [22 verb | 12x55 slots | 8 dir | value]. verb/dir/value
     // from one bias-free linear; slot logit i = tau_h * cos(q_h, k_i) with
     // keys k_i projected from the per-slot features above.
     float* hs = net->mingru->output;
@@ -378,109 +395,45 @@ static int nethack_net_forward(NethackNet* net, const unsigned char* obs) {   //
     return 0;
 }
 
-// masked multi-head sampling: illegal entries (mask 0) can't be drawn
-static void demo_sample(NethackNet* net, const unsigned char* mask, float* out_acts) {
-    if (mask != NULL)
-        for (int i = 0; i < DEMO_OD; i++)
-            if (!mask[i]) net->logits[i] = -1e9f;
-    softmax_multidiscrete(net->md, net->logits, out_acts);
-}
-
 static void run_demo(long max_steps, int frame_ms) {
     const char* wpath = getenv("NH_WEIGHTS");
     if (!wpath) wpath = "resources/nethack/nethack_weights.bin";
     Weights* w = load_weights((char*)wpath);
     if (!w) {
-        fprintf(stderr, "nethack demo: %s missing.\n"
-                "Train first, then copy a checkpoint:\n"
-                "  cp checkpoints/nethack/<run>/<final>.bin resources/nethack/nethack_weights.bin\n",
-                wpath);
+        fprintf(stderr, "nethack demo: %s missing (copy a checkpoint there)\n", wpath);
         exit(1);
     }
     NethackNet* net = make_nethack_net(w);
 
     Nethack env;
     env_open(&env);
-    const char* seed_env = getenv("NH_SEED");   // fixed seed pairs A/B sampling
+    const char* seed_env = getenv("NH_SEED");   // fixed seed replays a run
     srand(seed_env ? (unsigned)strtoul(seed_env, NULL, 10) : (unsigned)time(NULL));
 
-    long max_dlvl = 1;
-    long acts[NETHACK_NUM_ACTIONS] = {0};
-    float ep_score = 0.0f, ep_len = 0.0f;   // log totals at last episode end
-    float p_comb=0, p_starv=0, p_smite=0, p_trunc=0, p_mdep=0, p_xp=0,
-          p_klvl=0, p_mhp=0, p_adj=0, p_burst=0;   // per-episode death deltas
+    float ep_score = 0, ep_len = 0;   // log totals at last episode end
     float acts_f[DEMO_NUM_HEADS];
-    const int keep_state = getenv("NH_KEEP_STATE") != NULL;
-    const char* max_ep_env = getenv("NH_MAX_EPISODES");
-    const long max_episodes = max_ep_env ? strtol(max_ep_env, NULL, 10) : 0;   // 0 = unbounded
-    long nep = 0;
     for (long t = 0; t < max_steps; t++) {
         nethack_net_forward(net, env.observations);
-        demo_sample(net, env.action_mask, acts_f);
-        int a = (int)acts_f[0];
-        acts[a]++;
+        for (int i = 0; i < DEMO_OD; i++)
+            if (!env.action_mask[i]) net->logits[i] = -1e9f;
+        softmax_multidiscrete(net->md, net->logits, acts_f);
         for (int h = 0; h < DEMO_NUM_HEADS; h++) env.actions[h] = acts_f[h];
         c_step(&env);
-        if (env.blstats[NLE_BL_DEPTH] > max_dlvl) max_dlvl = env.blstats[NLE_BL_DEPTH];
         if (frame_ms > 0) {
             c_render(&env);
             usleep(frame_ms * 1000);
-        } else if (t % 2000 == 1999) {
-            fprintf(stderr, "step %ld: score=%ld dlvl=%ld T=%ld len=%d\n", t + 1,
-                    env.blstats[NLE_BL_SCORE], env.blstats[NLE_BL_DEPTH],
-                    env.blstats[NLE_BL_TIME], env.stats.length);
         }
         if (env.terminals[0] > 0.5f) {
-            // c_step already reset the env; per-episode values via log deltas
-            float dc=env.log.death_combat-p_comb, dst=env.log.death_starved-p_starv,
-                  dsm=env.log.death_smited-p_smite, dtr=env.log.truncated-p_trunc;
-            const char* how = dc>0.5f?"combat": dst>0.5f?"starved":
-                              dsm>0.5f?"smited": dtr>0.5f?"trunc":"other";
-            fprintf(stderr, "episode end: score=%.0f len=%.0f how=%s mdepth=%.0f xp=%.0f "
-                    "klvl=%.0f maxhp=%.0f adj=%.0f burst=%.0f\n",
-                    env.log.score - ep_score, env.log.episode_length - ep_len, how,
-                    env.log.max_depth - p_mdep, env.log.max_xp_level - p_xp,
-                    env.log.death_mon_level - p_klvl, env.log.death_maxhp - p_mhp,
-                    env.log.death_adj_monsters - p_adj, env.log.death_burst_turns - p_burst);
+            fprintf(stderr, "episode end: score=%.0f len=%.0f\n",
+                    env.log.score - ep_score, env.log.episode_length - ep_len);
             ep_score = env.log.score;
             ep_len = env.log.episode_length;
-            p_comb=env.log.death_combat; p_starv=env.log.death_starved;
-            p_smite=env.log.death_smited; p_trunc=env.log.truncated;
-            p_mdep=env.log.max_depth; p_xp=env.log.max_xp_level;
-            p_klvl=env.log.death_mon_level; p_mhp=env.log.death_maxhp;
-            p_adj=env.log.death_adj_monsters; p_burst=env.log.death_burst_turns;
-            if (!keep_state)
-                memset(net->mingru->state, 0,
-                       (size_t)net->num_layers * net->hidden_size * sizeof(float));
-            if (max_episodes && ++nep >= max_episodes) break;
+            memset(net->mingru->state, 0,
+                   (size_t)net->num_layers * net->hidden_size * sizeof(float));
         }
     }
-    fprintf(stderr, "actions:");
-    for (int i = 0; i < NETHACK_NUM_ACTIONS; i++)
-        fprintf(stderr, " %s=%ld", NETHACK_ACTION_NAMES[i], acts[i]);
-    fprintf(stderr, "\n");
-    if (env.log.n > 0) {
-        printf("demo: episodes=%.0f  avg_score=%.1f  avg_len=%.0f  avg_depth=%.2f  max_dlvl=%ld\n",
-               env.log.n, env.log.score / env.log.n, env.log.episode_length / env.log.n,
-               env.log.depth / env.log.n, max_dlvl);
-        printf("areas: mines=%.2f  minetown=%.2f  deep_mines=%.2f  main_d5=%.2f  sokoban=%.2f\n",
-               env.log.reach_mines / env.log.n, env.log.reach_minetown / env.log.n,
-               env.log.reach_deep_mines / env.log.n, env.log.reach_main_d5 / env.log.n,
-               env.log.reach_sokoban / env.log.n);
-        printf("rest/burden: regen_ticks=%.1f ups_hurt=%.2f burdened=%.1f%% pack_full=%.1f%% searches=%.1f (per ep)\n",
-               env.log.regen_ticks / env.log.n, env.log.ups_hurt / env.log.n,
-               100.f * env.log.burdened_frac / env.log.n, 100.f * env.log.pack_full_frac / env.log.n,
-               env.log.searches / env.log.n);
-        printf("deaths: combat=%.2f starved=%.2f killer_lvl=%.1f burst_turns=%.1f adj=%.1f maxhp=%.1f\n",
-               env.log.death_combat / env.log.n, env.log.death_starved / env.log.n,
-               env.log.death_mon_level / env.log.n, env.log.death_burst_turns / env.log.n,
-               env.log.death_adj_monsters / env.log.n, env.log.death_maxhp / env.log.n);
-        printf("items: wears=%.2f eats=%.2f (floor %.2f) quaffs=%.2f throws=%.2f zaps=%.2f prayers=%.2f engraves=%.2f (per ep)\n",
-               env.log.wears / env.log.n, env.log.eats / env.log.n,
-               env.log.floor_eats / env.log.n, env.log.quaffs / env.log.n,
-               env.log.throws / env.log.n, env.log.zaps / env.log.n,
-               env.log.prayers / env.log.n, env.log.engraves / env.log.n);
-    }
+    if (env.log.n > 0)
+        printf("episodes=%.0f  avg_score=%.1f\n", env.log.n, env.log.score / env.log.n);
     env_close(&env);
     free_mingru(net->mingru);
     free(net->md); free(net->hidden); free(net->e_eff); free(net);

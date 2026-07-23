@@ -30,49 +30,27 @@ void my_init(Env* env, Dict* kwargs) {
 }
 
 void my_log(Log* log, Dict* out) {
+    for (int v = 0; v < NETHACK_NUM_ACTIONS; v++)
+        if (NETHACK_VERB_STAT[v]) dict_set(out, NETHACK_VERB_STAT[v], log->verb_uses[v]);
     dict_set(out, "perf", log->perf);
     dict_set(out, "score", log->score);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
-    dict_set(out, "depth", log->depth);
     dict_set(out, "valid_moves", log->valid_moves);
     dict_set(out, "illegal_actions", log->illegal_actions);
     dict_set(out, "new_tiles", log->new_tiles);
     dict_set(out, "max_depth", log->max_depth);
-    dict_set(out, "searches", log->searches);
-    dict_set(out, "engraves", log->engraves);
-    dict_set(out, "wears", log->wears);
-    dict_set(out, "eats", log->eats);
+    dict_set(out, "enhances", log->enhances);
     dict_set(out, "floor_eats", log->floor_eats);
-    dict_set(out, "quaffs", log->quaffs);
-    dict_set(out, "prayers", log->prayers);
     dict_set(out, "prayers_low_hp", log->prayers_low_hp);
     dict_set(out, "prayers_starving", log->prayers_starving);
-    dict_set(out, "prayers_trouble", log->prayers_trouble);
-    dict_set(out, "throws", log->throws);
-    dict_set(out, "zaps", log->zaps);
-    dict_set(out, "pickups", log->pickups);
-    dict_set(out, "takeoffs", log->takeoffs);
-    dict_set(out, "putons", log->putons);
-    dict_set(out, "removes", log->removes);
-    dict_set(out, "wields", log->wields);
-    dict_set(out, "applies", log->applies);
-    dict_set(out, "reads", log->reads);
-    dict_set(out, "drops", log->drops);
-    dict_set(out, "rests", log->rests);
-    dict_set(out, "use_slot_mean", log->use_slot_mean);
-    dict_set(out, "valid_slot_mean", log->valid_slot_mean);
-    dict_set(out, "regen_ticks", log->regen_ticks);
-    dict_set(out, "ups_hurt", log->ups_hurt);
     dict_set(out, "burdened_frac", log->burdened_frac);
-    dict_set(out, "pack_full_frac", log->pack_full_frac);
     dict_set(out, "damage_taken", log->damage_taken);
     dict_set(out, "ac", log->ac);
     dict_set(out, "min_ac", log->min_ac);
-    dict_set(out, "swaps", log->swaps);
+    dict_set(out, "armor_swaps", log->armor_swaps);
     dict_set(out, "heal_hp", log->heal_hp);
     dict_set(out, "cures", log->cures);
-    dict_set(out, "reward_saturated", log->reward_saturated);
     dict_set(out, "game_time", log->game_time);
     dict_set(out, "max_xp_level", log->max_xp_level);
     dict_set(out, "death_combat", log->death_combat);
@@ -80,7 +58,6 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "death_smited", log->death_smited);
     dict_set(out, "death_other", log->death_other);
     dict_set(out, "death_mon_level", log->death_mon_level);
-    dict_set(out, "death_burst_turns", log->death_burst_turns);
     dict_set(out, "death_adj_monsters", log->death_adj_monsters);
     dict_set(out, "death_maxhp", log->death_maxhp);
     dict_set(out, "truncated", log->truncated);
