@@ -162,6 +162,8 @@ struct PPOKernelArgs {
     const int* act_sizes;
     const precision_t* action_mask; // (N, T, A_total) or nullptr
     int mask_stride_n, mask_stride_t;
+    const signed char* head_consume; // (nverbs, num_atns) or nullptr
+    int hc_stride;
     int num_atns;
     float clip_coef, vf_clip_coef, vf_coef;
     const float* ent_coef; // device ptr, by-value args get baked into the cuda graph
@@ -462,6 +464,30 @@ __device__ __forceinline__ float masked_logit(const precision_t* logits,
 }
 
 // Expects action logits and values to be in the same contiguous buffer. See default decoder
+// ---- consumed-head gating (opt-in via PUFFER_HEAD_GATING) ----
+extern "C" __attribute__((weak)) const signed char* env_head_consume_map(int*, int*);
+static const signed char* g_hc_dev = nullptr;
+static int g_hc_stride = 0;
+static bool g_hc_init = false;
+static const signed char* get_head_consume_dev(int* stride) {
+    if (!g_hc_init) {
+        g_hc_init = true;
+        const char* hg = getenv("PUFFER_HEAD_GATING");
+        if (hg && hg[0] && hg[0] != '0' && env_head_consume_map) {
+            int nv = 0, na = 0;
+            const signed char* host = env_head_consume_map(&nv, &na);
+            if (host && nv > 0 && na > 0) {
+                signed char* dev = nullptr;
+                cudaMalloc(&dev, (size_t)nv * na);
+                cudaMemcpy(dev, host, (size_t)nv * na, cudaMemcpyHostToDevice);
+                g_hc_dev = dev; g_hc_stride = na;
+            }
+        }
+    }
+    *stride = g_hc_stride;
+    return g_hc_dev;
+}
+
 __global__ void sample_logits(
         PrecisionTensor dec_out,              // (B, logits_dim + 1 for values)
         PrecisionTensor logstd_puf,           // (1, od) - continuous actions only
@@ -471,7 +497,9 @@ __global__ void sample_logits(
         precision_t* __restrict__ value_out,  // (B,)
         curandStatePhilox4_32_10_t* __restrict__ rng_states,
         const precision_t* __restrict__ action_mask, // (B, A_total) or nullptr
-        int mask_stride) {                    // 0 when action_mask is nullptr
+        int mask_stride,                      // 0 when action_mask is nullptr
+        const signed char* __restrict__ head_consume, // (nverbs, num_atns) or nullptr
+        int hc_stride) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
     int num_atns = numel(act_sizes_puf.shape);
@@ -575,7 +603,11 @@ __global__ void sample_logits(
 
             // Write action for this head
             actions[idx * num_atns + h] = from_float(sampled_action);
-            total_log_prob += log_prob;
+            // consumed-head gating: only heads the sampled verb uses count
+            int verb = (int)to_float(actions[idx * num_atns]);
+            int used = (head_consume == nullptr || h == 0)
+                     ? 1 : (int)head_consume[verb * hc_stride + h];
+            if (used) total_log_prob += log_prob;
 
             // Advance to next action head
             logits_offset += A;
@@ -699,11 +731,13 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         }
 
         // Offset RNG by bank_off so banks don't collide on per-buffer rng slots.
+        int hc_stride_s = 0;
+        const signed char* hc_dev_s = get_head_consume_dev(&hc_stride_s);
         sample_logits<<<grid_size(bank_size), BLOCK_SIZE, 0, stream>>>(
             dec_puf, p_logstd, pufferl->act_sizes_puf,
             act_b.data, lp_b.data, val_b.data,
             pufferl->rng_states[buf] + bank_off,
-            mask_b.data, mask_stride_b);
+            mask_b.data, mask_stride_b, hc_dev_s, hc_stride_s);
 
         cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
                 env.actions.data + (long)sub_start * act_cols,
@@ -859,23 +893,29 @@ __global__ void ppo_loss_compute(
     float head_logsumexp[MAX_ATN_HEADS];
     float head_entropy[MAX_ATN_HEADS];
     int head_act[MAX_ATN_HEADS];
+    int head_used[MAX_ATN_HEADS];
 
     int mask_base = (a.action_mask != nullptr)
         ? n * a.mask_stride_n + t * a.mask_stride_t : 0;
 
     if (!a.is_continuous) {
+        // consumed-head gating: heads the sampled verb (head 0) does not use
+        // contribute no logprob/entropy/gradient (see env_head_consume_map)
+        int verb = static_cast<int>(g.actions[nt * a.num_atns]);
         int logits_offset = 0;
         for (int h = 0; h < a.num_atns; ++h) {
             int A = a.act_sizes[h];
             int act = static_cast<int>(g.actions[nt * a.num_atns + h]);
             head_act[h] = act;
+            int used = (a.head_consume == nullptr || h == 0)
+                     ? 1 : (int)a.head_consume[verb * a.hc_stride + h];
+            head_used[h] = used;
             float lse, ent, lp;
             ppo_discrete_head(a.logits, logits_base, a.logits_stride_a, logits_offset, A, act,
                               a.action_mask, mask_base, &lse, &ent, &lp);
             head_logsumexp[h] = lse;
             head_entropy[h] = ent;
-            total_log_prob += lp;
-            total_entropy += ent;
+            if (used) { total_log_prob += lp; total_entropy += ent; }
             logits_offset += A;
         }
     } else {
@@ -912,6 +952,12 @@ __global__ void ppo_loss_compute(
         int logits_offset = 0;
         for (int h = 0; h < a.num_atns; ++h) {
             int A = a.act_sizes[h];
+            if (!head_used[h]) {           // gated head: no gradient
+                for (int j = 0; j < A; ++j)
+                    a.grad_logits[grad_logits_base + logits_offset + j] = 0.0f;
+                logits_offset += A;
+                continue;
+            }
             int act = head_act[h];
             float logsumexp = head_logsumexp[h];
             float ent = head_entropy[h];
@@ -1090,7 +1136,9 @@ void ppo_loss_fwd_bwd(
     };
 
     bool has_mask = (graph.mb_action_mask.data != nullptr);
-    PPOKernelArgs args = {
+            int hc_stride_l = 0;
+        const signed char* hc_dev_l = get_head_consume_dev(&hc_stride_l);
+PPOKernelArgs args = {
         .grad_logits = bufs.grad_logits.data,
         .grad_logstd = is_continuous ? bufs.grad_logstd.data : nullptr,
         .grad_values_pred = bufs.grad_values.data,
@@ -1103,6 +1151,8 @@ void ppo_loss_fwd_bwd(
         .action_mask = has_mask ? graph.mb_action_mask.data : nullptr,
         .mask_stride_n = has_mask ? T * A_total : 0,
         .mask_stride_t = has_mask ? A_total : 0,
+        .head_consume = hc_dev_l,
+        .hc_stride = hc_stride_l,
         .num_atns = (int)numel(act_sizes.shape),
         .clip_coef = clip_coef, .vf_clip_coef = vf_clip_coef,
         .vf_coef = vf_coef, .ent_coef = ent_coef,
