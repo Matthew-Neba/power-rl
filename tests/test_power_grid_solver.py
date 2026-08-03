@@ -50,3 +50,27 @@ def test_power_grid_baselines(tmp_path):
         cwd=ROOT,
     )
     subprocess.run([str(executable)], check=True, cwd=ROOT)
+
+
+def test_power_grid_ac_solver(tmp_path):
+    executable = tmp_path / "test_power_grid_ac"
+    subprocess.run(
+        [
+            "clang",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic",
+            f"-I{ROOT / 'ocean' / 'power_grid'}",
+            str(ROOT / "tests" / "test_power_grid_ac.c"),
+            str(ROOT / "ocean" / "power_grid" / "power_grid_solver.c"),
+            str(ROOT / "ocean" / "power_grid" / "power_grid_ac.c"),
+            "-lm",
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        cwd=ROOT,
+    )
+    subprocess.run([str(executable)], check=True, cwd=ROOT)

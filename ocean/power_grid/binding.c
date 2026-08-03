@@ -1,4 +1,5 @@
 #include "power_grid_solver.c"
+#include "power_grid_ac.c"
 #include "power_grid.h"
 
 #define OBS_SIZE POWER_GRID_OBS_SIZE
@@ -10,21 +11,33 @@
 #include "vecenv.h"
 
 void my_init(Env* env, Dict* kwargs) {
-    (void)kwargs;
     env->num_agents = 1;
     env->owns_buffers = 0;
+    env->ac_power_flow = (int)dict_get(kwargs, "ac_power_flow")->value;
+    env->evaluation_scenarios = (int)dict_get(kwargs, "evaluation_scenarios")->value;
 }
 
 void my_log(Log* log, Dict* out) {
-    dict_set(out, "perf", log->perf);
-    dict_set(out, "score", log->score);
-    dict_set(out, "episode_return", log->episode_return);
-    dict_set(out, "episode_length", log->episode_length);
-    dict_set(out, "total_failure", log->total_failure);
-    dict_set(out, "topology_failure", log->topology_failure);
-    dict_set(out, "solver_failure", log->solver_failure);
-    dict_set(out, "total_switches", log->total_switches);
-    dict_set(out, "line_switches", log->line_switches);
-    dict_set(out, "busbar_switches", log->busbar_switches);
-    dict_set(out, "coupler_switches", log->coupler_switches);
+#define POWER_GRID_LOG(field) dict_set(out, #field, log->field)
+    POWER_GRID_LOG(perf);
+    POWER_GRID_LOG(score);
+    POWER_GRID_LOG(episode_return);
+    POWER_GRID_LOG(episode_length);
+    POWER_GRID_LOG(total_failure);
+    POWER_GRID_LOG(topology_failure);
+    POWER_GRID_LOG(solver_failure);
+    POWER_GRID_LOG(total_switches);
+    POWER_GRID_LOG(line_switches);
+    POWER_GRID_LOG(busbar_switches);
+    POWER_GRID_LOG(coupler_switches);
+    POWER_GRID_LOG(overload_free_steps);
+    POWER_GRID_LOG(ac_voltage_violation_steps);
+    POWER_GRID_LOG(ac_generator_p_violation_steps);
+    POWER_GRID_LOG(ac_q_limit_events);
+    POWER_GRID_LOG(ac_mean_active_loss_mw);
+    POWER_GRID_LOG(ac_nonconvergence);
+    POWER_GRID_LOG(ac_thermal_trips);
+    POWER_GRID_LOG(ac_peak_thermal_stress);
+    POWER_GRID_LOG(maintenance_events);
+#undef POWER_GRID_LOG
 }

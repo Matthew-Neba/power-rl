@@ -124,23 +124,18 @@ static int topology_inputs_valid(const PowerGridTopology* topology) {
     return 1;
 }
 
-PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topology,
-        int* component_count, int* active_node_count) {
-    unsigned char active[POWER_GRID_NUM_NODES] = {0};
-    unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
-    unsigned char visited[POWER_GRID_NUM_NODES] = {0};
-    int queue[POWER_GRID_NUM_NODES];
-    if (component_count) *component_count = 0;
-    if (active_node_count) *active_node_count = 0;
-    if (topology == NULL || !topology_inputs_valid(topology)) return POWER_GRID_INVALID_INPUT;
-
+static void build_topology_graph(const PowerGridTopology* topology,
+        unsigned char active[POWER_GRID_NUM_NODES],
+        unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES]) {
     for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
         if (!topology->line_closed[branch]) continue;
         const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
-        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
-        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0),
+            line->from_bus);
+        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1),
+            line->to_bus);
         active[from] = active[to] = 1;
-        adjacency[from][to] = adjacency[to][from] = 1;
+        if (adjacency != NULL) adjacency[from][to] = adjacency[to][from] = 1;
     }
     for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
@@ -152,36 +147,16 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
             POWER_GRID_LOAD_BUSES[load]);
         active[node] = 1;
     }
+}
 
-    int active_count = 0;
-    int components = 0;
-    for (int node = 0; node < POWER_GRID_NUM_NODES; node++) active_count += active[node] != 0;
-    for (int start = 0; start < POWER_GRID_NUM_NODES; start++) {
-        if (!active[start] || visited[start]) continue;
-        components++;
-        int head = 0, tail = 0;
-        queue[tail++] = start;
-        visited[start] = 1;
-        while (head < tail) {
-            int node = queue[head++];
-            for (int next = 0; next < POWER_GRID_NUM_NODES; next++) {
-                if (active[next] && adjacency[node][next] && !visited[next]) {
-                    visited[next] = 1;
-                    queue[tail++] = next;
-                }
-            }
-        }
-    }
-    if (component_count) *component_count = components;
-    if (active_node_count) *active_node_count = active_count;
-
-    int reference = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(0),
-        POWER_GRID_GENERATOR_BUSES[0]);
-    /* Find exactly the nodes reachable from the slack/reference generator. */
-    memset(visited, 0, sizeof(visited));
+static void mark_component(
+        const unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES],
+        const unsigned char active[POWER_GRID_NUM_NODES], int start,
+        unsigned char visited[POWER_GRID_NUM_NODES]) {
+    int queue[POWER_GRID_NUM_NODES];
     int head = 0, tail = 0;
-    visited[reference] = 1;
-    queue[tail++] = reference;
+    visited[start] = 1;
+    queue[tail++] = start;
     while (head < tail) {
         int node = queue[head++];
         for (int next = 0; next < POWER_GRID_NUM_NODES; next++) {
@@ -191,6 +166,35 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
             }
         }
     }
+}
+
+PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topology,
+        int* component_count, int* active_node_count) {
+    unsigned char active[POWER_GRID_NUM_NODES] = {0};
+    unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
+    unsigned char visited[POWER_GRID_NUM_NODES] = {0};
+    if (component_count) *component_count = 0;
+    if (active_node_count) *active_node_count = 0;
+    if (topology == NULL || !topology_inputs_valid(topology)) return POWER_GRID_INVALID_INPUT;
+
+    build_topology_graph(topology, active, adjacency);
+
+    int active_count = 0;
+    int components = 0;
+    for (int node = 0; node < POWER_GRID_NUM_NODES; node++) active_count += active[node] != 0;
+    for (int start = 0; start < POWER_GRID_NUM_NODES; start++) {
+        if (!active[start] || visited[start]) continue;
+        components++;
+        mark_component(adjacency, active, start, visited);
+    }
+    if (component_count) *component_count = components;
+    if (active_node_count) *active_node_count = active_count;
+
+    int reference = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(0),
+        POWER_GRID_GENERATOR_BUSES[0]);
+    /* Find exactly the nodes reachable from the slack/reference generator. */
+    memset(visited, 0, sizeof(visited));
+    mark_component(adjacency, active, reference, visited);
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
             POWER_GRID_LOAD_BUSES[load]);
@@ -205,32 +209,41 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
     return POWER_GRID_SOLVE_OK;
 }
 
-static int solve_linear(double a[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES],
-        double b[POWER_GRID_NUM_NODES], double x[POWER_GRID_NUM_NODES], int n) {
-    for (int col = 0; col < n; col++) {
+int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
+        int dimensions, int stride) {
+    if (matrix == NULL || rhs == NULL || solution == NULL || dimensions < 0 ||
+            stride < dimensions) return 0;
+    for (int col = 0; col < dimensions; col++) {
         int pivot = col;
-        for (int row = col + 1; row < n; row++) {
-            if (fabs(a[row][col]) > fabs(a[pivot][col])) pivot = row;
+        for (int row = col + 1; row < dimensions; row++) {
+            if (fabs(matrix[row * stride + col]) > fabs(matrix[pivot * stride + col])) pivot = row;
         }
-        if (!isfinite(a[pivot][col]) || fabs(a[pivot][col]) < 1e-12) return 0;
+        if (!isfinite(matrix[pivot * stride + col]) ||
+                fabs(matrix[pivot * stride + col]) < 1e-12) return 0;
         if (pivot != col) {
-            for (int j = col; j < n; j++) {
-                double tmp = a[col][j]; a[col][j] = a[pivot][j]; a[pivot][j] = tmp;
+            for (int j = col; j < dimensions; j++) {
+                double swap = matrix[col * stride + j];
+                matrix[col * stride + j] = matrix[pivot * stride + j];
+                matrix[pivot * stride + j] = swap;
             }
-            double tmp = b[col]; b[col] = b[pivot]; b[pivot] = tmp;
+            double swap = rhs[col]; rhs[col] = rhs[pivot]; rhs[pivot] = swap;
         }
-        for (int row = col + 1; row < n; row++) {
-            double factor = a[row][col] / a[col][col];
-            a[row][col] = 0.0;
-            for (int j = col + 1; j < n; j++) a[row][j] -= factor * a[col][j];
-            b[row] -= factor * b[col];
+        for (int row = col + 1; row < dimensions; row++) {
+            double factor = matrix[row * stride + col] / matrix[col * stride + col];
+            matrix[row * stride + col] = 0.0;
+            for (int j = col + 1; j < dimensions; j++) {
+                matrix[row * stride + j] -= factor * matrix[col * stride + j];
+            }
+            rhs[row] -= factor * rhs[col];
         }
     }
-    for (int row = n - 1; row >= 0; row--) {
-        double value = b[row];
-        for (int col = row + 1; col < n; col++) value -= a[row][col] * x[col];
-        x[row] = value / a[row][row];
-        if (!isfinite(x[row])) return 0;
+    for (int row = dimensions - 1; row >= 0; row--) {
+        double value = rhs[row];
+        for (int col = row + 1; col < dimensions; col++) {
+            value -= matrix[row * stride + col] * solution[col];
+        }
+        solution[row] = value / matrix[row * stride + row];
+        if (!isfinite(solution[row])) return 0;
     }
     return 1;
 }
@@ -275,13 +288,7 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         return result->status;
     }
 
-    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
-        if (!topology->line_closed[branch]) continue;
-        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
-        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
-        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
-        active[from] = active[to] = 1;
-    }
+    build_topology_graph(topology, active, NULL);
     for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
             POWER_GRID_GENERATOR_BUSES[gen]);
@@ -323,7 +330,8 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         if (row_for_node[node] >= 0) rhs[row_for_node[node]] = injection[node];
     }
-    if (!solve_linear(matrix, rhs, solution, dimensions)) {
+    if (!power_grid_solve_dense(&matrix[0][0], rhs, solution, dimensions,
+            POWER_GRID_NUM_NODES)) {
         result->status = POWER_GRID_SINGULAR;
         return result->status;
     }

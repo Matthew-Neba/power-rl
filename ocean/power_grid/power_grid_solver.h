@@ -120,4 +120,8 @@ PowerGridSolveStatus power_grid_solve(
 const char* power_grid_solve_status_name(PowerGridSolveStatus status);
 const char* power_grid_action_name(int action, char* buffer, size_t size);
 
+/* Shared pivoted dense solve used by the small DC and AC nodal systems. */
+int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
+    int dimensions, int stride);
+
 #endif
