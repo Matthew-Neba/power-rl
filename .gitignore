@@ -159,6 +159,18 @@ experiments/
 wandb/
 .neptune/
 raylib*/
+
+# Training outputs and model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+trainer_state.*
+**/checkpoints/
+**/experiments/
+**/runs/
+**/outputs/
 box2d*/
 
 # Temp Impulse Wars files
