@@ -111,13 +111,13 @@ For a valid post-action state:
 
 `N_switch=0` for no-op and `1` for a line, terminal, or coupler toggle. A safe no-op earns `0.20`; a safe switch earns `0.19`. Valid rewards lie in `[-4.0, 0.2]`.
 
-A disconnected load or generator, island, invalid topology, or failed solve receives exactly `-5.0` and terminates. Episode exhaustion is normal completion after 24 steps.
+A disconnected load or generator, island, invalid topology, or failed solve receives exactly `-5.0` and terminates. Episode exhaustion is normal completion after 48 steps.
 
 Log `perf` as the overload-free step fraction. Log `score` as normalized episode return: `clamp(episode_return / (0.20 * episode_length), 0, 1)`, forced to zero after any catastrophic failure. This makes `perf` directly describe grid security while `score` combines congestion, switching, and safety through the actual reward. Also log switch counts, failure causes, and episode return/length.
 
 ## 5. Randomized episodes and validation
 
-Use 24 actions with injections held for four actions, producing six periods. Every episode begins with safe `P0`; independently sample each of the remaining five periods uniformly from `P1..P14` with replacement. Puffer initializes a separate RNG state for each vector environment, and reset advances that state, giving reproducible but varied schedules. The profile label is not observed: injections and resulting flows already expose the physical state.
+Use 48 actions with injections held for four actions, producing 12 periods. Every episode begins with safe `P0`; independently sample each of the remaining 11 periods uniformly from `P1..P14` with replacement. Puffer initializes a separate RNG state for each vector environment, and reset advances that state, giving reproducible but varied schedules. The profile label is not observed: injections and resulting flows already expose the physical state.
 
 - `P0`: nominal MATPOWER active loads, generator 2 at 40 MW, and bus 1 balancing; normal topology is safe.
 - `P1`: multiply loads and generator 2 by 1.10; overloads 1-2. A validated bus-2 split moves the 2-4 and 2-5 endpoints to busbar 2.

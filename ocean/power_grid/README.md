@@ -31,8 +31,8 @@ Episode logs use `perf` for the fraction of overload-free steps. `score` is the 
 divided by the theoretical `0.20`-per-step maximum and clipped to `[0, 1]`; catastrophic failures
 always score zero.
 
-Episodes contain six four-step operating periods. The first is always the safe nominal `P0`; the
-other five are independent samples from stress profiles `P1` through `P14`, with replacement. The
+Episodes contain 12 four-step operating periods. The first is always the safe nominal `P0`; the
+other 11 are independent samples from stress profiles `P1` through `P14`, with replacement. The
 sampling uses Puffer's per-environment RNG state, so a seed is reproducible and vector environments
 do not share RNG state. Profile IDs are not added to observations because injections and line flows
 already describe the current electrical condition.
