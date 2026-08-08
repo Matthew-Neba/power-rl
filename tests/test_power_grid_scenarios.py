@@ -3,7 +3,6 @@ import importlib.util
 import math
 import pathlib
 import re
-import subprocess
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -88,29 +87,3 @@ def test_weather_request_is_explicit_and_reproducible():
     assert "timezone=America%2FEdmonton" in url
     assert "models=era5" in url
     assert math.isfinite(BUILDER.NOMINAL_TOTAL_LOAD_MW)
-
-
-def test_checked_in_random_event_catalog_is_reproducible(tmp_path):
-    executable = tmp_path / "build_random_event_catalog"
-    generated = tmp_path / "power_grid_random_events_data.h"
-    subprocess.run(
-        [
-            "clang",
-            "-std=c11",
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pedantic",
-            f"-I{ROOT / 'ocean' / 'power_grid'}",
-            str(ROOT / "ocean" / "power_grid" / "build_random_event_catalog.c"),
-            "-lm",
-            "-o",
-            str(executable),
-        ],
-        check=True,
-        cwd=ROOT,
-    )
-    subprocess.run([str(executable), str(generated)], check=True, cwd=ROOT)
-    checked_in = ROOT / "ocean" / "power_grid" / "power_grid_random_events_data.h"
-    assert generated.read_bytes() == checked_in.read_bytes()

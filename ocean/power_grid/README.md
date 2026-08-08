@@ -11,13 +11,10 @@ is deliberately split into layers:
   flow, loading, and operating profiles.
 - `power_grid_ac.[ch]`: Newton-Raphson AC power flow, reactive limits, voltage checks, losses,
   MVA loading, and thermal-protection support.
-- `power_grid_baselines.[ch]`: a seeded-random controller for validation without learning.
 - `power_grid_scenarios_data.h`: the generated, compile-time historical scenario cache used by
   `power_grid.h`.
 - `build_offline_scenarios.py`: the network-enabled offline data preparation tool. It is never
   imported or called by training.
-- `power_grid_random_events_data.h`: the global mask of offline-certified solvable random outages.
-- `build_random_event_catalog.c`: the offline certification and catalog-generation tool.
 - `power_grid.h`: the 221-observation, 91-action environment, episode logic, and Raylib renderer.
 - `binding.c`: vectorized PufferLib registration.
 
@@ -110,15 +107,9 @@ Certification is intentionally minimal: from the normal topology, the outage mus
 power flow solvable. It does not need to cause an overload, and no recovery is required or supplied.
 If the agent has already changed the topology when the event is due, the event is skipped rather
 than applying that minimal solvability certificate to a state for which it was not checked. Random
-events are disabled in deterministic evaluation and AC modes. Rebuild the catalog after
-changing the grid, profiles, or historical cache:
-
-```sh
-clang -std=c11 -O2 -Iocean/power_grid \
-  ocean/power_grid/build_random_event_catalog.c -lm \
-  -o build/build_random_event_catalog
-build/build_random_event_catalog ocean/power_grid/power_grid_random_events_data.h
-```
+events are disabled in deterministic evaluation and AC modes. The environment excludes the radial
+7-8 branch; tests verify every other single-line outage against every cached period and synthetic
+profile.
 
 The hot training path only chooses a period and line from a precomputed bit mask. The compact event
 metrics report applied random events and terminal failures in episodes containing an event.

@@ -8,8 +8,6 @@ Completed:
   rewards, episode logging, renderer, and vectorized PufferLib binding.
 - AC replay with voltage and reactive-power checks, losses, Q-limit handling, thermal-stress
   protection, scheduled maintenance, and DC/AC checkpoint comparison tooling.
-- Do-nothing, seeded-random, greedy, and bounded-search baselines. Synthetic stress profiles are
-  checked for a safe topology within three actions.
 - Offline domain randomization from actual correlated AESO load/wind/solar and ERA5 temperature,
   wind-speed, and irradiance data. The checked-in cache contains 365 training days from 2019 and
   366 held-out days from 2020, with twelve two-hour operating periods per day.
@@ -22,9 +20,9 @@ Completed:
   with `build_offline_scenarios.py`.
 - Automated checks cover electrical invariants, action and reward bookkeeping, deterministic
   scenario selection, train/validation separation, randomized environment lifecycle, and every
-  one of the 8,772 cached operating periods. Every congested cached period has a topology found
-  within three actions from normal topology, and every normal operating point converges in AC
-  without voltage violations. A focused regression verifies that topology persists across periods.
+  one of the 8,772 cached operating periods. Every normal operating point converges in AC without
+  voltage violations, and every random-event line outage remains DC-solvable. A focused regression
+  verifies that topology persists across periods.
 
 Audit corrections completed:
 
@@ -33,7 +31,7 @@ Audit corrections completed:
 - A failure caused by advancing to new exogenous injections emits and logs exactly the `-5`
   failure reward instead of retaining the preceding state's provisional reward.
 - Held-out validation selection no longer depends on the training-mixture probability.
-- Non-finite scenario-mixture configuration values fall back to the documented 0.75 default.
+- Scenario-mixture configuration is passed directly to the environment without a hidden fallback.
 - Weather, rating scale, line availability/thermal stress, busbar voltage, and generator reactive
   output are observed. DC marks active busbars at unit voltage and supplies zero reactive output,
   so one stable contract supports DC training and optional AC policy training.
@@ -43,18 +41,17 @@ Not yet completed or proven:
 - IEEE 738 currently uses one reference conductor, perpendicular wind, effective incident
   irradiance, and one scale for all branches because IEEE-14 has no physical route or asset data.
   It is steady-state ampacity, not a sag or transient conductor-temperature model.
-- Per-period solvability is certified from normal topology. Continuous-day recoverability from
-  every topology an arbitrary policy could create is not required. Full N-1 security is also out
-  of scope without redispatch, shedding, or revised scenario constraints.
-- Safe-topology search remains DC-only by design. AC convergence and voltage feasibility are
-  exhaustively checked for every cached normal point, while AC thermal overload remains an
-  evaluation signal rather than a guaranteed-easy condition.
-- PPO performance against the baselines, policy robustness on held-out 2020 data, real facility
+- Random events are checked for DC solvability from normal topology. Continuous-day recoverability
+  from every topology an arbitrary policy could create is not required. Full N-1 security is also
+  out of scope without redispatch, shedding, or revised scenario constraints.
+- AC convergence and voltage feasibility are exhaustively checked for every cached normal point,
+  while AC thermal overload remains an evaluation signal rather than a guaranteed-easy condition.
+- PPO performance, policy robustness on held-out 2020 data, real facility
   ratings, and deployment-grade protection behavior still require empirical validation.
 
 ## 1. Goal and safety
 
-Train on fast DC power flow, then replay policies and baselines under AC physics and chronological scenarios. The agent must relieve congestion with as little switching as possible while keeping every load and generator connected to the main grid. A disconnected terminal, unintended island, invalid topology, or failed solve is terminal failure; overload alone is recoverable.
+Train on fast DC power flow, then replay policies under AC physics and chronological scenarios. The agent must relieve congestion with as little switching as possible while keeping every load and generator connected to the main grid. A disconnected terminal, unintended island, invalid topology, or failed solve is terminal failure; overload alone is recoverable.
 
 Priority: connectivity and solvability, thermal limits, then switching cost. Version one excludes load shedding, intentional islands, and dispatch control.
 
@@ -68,7 +65,6 @@ Synthetic DC branch limits in branch order are `[155,145,130,80,70,50,80,50,35,6
 
 - `power_grid_solver.[ch]`: grid data, topology actions/validation, DC flow, profiles, shared dense solve.
 - `power_grid_ac.[ch]`: Newton-Raphson AC replay, electrical constraints, losses, and thermal support.
-- `power_grid_baselines.[ch]`: do-nothing, random, greedy, and bounded search.
 - `power_grid.h`: environment state, contract, episodes, logging, and renderer.
 - `binding.c`: PufferLib registration; `power_grid.c`: standalone playback; `evaluate.py`: DC/AC checkpoint comparison.
 
@@ -116,7 +112,9 @@ Each episode has 12 six-action periods. Default training uses a 75/25 mixture of
 - `P12/P13`: add load at bus 11/12 and generation at bus 6; overload 6-11 / 6-13.
 - `P14`: add 30 MW demand at bus 2; overload 1-2 differently from P1.
 
-All profiles must have a connected overload-free topology found within three switches from normal. Tests verify reference flows, profile stress, slack balance, KCL/KVL, taps, topology failures, AC reference values, and baselines. Do not train changed grid data until bounded search proves solvability. PPO must beat random/do-nothing and approach search without exploiting termination or clipping.
+Tests verify reference flows, profile stress, slack balance, KCL/KVL, taps, topology failures, and
+AC reference values. Profiles are not required to have a known safe topology or bounded recovery
+sequence.
 
 Held-out evaluation uses a repeatable 00:00–22:00 demand curve, synthetic solar at generator bus 3, wind at bus 6, and a 9-14 maintenance outage from 08:00–16:00. Compare identical DC and AC trajectories. Curriculum progresses from safe no-op and one-switch cases through busbar sequences, unsafe alternatives, multi-action solutions, restoration, and broader randomization while retaining earlier cases.
 

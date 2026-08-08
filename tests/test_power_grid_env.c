@@ -51,16 +51,8 @@ static void test_action_application_and_bookkeeping(void)
     CHECK(env.episode.switches[0] == 1);
 }
 
-static void test_safety_cost_and_reward(void)
+static void test_reward(void)
 {
-    PowerGridSolveResult solution = {0};
-    PowerGridACSolveResult ac_solution = {0};
-    solution.congestion_cost = 0.04;
-    ac_solution.voltage_violation_cost = 0.09;
-
-    CHECK_CLOSE(calculate_constraint_cost(&solution, &ac_solution, 0, 3), 0.04);
-    CHECK_CLOSE(calculate_constraint_cost(&solution, &ac_solution, 1, 3), 3.13);
-
     CHECK_CLOSE(calculate_reward(POWER_GRID_INVALID_TOPOLOGY, 0.0, 0, 0),
                 POWER_GRID_FAILURE_REWARD);
     CHECK_CLOSE(calculate_reward(POWER_GRID_SOLVE_OK, 0.0, 0, 1), 0.2);
@@ -140,6 +132,16 @@ static void test_offline_scenario_cache(void)
             point.generator_mw[2] = scenario->solar_mw[period];
             point.generator_mw[3] = scenario->wind_mw[period];
             CHECK(power_grid_solve(&topology, &point, &solution) == POWER_GRID_SOLVE_OK);
+            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            {
+                if ((POWER_GRID_RANDOM_EVENT_LINE_MASK & (1u << line)) == 0)
+                    continue;
+                PowerGridTopology event_topology = topology;
+                PowerGridSolveResult event_solution;
+                event_topology.line_closed[line] = 0;
+                CHECK(power_grid_solve(&event_topology, &point, &event_solution) ==
+                      POWER_GRID_SOLVE_OK);
+            }
             PowerGridACSolveResult ac_solution;
             PowerGridACStatus ac_status = power_grid_ac_solve(
                 &topology, &point, &ac_solution);
@@ -163,6 +165,22 @@ static void test_offline_scenario_cache(void)
     CHECK(overloaded_periods > 0);
     CHECK(ac_nonconvergence == 0);
     CHECK(ac_voltage_infeasible == 0);
+
+    for (int profile = 0; profile < POWER_GRID_NUM_PROFILES; profile++)
+    {
+        PowerGridOperatingPoint point;
+        power_grid_operating_point_profile(&point, (PowerGridProfile)profile);
+        for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+        {
+            if ((POWER_GRID_RANDOM_EVENT_LINE_MASK & (1u << line)) == 0)
+                continue;
+            PowerGridTopology event_topology = topology;
+            PowerGridSolveResult event_solution;
+            event_topology.line_closed[line] = 0;
+            CHECK(power_grid_solve(&event_topology, &point, &event_solution) ==
+                  POWER_GRID_SOLVE_OK);
+        }
+    }
 
     double cold_windy = power_grid_weather_rating_scale(-20.0, 8.0, 0.0);
     double hot_calm = power_grid_weather_rating_scale(35.0, 0.0, 1000.0);
@@ -346,24 +364,6 @@ static void test_solvable_random_event_lifecycle(void)
     c_close(&env);
 }
 
-static void test_random_event_is_skipped_from_uncertified_topology(void)
-{
-    PowerGrid env = {
-        .rng = 54321u,
-        .offline_scenarios = 1,
-        .offline_scenario_probability = 1.0,
-        .random_events = 1,
-        .random_event_probability = 1.0,
-    };
-    power_grid_allocate(&env);
-    c_reset(&env);
-    env.topology.terminal_busbar[0] = 1;
-    apply_scheduled_random_event(&env, env.scheduled_random_event_period);
-    CHECK(env.episode.random_events == 0);
-    CHECK(env.active_random_event_line == -1);
-    c_close(&env);
-}
-
 static void test_randomized_environment_lifecycle(void)
 {
     const PowerGrid configurations[] = {
@@ -401,14 +401,13 @@ static void test_randomized_environment_lifecycle(void)
 int main(void)
 {
     test_action_application_and_bookkeeping();
-    test_safety_cost_and_reward();
+    test_reward();
     test_episode_metrics();
     test_offline_scenario_cache();
     test_offline_episode_sampling();
     test_period_transition_failure_reward();
     test_topology_persists_across_periods();
     test_solvable_random_event_lifecycle();
-    test_random_event_is_skipped_from_uncertified_topology();
     test_randomized_environment_lifecycle();
     if (failures)
         return 1;

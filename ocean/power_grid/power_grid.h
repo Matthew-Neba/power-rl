@@ -17,6 +17,9 @@
 #define POWER_GRID_EPISODE_STEPS 72
 #define POWER_GRID_STEPS_PER_PERIOD 6
 #define POWER_GRID_NUM_PERIODS (POWER_GRID_EPISODE_STEPS / POWER_GRID_STEPS_PER_PERIOD)
+/* Any line except radial 7-8 can be removed without disconnecting the normal topology. */
+#define POWER_GRID_RANDOM_EVENT_LINE_MASK \
+    (((1u << POWER_GRID_NUM_BRANCHES) - 1u) & ~(1u << 13))
 
 typedef struct {
     unsigned int date_yyyymmdd;
@@ -29,7 +32,6 @@ typedef struct {
 } PowerGridOfflineScenario;
 
 #include "power_grid_scenarios_data.h"
-#include "power_grid_random_events_data.h"
 
 /* Steady-state IEEE 738 ampacity normalized to median 2019 ERA5 conditions.
  * IEEE-14 has no physical routes, so all lines use the published 26/7 Drake
@@ -358,80 +360,10 @@ static void power_grid_apply_dynamic_ratings(PowerGrid *env)
     }
 }
 
-static void power_grid_update_maintenance(PowerGrid *env, int period)
-{
-    if (!env->evaluation_scenarios)
-        return;
-    const int maintenance_line = 16; /* Connected 9-14 outage during the daytime peak. */
-    if (period == 4)
-    {
-        env->line_maintenance[maintenance_line] = 1;
-        env->maintenance_was_closed[maintenance_line] =
-            env->topology.line_closed[maintenance_line];
-        env->topology.line_closed[maintenance_line] = 0;
-        env->episode.maintenance_events++;
-    }
-    else if (period == 8)
-    {
-        env->line_maintenance[maintenance_line] = 0;
-        if (env->line_available[maintenance_line])
-        {
-            env->topology.line_closed[maintenance_line] =
-                env->maintenance_was_closed[maintenance_line];
-        }
-    }
-}
-
 static unsigned int next_random(PowerGrid *env)
 {
     env->rng = env->rng * 1664525u + 1013904223u;
     return env->rng ^ (env->rng >> 16);
-}
-
-static void schedule_random_event(PowerGrid *env)
-{
-    env->scheduled_random_event_period = -1;
-    env->scheduled_random_event_line = -1;
-    if (!env->random_events || env->evaluation_scenarios || env->ac_power_flow)
-        return;
-
-    double unit_sample = (double)(next_random(env) >> 8) / 16777216.0;
-    if (unit_sample >= env->random_event_probability)
-        return;
-
-    env->scheduled_random_event_period = 1 +
-        (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
-    unsigned int selected = next_random(env) %
-        (unsigned int)__builtin_popcount(POWER_GRID_SOLVABLE_RANDOM_EVENT_MASK);
-    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-    {
-        if ((POWER_GRID_SOLVABLE_RANDOM_EVENT_MASK & (UINT32_C(1) << line)) == 0)
-            continue;
-        if (selected-- == 0)
-        {
-            env->scheduled_random_event_line = line;
-            return;
-        }
-    }
-}
-
-static void apply_scheduled_random_event(PowerGrid *env, int period)
-{
-    if (period != env->scheduled_random_event_period)
-        return;
-
-    PowerGridTopology normal;
-    power_grid_topology_normal(&normal);
-    if (memcmp(&env->topology, &normal, sizeof(normal)) != 0)
-    {
-        return;
-    }
-
-    int line = env->scheduled_random_event_line;
-    env->line_available[line] = 0;
-    env->topology.line_closed[line] = 0;
-    env->active_random_event_line = line;
-    env->episode.random_events++;
 }
 
 static PowerGridSolveStatus power_grid_solve_environment(PowerGrid *env)
@@ -588,20 +520,6 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     return action;
 }
 
-static double calculate_constraint_cost(
-    const PowerGridSolveResult *solution, const PowerGridACSolveResult *ac_solution,
-    int ac_power_flow, int new_thermal_trips)
-{
-    double cost = POWER_GRID_CONGESTION_COST_WEIGHT * solution->congestion_cost;
-    if (ac_power_flow)
-    {
-        cost += POWER_GRID_AC_VOLTAGE_VIOLATION_COST_WEIGHT *
-                ac_solution->voltage_violation_cost;
-        cost += POWER_GRID_AC_THERMAL_TRIP_PENALTY * new_thermal_trips;
-    }
-    return cost;
-}
-
 static float calculate_reward(PowerGridSolveStatus solve_status,
                               double constraint_cost, int switched, int safe)
 {
@@ -609,19 +527,6 @@ static float calculate_reward(PowerGridSolveStatus solve_status,
         return POWER_GRID_FAILURE_REWARD;
     return (float)(-constraint_cost - POWER_GRID_SWITCH_PENALTY * switched +
                    POWER_GRID_SAFE_STEP_REWARD * safe);
-}
-
-static PowerGridSolveStatus advance_period_if_due(PowerGrid *env)
-{
-    int next_period = env->episode_step / POWER_GRID_STEPS_PER_PERIOD;
-    if (next_period == env->current_period)
-        return env->solution.status;
-
-    env->current_period = next_period;
-    power_grid_update_maintenance(env, next_period);
-    power_grid_set_operating_period(env, next_period);
-    apply_scheduled_random_event(env, next_period);
-    return power_grid_solve_environment(env);
 }
 
 static void power_grid_finish_episode(PowerGrid *env)
@@ -729,7 +634,29 @@ void c_reset(PowerGrid *env)
                                                                sample % (POWER_GRID_NUM_PROFILES - 1));
         }
     }
-    schedule_random_event(env);
+    env->scheduled_random_event_period = -1;
+    env->scheduled_random_event_line = -1;
+    if (env->random_events && !env->evaluation_scenarios && !env->ac_power_flow)
+    {
+        double unit_sample = (double)(next_random(env) >> 8) / 16777216.0;
+        if (unit_sample < env->random_event_probability)
+        {
+            env->scheduled_random_event_period = 1 +
+                (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
+            unsigned int selected = next_random(env) %
+                (unsigned int)__builtin_popcount(POWER_GRID_RANDOM_EVENT_LINE_MASK);
+            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            {
+                if ((POWER_GRID_RANDOM_EVENT_LINE_MASK & (1u << line)) == 0)
+                    continue;
+                if (selected-- == 0)
+                {
+                    env->scheduled_random_event_line = line;
+                    break;
+                }
+            }
+        }
+    }
     env->current_period = 0;
     power_grid_set_operating_period(env, 0);
     power_grid_solve_environment(env);
@@ -768,8 +695,13 @@ void c_step(PowerGrid *env)
         /* Scheduled generator-P violations are exogenous data faults, not agent actions. */
         safe = env->solution.max_rho <= 1.0 &&
                (!env->ac_power_flow || env->ac_solution.voltage_violation_count == 0);
-        constraint_cost = calculate_constraint_cost(
-            &env->solution, &env->ac_solution, env->ac_power_flow, new_trips);
+        constraint_cost = POWER_GRID_CONGESTION_COST_WEIGHT * env->solution.congestion_cost;
+        if (env->ac_power_flow)
+        {
+            constraint_cost += POWER_GRID_AC_VOLTAGE_VIOLATION_COST_WEIGHT *
+                               env->ac_solution.voltage_violation_cost;
+            constraint_cost += POWER_GRID_AC_THERMAL_TRIP_PENALTY * new_trips;
+        }
         env->episode.safe_steps += safe;
         if (env->ac_power_flow)
         {
@@ -793,7 +725,45 @@ void c_step(PowerGrid *env)
         return;
     }
 
-    status = advance_period_if_due(env);
+    int next_period = env->episode_step / POWER_GRID_STEPS_PER_PERIOD;
+    if (next_period != env->current_period)
+    {
+        env->current_period = next_period;
+        if (env->evaluation_scenarios)
+        {
+            const int maintenance_line = 16; /* Connected 9-14 daytime outage. */
+            if (next_period == 4)
+            {
+                env->line_maintenance[maintenance_line] = 1;
+                env->maintenance_was_closed[maintenance_line] =
+                    env->topology.line_closed[maintenance_line];
+                env->topology.line_closed[maintenance_line] = 0;
+                env->episode.maintenance_events++;
+            }
+            else if (next_period == 8)
+            {
+                env->line_maintenance[maintenance_line] = 0;
+                if (env->line_available[maintenance_line])
+                    env->topology.line_closed[maintenance_line] =
+                        env->maintenance_was_closed[maintenance_line];
+            }
+        }
+        power_grid_set_operating_period(env, next_period);
+        if (next_period == env->scheduled_random_event_period)
+        {
+            PowerGridTopology normal;
+            power_grid_topology_normal(&normal);
+            if (memcmp(&env->topology, &normal, sizeof(normal)) == 0)
+            {
+                int line = env->scheduled_random_event_line;
+                env->line_available[line] = 0;
+                env->topology.line_closed[line] = 0;
+                env->active_random_event_line = line;
+                env->episode.random_events++;
+            }
+        }
+        status = power_grid_solve_environment(env);
+    }
     if (status != POWER_GRID_SOLVE_OK)
     {
         /* New injections can expose an infeasible state without another agent action. */
