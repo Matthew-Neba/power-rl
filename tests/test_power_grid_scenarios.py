@@ -90,9 +90,9 @@ def test_weather_request_is_explicit_and_reproducible():
     assert math.isfinite(BUILDER.NOMINAL_TOTAL_LOAD_MW)
 
 
-def test_checked_in_contingency_catalog_is_reproducible(tmp_path):
-    executable = tmp_path / "build_contingency_catalog"
-    generated = tmp_path / "power_grid_contingencies_data.h"
+def test_checked_in_random_event_catalog_is_reproducible(tmp_path):
+    executable = tmp_path / "build_random_event_catalog"
+    generated = tmp_path / "power_grid_random_events_data.h"
     subprocess.run(
         [
             "clang",
@@ -103,7 +103,7 @@ def test_checked_in_contingency_catalog_is_reproducible(tmp_path):
             "-Werror",
             "-pedantic",
             f"-I{ROOT / 'ocean' / 'power_grid'}",
-            str(ROOT / "ocean" / "power_grid" / "build_contingency_catalog.c"),
+            str(ROOT / "ocean" / "power_grid" / "build_random_event_catalog.c"),
             "-lm",
             "-o",
             str(executable),
@@ -112,5 +112,5 @@ def test_checked_in_contingency_catalog_is_reproducible(tmp_path):
         cwd=ROOT,
     )
     subprocess.run([str(executable), str(generated)], check=True, cwd=ROOT)
-    checked_in = ROOT / "ocean" / "power_grid" / "power_grid_contingencies_data.h"
+    checked_in = ROOT / "ocean" / "power_grid" / "power_grid_random_events_data.h"
     assert generated.read_bytes() == checked_in.read_bytes()

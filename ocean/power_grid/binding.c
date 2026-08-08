@@ -26,14 +26,14 @@ void my_init(Env* env, Dict* kwargs) {
         env->offline_scenario_probability = 0.0;
     if (env->offline_scenario_probability > 1.0)
         env->offline_scenario_probability = 1.0;
-    env->contingency_events = (int)dict_get(kwargs, "contingency_events")->value;
-    env->contingency_probability = dict_get(kwargs, "contingency_probability")->value;
-    if (!isfinite(env->contingency_probability))
-        env->contingency_probability = 0.25;
-    if (env->contingency_probability < 0.0)
-        env->contingency_probability = 0.0;
-    if (env->contingency_probability > 1.0)
-        env->contingency_probability = 1.0;
+    env->random_events = (int)dict_get(kwargs, "random_events")->value;
+    env->random_event_probability = dict_get(kwargs, "random_event_probability")->value;
+    if (!isfinite(env->random_event_probability))
+        env->random_event_probability = 0.25;
+    if (env->random_event_probability < 0.0)
+        env->random_event_probability = 0.0;
+    if (env->random_event_probability > 1.0)
+        env->random_event_probability = 1.0;
 }
 
 void my_log(Log* log, Dict* out) {
@@ -45,7 +45,6 @@ void my_log(Log* log, Dict* out) {
     POWER_GRID_LOG(total_failure);
     POWER_GRID_LOG(topology_failure);
     POWER_GRID_LOG(solver_failure);
-    POWER_GRID_LOG(unrecovered_overload);
     POWER_GRID_LOG(event_failure);
     POWER_GRID_LOG(total_switches);
     POWER_GRID_LOG(line_switches);
@@ -60,6 +59,6 @@ void my_log(Log* log, Dict* out) {
     POWER_GRID_LOG(ac_thermal_trips);
     POWER_GRID_LOG(ac_peak_thermal_stress);
     POWER_GRID_LOG(maintenance_events);
-    POWER_GRID_LOG(contingency_events);
+    POWER_GRID_LOG(random_events);
 #undef POWER_GRID_LOG
 }
