@@ -44,11 +44,11 @@ Continuous values are normalized but not clipped, preserving overload severity. 
 
 Action: one categorical value from 0 through 90: `0` no-op; `1..20` toggle branches; `21..60` move branch endpoints; `61..65` move generators; `66..76` move loads; `77..90` toggle couplers. Only one item changes per step. Unsafe actions are not masked. A safe busbar transfer can close the coupler, move terminals, then reopen it.
 
-For valid states, `safe = (max_rho <= 1)`, `raw_reward = -C - 0.01*N_switch + 0.20*safe`, and `reward = max(raw_reward, -4)`. A safety/solver failure gives exactly `-5` and terminates. Episodes normally end after 48 actions. `perf` is overload-free step fraction; `score` is `clamp(episode_return / (0.20*episode_length), 0, 1)`, forced to zero after catastrophe. Log return, length, switches, and failure causes.
+For valid states, `safe = (max_rho <= 1)` and `reward = -C - 0.001*N_switch + 0.20*safe`, with no lower reward cap. A safety/solver failure gives exactly `-5` and terminates. Episodes normally end after 72 actions. `perf` is the overload-free step fraction, forced to zero after catastrophe; `score` is the fraction of actions that were no-ops. Log return, length, switches, and failure causes. Hyperparameter sweeps maximize `perf`.
 
 ## 5. Episodes, profiles, and validation
 
-Each episode has 12 four-action periods. Start with safe nominal `P0`; sample every later period independently and uniformly from `P1..P14` with replacement using each vector environment's Puffer RNG. Profile IDs are hidden because injections and flows expose the physical state.
+Each episode has 12 six-action periods. Start with safe nominal `P0`; sample every later period independently and uniformly from `P1..P14` with replacement using each vector environment's Puffer RNG. Profile IDs are hidden because injections and flows expose the physical state.
 
 - `P1`: 1.10 load/gen-2 scale, overload 1-2; validated bus-2 split moves endpoints 2-4 and 2-5.
 - `P2/P3`: shift load bus 3→14 / bus 3→4; P2 overloads 9-14, P3 teaches restoration after the P1 split.
@@ -69,3 +69,9 @@ Held-out evaluation uses a repeatable 00:00–22:00 demand curve, synthetic sola
 AC replay keeps the same observations/actions but solves voltage magnitudes/angles, P/Q, resistance, taps, charging, bus-9 shunt, losses, generator Q-limit PV→PQ conversion, and worst-end MVA loading. The first AC rating is 160 MVA so nominal reactive flow preserves the safe start; other synthetic values match DC. Log voltage/P-limit violations, Q-limit events, losses, convergence, stress, and trips. The thermal proxy trips at 200% after one step, 150% after four, about 120% after 25, cools at safe loading, and locks tripped lines out for the episode.
 
 DC cannot detect voltage collapse, reactive shortages, frequency or transient instability, short circuits, synchronization hazards, or real protection behavior. Future work: dynamics and frequency control; conductor/transformer temperature, weather, emergency ratings, and relays; breaker/disconnector interlocks and protection zones; real facility ratings; N-1 security; redispatch and DC/AC OPF; topology-dependent renewable curtailment; heavily penalized emergency shedding; validated viable islands; differentiated switching costs; randomized safe starts; larger grids and held-out scenarios.
+
+## 7. Ultimate architecture
+
+Offline domain randomization across grid conditions and operating scenarios for robust policy learning.
+Offline PPO training from validated trajectories, with AC replay used for physics-faithful evaluation.
+Runtime safety guardrails enforce topology validity, solver health, thermal limits, and controlled fallback actions.

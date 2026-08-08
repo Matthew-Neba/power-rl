@@ -40,11 +40,11 @@ loading trips a line in one step, 150% in four, and 120% in about 25; loading at
 cools it. A tripped line is locked out for the episode and AC power flow is recalculated. This is
 a thermal proxy, not a conductor-temperature or manufacturer relay model.
 
-Episode logs use `perf` for the fraction of overload-free steps. `score` is the episode return
-divided by the theoretical `0.20`-per-step maximum and clipped to `[0, 1]`; catastrophic failures
-always score zero.
+Episode logs use `perf` for the fraction of overload-free steps, forced to zero after a
+catastrophic failure. `score` is the fraction of actions that were no-ops, including in failed
+episodes. Hyperparameter sweeps maximize `perf`.
 
-Episodes contain 12 four-step operating periods. The first is always the safe nominal `P0`; the
+Episodes contain 12 six-step operating periods. The first is always the safe nominal `P0`; the
 other 11 are independent samples from stress profiles `P1` through `P14`, with replacement. The
 sampling uses Puffer's per-environment RNG state, so a seed is reproducible and vector environments
 do not share RNG state. Profile IDs are not added to observations because injections and line flows
