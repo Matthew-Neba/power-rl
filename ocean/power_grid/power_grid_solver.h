@@ -104,7 +104,7 @@ PowerGridActionType power_grid_apply_action(PowerGridTopology* topology, int act
 int power_grid_terminal_node(const PowerGridTopology* topology, int terminal, int substation);
 
 void power_grid_operating_point_nominal(PowerGridOperatingPoint* point);
-int power_grid_operating_point_profile(PowerGridOperatingPoint* point, PowerGridProfile profile);
+void power_grid_operating_point_profile(PowerGridOperatingPoint* point, PowerGridProfile profile);
 const char* power_grid_profile_name(PowerGridProfile profile);
 
 PowerGridSolveStatus power_grid_validate_topology(

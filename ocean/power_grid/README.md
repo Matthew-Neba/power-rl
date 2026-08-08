@@ -11,8 +11,7 @@ is deliberately split into layers:
   flow, loading, and operating profiles.
 - `power_grid_ac.[ch]`: Newton-Raphson AC power flow, reactive limits, voltage checks, losses,
   MVA loading, and thermal-protection support.
-- `power_grid_baselines.[ch]`: seeded-random and one-step greedy controllers for validation without
-  learning.
+- `power_grid_baselines.[ch]`: a seeded-random controller for validation without learning.
 - `power_grid_scenarios_data.h`: the generated, compile-time historical scenario cache used by
   `power_grid.h`.
 - `build_offline_scenarios.py`: the network-enabled offline data preparation tool. It is never

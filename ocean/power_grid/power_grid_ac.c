@@ -49,19 +49,14 @@ typedef struct {
 } ACNetwork;
 
 double power_grid_ac_load_q_mvar(const PowerGridOperatingPoint* point, int load) {
-    if (point == NULL || load < 0 || load >= POWER_GRID_NUM_LOADS) return 0.0;
     return AC_LOAD_Q_NOMINAL[load] * point->load_mw[load] / AC_LOAD_P_NOMINAL[load];
 }
 
 double power_grid_ac_branch_rating_mva(int branch) {
-    return branch >= 0 && branch < POWER_GRID_NUM_BRANCHES ?
-        AC_BRANCH_RATING_MVA[branch] : 0.0;
+    return AC_BRANCH_RATING_MVA[branch];
 }
 
 double power_grid_ac_thermal_step(double previous_stress, double rho) {
-    if (!isfinite(previous_stress) || !isfinite(rho) || previous_stress < 0.0 || rho < 0.0) {
-        return NAN;
-    }
     if (rho <= 1.0) return fmax(0.0, previous_stress - POWER_GRID_THERMAL_COOLING_PER_STEP);
     double overload = rho - 1.0;
     return previous_stress + overload * overload;
@@ -253,10 +248,8 @@ static void ac_branch_flow(int line, int from, int to, const double* voltage,
 
 PowerGridACStatus power_grid_ac_solve(const PowerGridTopology* topology,
         const PowerGridOperatingPoint* point, PowerGridACSolveResult* result) {
-    if (result == NULL) return POWER_GRID_AC_INVALID_INPUT;
     memset(result, 0, sizeof(*result));
     result->min_voltage_pu = INFINITY;
-    if (topology == NULL || point == NULL) return result->status = POWER_GRID_AC_INVALID_INPUT;
     result->topology_status = power_grid_validate_topology(topology, &result->component_count,
         &result->active_node_count);
     if (result->topology_status != POWER_GRID_SOLVE_OK) {
@@ -444,6 +437,5 @@ const char* power_grid_ac_status_name(PowerGridACStatus status) {
     static const char* names[] = {
         "ok", "topology_failure", "invalid_input", "singular", "diverged", "nonfinite",
     };
-    if (status < POWER_GRID_AC_OK || status > POWER_GRID_AC_NONFINITE) return "unknown";
     return names[status];
 }

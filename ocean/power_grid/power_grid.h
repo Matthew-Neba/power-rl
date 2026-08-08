@@ -39,10 +39,6 @@ typedef struct {
 static inline double power_grid_weather_rating_scale(
     double ambient_temperature_c, double wind_speed_mps, double solar_irradiance_wm2)
 {
-    if (!isfinite(ambient_temperature_c) || !isfinite(wind_speed_mps) ||
-        !isfinite(solar_irradiance_wm2))
-        return 1.0;
-
     const double conductor_temperature_c = 100.0;
     const double conductor_diameter_m = 0.02814;
     const double conductor_emissivity = 0.8;
@@ -53,8 +49,8 @@ static inline double power_grid_weather_rating_scale(
     const double resistance_100_ohm_m = resistance_25_ohm_m +
         (resistance_75_ohm_m - resistance_25_ohm_m) * 1.5;
     const double ambient[2] = {ambient_temperature_c, 3.6};
-    const double wind[2] = {fmax(0.0, wind_speed_mps), 3.13};
-    const double irradiance[2] = {fmax(0.0, solar_irradiance_wm2), 7.0};
+    const double wind[2] = {wind_speed_mps, 3.13};
+    const double irradiance[2] = {solar_irradiance_wm2, 7.0};
     double ampacity[2] = {0.0, 0.0};
 
     for (int condition = 0; condition < 2; condition++)

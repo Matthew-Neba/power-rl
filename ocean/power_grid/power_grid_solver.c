@@ -53,13 +53,12 @@ static const PowerGridProfileSpec POWER_GRID_PROFILES[POWER_GRID_NUM_PROFILES] =
 };
 
 void power_grid_topology_normal(PowerGridTopology* topology) {
-    if (topology == NULL) return;
     memset(topology, 0, sizeof(*topology));
     memset(topology->line_closed, 1, sizeof(topology->line_closed));
 }
 
 PowerGridActionType power_grid_apply_action(PowerGridTopology* topology, int action) {
-    if (topology == NULL || action < 0 || action >= POWER_GRID_NUM_ACTIONS) {
+    if (action < 0 || action >= POWER_GRID_NUM_ACTIONS) {
         return POWER_GRID_ACTION_INVALID;
     }
     if (action == 0) return POWER_GRID_ACTION_NONE;
@@ -76,8 +75,6 @@ PowerGridActionType power_grid_apply_action(PowerGridTopology* topology, int act
 }
 
 int power_grid_terminal_node(const PowerGridTopology* topology, int terminal, int substation) {
-    if (topology == NULL || terminal < 0 || terminal >= POWER_GRID_NUM_TERMINALS ||
-            substation < 0 || substation >= POWER_GRID_NUM_SUBSTATIONS) return -1;
     /* An ideal closed coupler makes both physical busbars one electrical node. */
     int busbar = topology->coupler_closed[substation] ? 0 : topology->terminal_busbar[terminal];
     return 2 * substation + busbar;
@@ -87,14 +84,12 @@ void power_grid_operating_point_nominal(PowerGridOperatingPoint* point) {
     static const double loads[POWER_GRID_NUM_LOADS] = {
         21.7, 94.2, 47.8, 7.6, 11.2, 29.5, 9.0, 3.5, 6.1, 13.5, 14.9,
     };
-    if (point == NULL) return;
     memset(point, 0, sizeof(*point));
     memcpy(point->load_mw, loads, sizeof(loads));
     point->generator_mw[1] = 40.0;
 }
 
-int power_grid_operating_point_profile(PowerGridOperatingPoint* point, PowerGridProfile profile) {
-    if (point == NULL || profile < 0 || profile >= POWER_GRID_NUM_PROFILES) return 0;
+void power_grid_operating_point_profile(PowerGridOperatingPoint* point, PowerGridProfile profile) {
     const PowerGridProfileSpec* spec = &POWER_GRID_PROFILES[profile];
     power_grid_operating_point_nominal(point);
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
@@ -103,25 +98,10 @@ int power_grid_operating_point_profile(PowerGridOperatingPoint* point, PowerGrid
     if (spec->source_load >= 0) point->load_mw[spec->source_load] -= spec->transfer_mw;
     if (spec->target_load >= 0) point->load_mw[spec->target_load] += spec->transfer_mw;
     if (spec->generator >= 0) point->generator_mw[spec->generator] = spec->generation_mw;
-    return 1;
 }
 
 const char* power_grid_profile_name(PowerGridProfile profile) {
-    return profile >= 0 && profile < POWER_GRID_NUM_PROFILES ?
-        POWER_GRID_PROFILES[profile].name : "unknown";
-}
-
-static int topology_inputs_valid(const PowerGridTopology* topology) {
-    for (int i = 0; i < POWER_GRID_NUM_BRANCHES; i++) {
-        if (topology->line_closed[i] > 1) return 0;
-    }
-    for (int i = 0; i < POWER_GRID_NUM_TERMINALS; i++) {
-        if (topology->terminal_busbar[i] > 1) return 0;
-    }
-    for (int i = 0; i < POWER_GRID_NUM_SUBSTATIONS; i++) {
-        if (topology->coupler_closed[i] > 1) return 0;
-    }
-    return 1;
+    return POWER_GRID_PROFILES[profile].name;
 }
 
 static void build_topology_graph(const PowerGridTopology* topology,
@@ -175,8 +155,6 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
     unsigned char visited[POWER_GRID_NUM_NODES] = {0};
     if (component_count) *component_count = 0;
     if (active_node_count) *active_node_count = 0;
-    if (topology == NULL || !topology_inputs_valid(topology)) return POWER_GRID_INVALID_INPUT;
-
     build_topology_graph(topology, active, adjacency);
 
     int active_count = 0;
@@ -211,8 +189,6 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
 
 int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
         int dimensions, int stride) {
-    if (matrix == NULL || rhs == NULL || solution == NULL || dimensions < 0 ||
-            stride < dimensions) return 0;
     for (int col = 0; col < dimensions; col++) {
         int pivot = col;
         for (int row = col + 1; row < dimensions; row++) {
@@ -256,12 +232,7 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     double matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
     double rhs[POWER_GRID_NUM_NODES] = {0};
     double solution[POWER_GRID_NUM_NODES] = {0};
-    if (result == NULL) return POWER_GRID_INVALID_INPUT;
     memset(result, 0, sizeof(*result));
-    if (topology == NULL || point == NULL) {
-        result->status = POWER_GRID_INVALID_INPUT;
-        return result->status;
-    }
     result->status = power_grid_validate_topology(topology, &result->component_count,
         &result->active_node_count);
     if (result->status != POWER_GRID_SOLVE_OK) return result->status;
@@ -368,12 +339,10 @@ const char* power_grid_solve_status_name(PowerGridSolveStatus status) {
         "ok", "invalid_topology", "disconnected_load", "disconnected_generator",
         "islanded", "singular", "nonfinite", "invalid_input",
     };
-    if (status < POWER_GRID_SOLVE_OK || status > POWER_GRID_INVALID_INPUT) return "unknown";
     return names[status];
 }
 
 const char* power_grid_action_name(int action, char* buffer, size_t size) {
-    if (buffer == NULL || size == 0) return NULL;
     if (action == 0) {
         snprintf(buffer, size, "do-nothing");
     } else if (action >= POWER_GRID_LINE_ACTION_OFFSET &&

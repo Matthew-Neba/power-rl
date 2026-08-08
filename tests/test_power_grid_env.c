@@ -167,7 +167,6 @@ static void test_offline_scenario_cache(void)
     double cold_windy = power_grid_weather_rating_scale(-20.0, 8.0, 0.0);
     double hot_calm = power_grid_weather_rating_scale(35.0, 0.0, 1000.0);
     CHECK_CLOSE(power_grid_weather_rating_scale(3.6, 3.13, 7.0), 1.0);
-    CHECK_CLOSE(power_grid_weather_rating_scale(NAN, 3.13, 7.0), 1.0);
     CHECK(cold_windy > hot_calm);
     CHECK(cold_windy <= 1.35);
     CHECK(hot_calm >= 0.90);

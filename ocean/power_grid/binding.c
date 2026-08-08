@@ -18,22 +18,9 @@ void my_init(Env* env, Dict* kwargs) {
     env->offline_scenarios = (int)dict_get(kwargs, "offline_scenarios")->value;
     env->offline_scenario_validation =
         (int)dict_get(kwargs, "offline_scenario_validation")->value;
-    env->offline_scenario_probability =
-        dict_get(kwargs, "offline_scenario_probability")->value;
-    if (!isfinite(env->offline_scenario_probability))
-        env->offline_scenario_probability = 0.75;
-    if (env->offline_scenario_probability < 0.0)
-        env->offline_scenario_probability = 0.0;
-    if (env->offline_scenario_probability > 1.0)
-        env->offline_scenario_probability = 1.0;
+    env->offline_scenario_probability = dict_get(kwargs, "offline_scenario_probability")->value;
     env->random_events = (int)dict_get(kwargs, "random_events")->value;
     env->random_event_probability = dict_get(kwargs, "random_event_probability")->value;
-    if (!isfinite(env->random_event_probability))
-        env->random_event_probability = 0.25;
-    if (env->random_event_probability < 0.0)
-        env->random_event_probability = 0.0;
-    if (env->random_event_probability > 1.0)
-        env->random_event_probability = 1.0;
 }
 
 void my_log(Log* log, Dict* out) {

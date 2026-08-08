@@ -163,7 +163,6 @@ static void test_inverse_time_thermal_protection(void) {
     check_near(stress, 1.0, 1e-12);
     stress = power_grid_ac_thermal_step(stress, 0.8);
     check_near(stress, 0.98, 1e-12);
-    CHECK(isnan(power_grid_ac_thermal_step(-1.0, 1.0)));
 }
 
 static void test_connected_nominal_line_contingencies(void) {
