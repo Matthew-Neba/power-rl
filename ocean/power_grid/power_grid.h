@@ -29,6 +29,7 @@ typedef struct {
 } PowerGridOfflineScenario;
 
 #include "power_grid_scenarios_data.h"
+#include "power_grid_contingencies_data.h"
 
 /* Steady-state IEEE 738 ampacity normalized to median 2019 ERA5 conditions.
  * IEEE-14 has no physical routes, so all lines use the published 26/7 Drake
@@ -134,6 +135,8 @@ typedef struct
     float total_failure;
     float topology_failure;
     float solver_failure;
+    float unrecovered_overload;
+    float event_failure;
     float total_switches;
     float line_switches;
     float busbar_switches;
@@ -147,6 +150,7 @@ typedef struct
     float ac_thermal_trips;
     float ac_peak_thermal_stress;
     float maintenance_events;
+    float contingency_events;
     float n;
 } Log;
 
@@ -161,6 +165,7 @@ typedef struct
     int ac_nonconvergence;
     int thermal_trips;
     int maintenance_events;
+    int contingency_events;
     double active_loss_mw_sum;
     double peak_thermal_stress;
 } PowerGridEpisodeStats;
@@ -197,6 +202,9 @@ typedef struct
     double line_thermal_stress[POWER_GRID_NUM_BRANCHES];
     unsigned char line_maintenance[POWER_GRID_NUM_BRANCHES];
     unsigned char maintenance_was_closed[POWER_GRID_NUM_BRANCHES];
+    int scheduled_contingency_period;
+    int scheduled_contingency_line;
+    int active_contingency_line;
     float episode_return;
     int pending_reset;
     int last_action;
@@ -206,6 +214,8 @@ typedef struct
     int offline_scenarios;
     int offline_scenario_validation;
     double offline_scenario_probability;
+    int contingency_events;
+    double contingency_probability;
     double branch_rating_scale;
     double ambient_temperature_c;
     double wind_speed_mps;
@@ -375,6 +385,58 @@ static void power_grid_update_maintenance(PowerGrid *env, int period)
                 env->maintenance_was_closed[maintenance_line];
         }
     }
+}
+
+static unsigned int next_random(PowerGrid *env)
+{
+    env->rng = env->rng * 1664525u + 1013904223u;
+    return env->rng ^ (env->rng >> 16);
+}
+
+static void schedule_contingency(PowerGrid *env)
+{
+    env->scheduled_contingency_period = -1;
+    env->scheduled_contingency_line = -1;
+    if (!env->contingency_events || env->evaluation_scenarios || env->ac_power_flow)
+        return;
+
+    double unit_sample = (double)(next_random(env) >> 8) / 16777216.0;
+    if (unit_sample >= env->contingency_probability)
+        return;
+
+    env->scheduled_contingency_period = 1 +
+        (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
+    unsigned int selected = next_random(env) %
+        (unsigned int)__builtin_popcount(POWER_GRID_SOLVABLE_CONTINGENCY_MASK);
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        if ((POWER_GRID_SOLVABLE_CONTINGENCY_MASK & (UINT32_C(1) << line)) == 0)
+            continue;
+        if (selected-- == 0)
+        {
+            env->scheduled_contingency_line = line;
+            return;
+        }
+    }
+}
+
+static void apply_scheduled_contingency(PowerGrid *env, int period)
+{
+    if (period != env->scheduled_contingency_period)
+        return;
+
+    PowerGridTopology normal;
+    power_grid_topology_normal(&normal);
+    if (memcmp(&env->topology, &normal, sizeof(normal)) != 0)
+    {
+        return;
+    }
+
+    int line = env->scheduled_contingency_line;
+    env->line_available[line] = 0;
+    env->topology.line_closed[line] = 0;
+    env->active_contingency_line = line;
+    env->episode.contingency_events++;
 }
 
 static PowerGridSolveStatus power_grid_solve_environment(PowerGrid *env)
@@ -563,6 +625,7 @@ static PowerGridSolveStatus advance_period_if_due(PowerGrid *env)
     env->current_period = next_period;
     power_grid_update_maintenance(env, next_period);
     power_grid_set_operating_period(env, next_period);
+    apply_scheduled_contingency(env, next_period);
     return power_grid_solve_environment(env);
 }
 
@@ -594,6 +657,7 @@ static void power_grid_finish_episode(PowerGrid *env)
         env->log.ac_peak_thermal_stress += (float)env->episode.peak_thermal_stress;
     }
     env->log.maintenance_events += (float)env->episode.maintenance_events;
+    env->log.contingency_events += (float)env->episode.contingency_events;
     env->log.score += score;
     env->log.episode_return += env->episode_return;
     env->log.episode_length += (float)env->episode_step;
@@ -604,6 +668,9 @@ static void power_grid_finish_episode(PowerGrid *env)
                                  env->solution.status == POWER_GRID_ISLANDED;
     env->log.solver_failure += env->solution.status == POWER_GRID_SINGULAR ||
                                env->solution.status == POWER_GRID_NONFINITE || env->solution.status == POWER_GRID_INVALID_INPUT;
+    env->log.unrecovered_overload +=
+        env->solution.status == POWER_GRID_SOLVE_OK && env->solution.max_rho > 1.0;
+    env->log.event_failure += failed && env->episode.contingency_events > 0;
     env->log.total_switches += (float)env->episode.switches[0];
     env->log.line_switches += (float)env->episode.switches[POWER_GRID_ACTION_LINE];
     env->log.busbar_switches += (float)env->episode.switches[POWER_GRID_ACTION_TERMINAL];
@@ -633,14 +700,14 @@ void c_reset(PowerGrid *env)
     env->last_action = POWER_GRID_ACTION_NONE;
     env->last_action_type = POWER_GRID_ACTION_NONE;
     env->episode_return = 0.0f;
+    env->active_contingency_line = -1;
     env->offline_scenario = NULL;
     env->branch_rating_scale = 1.0;
     if (env->offline_scenarios && !env->evaluation_scenarios)
     {
         /* One draw chooses the curriculum branch and, when selected, a complete
          * correlated cached day. No file or network access occurs in the hot path. */
-        env->rng = env->rng * 1664525u + 1013904223u;
-        unsigned int sample = env->rng ^ (env->rng >> 16);
+        unsigned int sample = next_random(env);
         double unit_sample = (double)(sample >> 8) / 16777216.0;
         if (env->offline_scenario_validation ||
             unit_sample < env->offline_scenario_probability)
@@ -664,12 +731,12 @@ void c_reset(PowerGrid *env)
         else
         {
             /* Puffer initializes a separate rng per vector environment. Mix high and low LCG bits. */
-            env->rng = env->rng * 1664525u + 1013904223u;
-            unsigned int sample = env->rng ^ (env->rng >> 16);
+            unsigned int sample = next_random(env);
             env->episode_profiles[period] = (PowerGridProfile)(1 +
                                                                sample % (POWER_GRID_NUM_PROFILES - 1));
         }
     }
+    schedule_contingency(env);
     env->current_period = 0;
     power_grid_set_operating_period(env, 0);
     power_grid_solve_environment(env);
@@ -820,7 +887,7 @@ static const Vector2 POWER_GRID_LABEL_OFFSETS[POWER_GRID_NUM_BRANCHES] = {
 
 static Color power_grid_line_color(const PowerGrid *env, int line)
 {
-    if (env->ac_power_flow && !env->line_available[line])
+    if (!env->line_available[line])
         return POWER_GRID_OVERLOAD;
     if (env->line_maintenance[line])
         return POWER_GRID_WARN;

@@ -2,7 +2,6 @@
 
 #include "power_grid_solver.c"
 #include "power_grid_ac.c"
-#include "power_grid_baselines.c"
 #include "power_grid.h"
 
 #include <math.h>
@@ -78,16 +77,22 @@ static void test_episode_metrics(void)
     env.episode.safe_steps = 7;
     env.episode.no_op_actions = 8;
     env.solution.status = POWER_GRID_SOLVE_OK;
+    env.solution.max_rho = 1.2;
     power_grid_finish_episode(&env);
     CHECK_CLOSE(env.log.perf, 0.7);
     CHECK_CLOSE(env.log.score, 0.8);
+    CHECK_CLOSE(env.log.unrecovered_overload, 1.0);
+    CHECK_CLOSE(env.log.event_failure, 0.0);
 
     memset(&env.log, 0, sizeof(env.log));
     env.pending_reset = 0;
+    env.episode.contingency_events = 1;
     env.solution.status = POWER_GRID_ISLANDED;
     power_grid_finish_episode(&env);
     CHECK_CLOSE(env.log.perf, 0.0);
     CHECK_CLOSE(env.log.score, 0.8);
+    CHECK_CLOSE(env.log.unrecovered_overload, 0.0);
+    CHECK_CLOSE(env.log.event_failure, 1.0);
     c_close(&env);
 }
 
@@ -99,10 +104,8 @@ static void test_offline_scenario_cache(void)
     int weather_derated_periods = 0;
     int weather_uprated_periods = 0;
     int overloaded_periods = 0;
-    int unsolvable_periods = 0;
     int ac_nonconvergence = 0;
     int ac_voltage_infeasible = 0;
-    int maximum_search_depth = 0;
     unsigned int previous_date = 0;
     PowerGridTopology topology;
     power_grid_topology_normal(&topology);
@@ -154,24 +157,15 @@ static void test_offline_scenario_cache(void)
             weather_derated_periods += scale < 0.95;
             weather_uprated_periods += scale > 1.05;
             if (solution.max_rho / scale > 1.0)
-            {
                 overloaded_periods++;
-                PowerGridSearchResult search = power_grid_search_safe_topology(
-                    &topology, &point, scale, 3);
-                unsolvable_periods += !search.found;
-                if (search.depth > maximum_search_depth)
-                    maximum_search_depth = search.depth;
-            }
 
         }
     }
     CHECK(weather_derated_periods > 0);
     CHECK(weather_uprated_periods > 0);
     CHECK(overloaded_periods > 0);
-    CHECK(unsolvable_periods == 0);
     CHECK(ac_nonconvergence == 0);
     CHECK(ac_voltage_infeasible == 0);
-    CHECK(maximum_search_depth <= 3);
 
     double cold_windy = power_grid_weather_rating_scale(-20.0, 8.0, 0.0);
     double hot_calm = power_grid_weather_rating_scale(35.0, 0.0, 1000.0);
@@ -322,6 +316,58 @@ static void test_topology_persists_across_periods(void)
     c_close(&env);
 }
 
+static void test_solvable_contingency_lifecycle(void)
+{
+    PowerGrid env = {
+        .rng = 12345u,
+        .offline_scenarios = 1,
+        .offline_scenario_probability = 1.0,
+        .contingency_events = 1,
+        .contingency_probability = 1.0,
+    };
+    power_grid_allocate(&env);
+    c_reset(&env);
+    CHECK(env.scheduled_contingency_period > 0);
+    CHECK(env.scheduled_contingency_period < POWER_GRID_NUM_PERIODS);
+    CHECK(env.scheduled_contingency_line >= 0);
+    CHECK(env.scheduled_contingency_line < POWER_GRID_NUM_BRANCHES);
+
+    while (env.current_period < env.scheduled_contingency_period)
+    {
+        env.actions[0] = POWER_GRID_ACTION_NONE;
+        c_step(&env);
+        CHECK(env.terminals[0] == 0.0f);
+    }
+    int outage_line = env.scheduled_contingency_line;
+    CHECK(env.active_contingency_line == outage_line);
+    CHECK(env.episode.contingency_events == 1);
+    CHECK(env.line_available[outage_line] == 0);
+    CHECK(env.topology.line_closed[outage_line] == 0);
+    CHECK_CLOSE(env.observations[POWER_GRID_LINE_OBS_OFFSET +
+                                 outage_line * POWER_GRID_LINE_OBS_FEATURES + 3], 0.0);
+    CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
+
+    c_close(&env);
+}
+
+static void test_contingency_is_skipped_from_uncertified_topology(void)
+{
+    PowerGrid env = {
+        .rng = 54321u,
+        .offline_scenarios = 1,
+        .offline_scenario_probability = 1.0,
+        .contingency_events = 1,
+        .contingency_probability = 1.0,
+    };
+    power_grid_allocate(&env);
+    c_reset(&env);
+    env.topology.terminal_busbar[0] = 1;
+    apply_scheduled_contingency(&env, env.scheduled_contingency_period);
+    CHECK(env.episode.contingency_events == 0);
+    CHECK(env.active_contingency_line == -1);
+    c_close(&env);
+}
+
 static void test_randomized_environment_lifecycle(void)
 {
     const PowerGrid configurations[] = {
@@ -365,6 +411,8 @@ int main(void)
     test_offline_episode_sampling();
     test_period_transition_failure_reward();
     test_topology_persists_across_periods();
+    test_solvable_contingency_lifecycle();
+    test_contingency_is_skipped_from_uncertified_topology();
     test_randomized_environment_lifecycle();
     if (failures)
         return 1;

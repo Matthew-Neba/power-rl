@@ -25,22 +25,6 @@ static void test_baseline_actions(void) {
     }
 }
 
-static void test_profile_search(void) {
-    for (int profile = 0; profile < POWER_GRID_NUM_PROFILES; profile++) {
-        PowerGridTopology topology;
-        PowerGridOperatingPoint point;
-        PowerGridSolveResult greedy_result;
-        power_grid_topology_normal(&topology);
-        power_grid_operating_point_profile(&point, (PowerGridProfile)profile);
-        int greedy = power_grid_greedy_action(&topology, &point, &greedy_result);
-        PowerGridSearchResult search = power_grid_search_safe_topology(&topology, &point, 1.0, 3);
-        CHECK(greedy >= 0 && greedy < POWER_GRID_NUM_ACTIONS);
-        CHECK(greedy_result.status == POWER_GRID_SOLVE_OK);
-        CHECK(search.found);
-        CHECK(search.final_result.max_rho <= 1.0);
-    }
-}
-
 static void test_intended_reconfiguration_sequence(void) {
     PowerGridTopology topology;
     PowerGridOperatingPoint point;
@@ -74,7 +58,6 @@ static void test_intended_reconfiguration_sequence(void) {
 
 int main(void) {
     test_baseline_actions();
-    test_profile_search();
     test_intended_reconfiguration_sequence();
     if (failures) return 1;
     puts("power-grid baseline tests passed");

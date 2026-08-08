@@ -11,12 +11,14 @@ is deliberately split into layers:
   flow, loading, and operating profiles.
 - `power_grid_ac.[ch]`: Newton-Raphson AC power flow, reactive limits, voltage checks, losses,
   MVA loading, and thermal-protection support.
-- `power_grid_baselines.[ch]`: do-nothing, seeded-random, one-step greedy, and bounded search
-  controllers for validation without learning.
+- `power_grid_baselines.[ch]`: seeded-random and one-step greedy controllers for validation without
+  learning.
 - `power_grid_scenarios_data.h`: the generated, compile-time historical scenario cache used by
   `power_grid.h`.
 - `build_offline_scenarios.py`: the network-enabled offline data preparation tool. It is never
   imported or called by training.
+- `power_grid_contingencies_data.h`: the global mask of offline-certified solvable line outages.
+- `build_contingency_catalog.c`: the offline certification and catalog-generation tool.
 - `power_grid.h`: the 221-observation, 91-action environment, episode logic, and Raylib renderer.
 - `binding.c`: vectorized PufferLib registration.
 
@@ -96,6 +98,38 @@ The held-out `evaluation_scenarios` mode replaces random profiles with a repeata
 synthetic bus-3 solar, and bus-6 wind trajectory. It also takes line 9-14 out for maintenance from
 08:00 through 16:00. The headless report enables this for both DC and AC so only the solver physics
 change between columns. These renewable injections are exogenous; curtailment remains out of scope.
+
+## Random contingency layer
+
+Training can independently layer one persistent line outage onto a historical day or synthetic
+profile. `contingency_probability` controls the fraction of episodes that schedule an event. The
+event begins at a randomly selected period after the episode has started, and the failed line is
+locked open for the rest of the episode. Line availability is already part of each line's
+observation, so the policy sees the outage without changing the observation layout.
+
+Certification is intentionally minimal: from the normal topology, the outage must leave the DC
+power flow solvable. It does not need to cause an overload, and no recovery is required or supplied.
+If the agent has already changed the topology when the event is due, the event is skipped rather
+than applying that minimal solvability certificate to a state for which it was not checked. Random
+contingencies are disabled in deterministic evaluation and AC modes. Rebuild the catalog after
+changing the grid, profiles, or historical cache:
+
+```sh
+clang -std=c11 -O2 -Iocean/power_grid \
+  ocean/power_grid/build_contingency_catalog.c -lm \
+  -o build/build_contingency_catalog
+build/build_contingency_catalog ocean/power_grid/power_grid_contingencies_data.h
+```
+
+The hot training path only chooses a period and line from a precomputed bit mask. The compact event
+metrics report applied contingencies, terminal failures in episodes containing an event, and
+unresolved overloads at the episode horizon.
+
+No historical period or synthetic profile is required to have a safe topology within a bounded
+number of actions. The six actions in each operating period are an agent response budget, not a
+promise that recovery exists. `unrecovered_overload` counts episodes that reach their horizon still
+above a line limit, `event_failure` counts solver/topology failures after a contingency was applied,
+and `topology_failure` continues to count disconnected, islanded, or otherwise invalid topologies.
 
 ## Tests
 
