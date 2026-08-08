@@ -13,7 +13,11 @@ is deliberately split into layers:
   MVA loading, and thermal-protection support.
 - `power_grid_baselines.[ch]`: do-nothing, seeded-random, one-step greedy, and bounded search
   controllers for validation without learning.
-- `power_grid.h`: the 144-observation, 91-action environment, episode logic, and Raylib renderer.
+- `power_grid_scenarios_data.h`: the generated, compile-time historical scenario cache used by
+  `power_grid.h`.
+- `build_offline_scenarios.py`: the network-enabled offline data preparation tool. It is never
+  imported or called by training.
+- `power_grid.h`: the 221-observation, 91-action environment, episode logic, and Raylib renderer.
 - `binding.c`: vectorized PufferLib registration.
 
 ## Physics represented
@@ -44,11 +48,49 @@ Episode logs use `perf` for the fraction of overload-free steps, forced to zero 
 catastrophic failure. `score` is the fraction of actions that were no-ops, including in failed
 episodes. Hyperparameter sweeps maximize `perf`.
 
-Episodes contain 12 six-step operating periods. The first is always the safe nominal `P0`; the
-other 11 are independent samples from stress profiles `P1` through `P14`, with replacement. The
-sampling uses Puffer's per-environment RNG state, so a seed is reproducible and vector environments
-do not share RNG state. Profile IDs are not added to observations because injections and line flows
-already describe the current electrical condition.
+Episodes contain 12 six-step operating periods. By default, reset makes one reproducible RNG draw:
+75% of episodes use one complete day from the compile-time historical cache, while 25% retain the
+deliberately congested synthetic curriculum. Set `offline_scenario_probability` anywhere from 0 to
+1 to control that mix. Synthetic episodes begin with safe nominal `P0`; the other 11 periods are
+independent samples from stress profiles `P1` through `P14`. Scenario identity is not observed
+because injections, flows, and weather-adjusted loading expose the actionable current condition.
+
+## Offline historical domain randomization
+
+The checked-in cache contains 365 training days from 2019 and a disjoint 366-day validation pool
+from 2020. Each day combines:
+
+- actual hourly Alberta Internal Load, wind generation, and solar generation published by the
+  [Alberta Electric System Operator](https://www.aeso.ca/market/market-and-system-reporting/data-requests/hourly-ail-smp-wind-generation-and-solar-generation-data-for-2016-to-2020/);
+- Edmonton-area hourly ERA5 temperature, 10 m wind speed, and shortwave radiation from
+  the [Open-Meteo Historical Weather API](https://open-meteo.com/en/docs/historical-weather-api).
+
+The builder averages those correlated local-time observations into the episode's twelve two-hour
+periods. AESO load is normalized to the IEEE-14 total demand, and annual renewable capacity factors
+drive the bus-3 solar and bus-6 wind generators. Ambient temperature, wind speed, and irradiance
+feed the steady-state IEEE 738 heat balance, normalized to median 2019 weather and capped between
+0.90x and 1.35x because the underlying IEEE-14 ratings are synthetic. The model uses the published
+26/7 Drake ACSR example parameters, Edmonton elevation, perpendicular wind, and measured
+irradiance as effective incident flux. Real deployment still requires conductor and route geometry,
+wind attack angle, calibrated facility ratings, and transient conductor-temperature or sag limits.
+
+`power_grid_scenarios_data.h` records SHA-256 hashes of both downloaded inputs. Rebuild it with:
+
+```sh
+python ocean/power_grid/build_offline_scenarios.py
+```
+
+Downloads are cached under the ignored `.scenario_sources` directory. Pass `--refresh` to fetch
+new copies. The resulting header is compiled into the environment. A historical reset only selects
+a pointer into this read-only table, so it performs no API calls, file reads, parsing, allocation,
+or per-environment copy. Use `offline_scenario_validation = True` to sample only 2020; do not use
+that pool for training if it is serving as held-out validation.
+
+The observation exposes normalized weather, the adjusted rating scale, per-branch availability and
+thermal stress, all 28 busbar voltage magnitudes, and generator reactive output. DC mode supplies
+`1` for active busbars, `0` for inactive busbars, and zero reactive output, so the layout is
+identical in DC and AC. This expansion is
+incompatible with checkpoints trained on the older 144-value contract.
 
 The held-out `evaluation_scenarios` mode replaces random profiles with a repeatable 24-hour load,
 synthetic bus-3 solar, and bus-6 wind trajectory. It also takes line 9-14 out for maintenance from
@@ -60,7 +102,8 @@ change between columns. These renewable injections are exogenous; curtailment re
 Run the dependency-free C checks directly through pytest:
 
 ```sh
-uv run --with pytest pytest -q tests/test_power_grid_solver.py
+uv run --with pytest pytest -q \
+  tests/test_power_grid_solver.py tests/test_power_grid_scenarios.py
 ```
 
 Build the CUDA PufferLib extension and standalone renderer with:

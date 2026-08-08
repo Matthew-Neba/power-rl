@@ -186,3 +186,6 @@ resources/drive/binaries/*
 
 vendor/nle/
 vendor/fast-nle/
+
+# Downloaded inputs for the reproducible offline power-grid scenario builder.
+ocean/power_grid/.scenario_sources/

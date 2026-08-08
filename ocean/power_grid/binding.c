@@ -15,6 +15,17 @@ void my_init(Env* env, Dict* kwargs) {
     env->owns_buffers = 0;
     env->ac_power_flow = (int)dict_get(kwargs, "ac_power_flow")->value;
     env->evaluation_scenarios = (int)dict_get(kwargs, "evaluation_scenarios")->value;
+    env->offline_scenarios = (int)dict_get(kwargs, "offline_scenarios")->value;
+    env->offline_scenario_validation =
+        (int)dict_get(kwargs, "offline_scenario_validation")->value;
+    env->offline_scenario_probability =
+        dict_get(kwargs, "offline_scenario_probability")->value;
+    if (!isfinite(env->offline_scenario_probability))
+        env->offline_scenario_probability = 0.75;
+    if (env->offline_scenario_probability < 0.0)
+        env->offline_scenario_probability = 0.0;
+    if (env->offline_scenario_probability > 1.0)
+        env->offline_scenario_probability = 1.0;
 }
 
 void my_log(Log* log, Dict* out) {

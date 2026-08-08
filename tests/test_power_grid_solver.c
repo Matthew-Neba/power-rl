@@ -277,25 +277,6 @@ static void test_stable_names(void) {
     CHECK(strstr(power_grid_action_name(91, name, sizeof(name)), "invalid-action") != NULL);
 }
 
-static void print_profile_diagnostics(void) {
-    PowerGridTopology topology;
-    power_grid_topology_normal(&topology);
-    for (int profile = 0; profile < POWER_GRID_NUM_PROFILES; profile++) {
-        PowerGridOperatingPoint point;
-        PowerGridSolveResult result;
-        power_grid_operating_point_profile(&point, (PowerGridProfile)profile);
-        power_grid_solve(&topology, &point, &result);
-        printf("P%d: slack=%7.3f max_rho=%6.3f congestion=%8.5f", profile,
-            result.slack_generation_mw, result.max_rho, result.congestion_cost);
-        for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++) {
-            if (result.branch_rho[line] > 1.0) {
-                printf(" overload=%s(%.3f)", POWER_GRID_BRANCH_NAMES[line], result.branch_rho[line]);
-            }
-        }
-        putchar('\n');
-    }
-}
-
 int main(void) {
     test_nominal_balance_and_flow();
     test_profiles_are_balanced_by_slack();
@@ -305,7 +286,6 @@ int main(void) {
     test_busbar_reconfiguration();
     test_coupler_allows_safe_radial_transfer();
     test_stable_names();
-    print_profile_diagnostics();
     if (failures != 0) {
         fprintf(stderr, "%d power-grid solver test(s) failed\n", failures);
         return 1;

@@ -22,6 +22,7 @@ int power_grid_greedy_action(
 PowerGridSearchResult power_grid_search_safe_topology(
     const PowerGridTopology* topology,
     const PowerGridOperatingPoint* point,
+    double rating_scale,
     int max_depth
 );
 

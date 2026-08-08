@@ -82,6 +82,7 @@ def test_power_grid_environment(tmp_path):
         [
             "clang",
             "-std=c11",
+            "-O2",
             "-Wall",
             "-Wextra",
             "-Werror",

@@ -13,10 +13,83 @@
 #include "raylib.h"
 #endif
 
-#define POWER_GRID_OBS_SIZE 144
+#define POWER_GRID_OBS_SIZE 221
 #define POWER_GRID_EPISODE_STEPS 72
 #define POWER_GRID_STEPS_PER_PERIOD 6
 #define POWER_GRID_NUM_PERIODS (POWER_GRID_EPISODE_STEPS / POWER_GRID_STEPS_PER_PERIOD)
+
+typedef struct {
+    unsigned int date_yyyymmdd;
+    float load_scale[POWER_GRID_NUM_PERIODS];
+    float solar_mw[POWER_GRID_NUM_PERIODS];
+    float wind_mw[POWER_GRID_NUM_PERIODS];
+    float ambient_temperature_c[POWER_GRID_NUM_PERIODS];
+    float wind_speed_mps[POWER_GRID_NUM_PERIODS];
+    float solar_irradiance_wm2[POWER_GRID_NUM_PERIODS];
+} PowerGridOfflineScenario;
+
+#include "power_grid_scenarios_data.h"
+
+/* Steady-state IEEE 738 ampacity normalized to median 2019 ERA5 conditions.
+ * IEEE-14 has no physical routes, so all lines use the published 26/7 Drake
+ * ACSR example parameters and perpendicular wind. Measured irradiance is
+ * treated as effective incident flux. Synthetic ratings remain capped at
+ * 0.90x-1.35x until real conductor and route data are available. */
+static inline double power_grid_weather_rating_scale(
+    double ambient_temperature_c, double wind_speed_mps, double solar_irradiance_wm2)
+{
+    if (!isfinite(ambient_temperature_c) || !isfinite(wind_speed_mps) ||
+        !isfinite(solar_irradiance_wm2))
+        return 1.0;
+
+    const double conductor_temperature_c = 100.0;
+    const double conductor_diameter_m = 0.02814;
+    const double conductor_emissivity = 0.8;
+    const double conductor_solar_absorptivity = 0.8;
+    const double elevation_m = 645.0;
+    const double resistance_25_ohm_m = 7.283e-5;
+    const double resistance_75_ohm_m = 8.688e-5;
+    const double resistance_100_ohm_m = resistance_25_ohm_m +
+        (resistance_75_ohm_m - resistance_25_ohm_m) * 1.5;
+    const double ambient[2] = {ambient_temperature_c, 3.6};
+    const double wind[2] = {fmax(0.0, wind_speed_mps), 3.13};
+    const double irradiance[2] = {fmax(0.0, solar_irradiance_wm2), 7.0};
+    double ampacity[2] = {0.0, 0.0};
+
+    for (int condition = 0; condition < 2; condition++)
+    {
+        double temperature_difference = fmax(0.0,
+            conductor_temperature_c - ambient[condition]);
+        double film_temperature_c = 0.5 *
+            (conductor_temperature_c + ambient[condition]);
+        double air_viscosity = 1.458e-6 * pow(film_temperature_c + 273.0, 1.5) /
+                               (film_temperature_c + 383.4);
+        double air_density = (1.293 - 1.525e-4 * elevation_m +
+                              6.379e-9 * elevation_m * elevation_m) /
+                             (1.0 + 0.00367 * film_temperature_c);
+        double air_conductivity = 2.424e-2 + 7.477e-5 * film_temperature_c -
+                                  4.407e-9 * film_temperature_c * film_temperature_c;
+        double reynolds = conductor_diameter_m * air_density * wind[condition] /
+                          air_viscosity;
+        double natural_convection = 3.645 * sqrt(air_density) *
+            pow(conductor_diameter_m, 0.75) * pow(temperature_difference, 1.25);
+        /* K_angle is 1.0 for wind perpendicular to the conductor axis. */
+        double forced_convection_1 = (1.01 + 1.35 * pow(reynolds, 0.52)) *
+                                     air_conductivity * temperature_difference;
+        double forced_convection_2 = 0.754 * pow(reynolds, 0.6) *
+                                     air_conductivity * temperature_difference;
+        double convection = fmax(natural_convection,
+                                 fmax(forced_convection_1, forced_convection_2));
+        double radiation = 17.8 * conductor_diameter_m * conductor_emissivity *
+            (pow((conductor_temperature_c + 273.0) / 100.0, 4.0) -
+             pow((ambient[condition] + 273.0) / 100.0, 4.0));
+        double solar = conductor_solar_absorptivity * irradiance[condition] *
+                       conductor_diameter_m;
+        ampacity[condition] = sqrt(fmax(1.0, convection + radiation - solar) /
+                                   resistance_100_ohm_m);
+    }
+    return fmin(1.35, fmax(0.90, ampacity[0] / ampacity[1]));
+}
 
 /* Reward configuration. */
 #define POWER_GRID_FAILURE_REWARD (-5.0f)
@@ -28,7 +101,7 @@
 #define POWER_GRID_AC_VOLTAGE_VIOLATION_COST_WEIGHT 1.0
 #define POWER_GRID_AC_THERMAL_TRIP_PENALTY 1.0
 
-#define POWER_GRID_LINE_OBS_FEATURES 3
+#define POWER_GRID_LINE_OBS_FEATURES 5
 #define POWER_GRID_LINE_OBS_OFFSET 0
 #define POWER_GRID_TERMINAL_OBS_OFFSET \
     (POWER_GRID_NUM_BRANCHES * POWER_GRID_LINE_OBS_FEATURES)
@@ -36,10 +109,16 @@
     (POWER_GRID_TERMINAL_OBS_OFFSET + POWER_GRID_NUM_TERMINALS)
 #define POWER_GRID_INJECTION_OBS_OFFSET \
     (POWER_GRID_COUPLER_OBS_OFFSET + POWER_GRID_NUM_SUBSTATIONS)
+#define POWER_GRID_RATING_SCALE_OBS_OFFSET \
+    (POWER_GRID_INJECTION_OBS_OFFSET + POWER_GRID_NUM_SUBSTATIONS)
+#define POWER_GRID_WEATHER_OBS_OFFSET (POWER_GRID_RATING_SCALE_OBS_OFFSET + 1)
+#define POWER_GRID_VOLTAGE_OBS_OFFSET (POWER_GRID_WEATHER_OBS_OFFSET + 3)
+#define POWER_GRID_GENERATOR_Q_OBS_OFFSET \
+    (POWER_GRID_VOLTAGE_OBS_OFFSET + POWER_GRID_NUM_NODES)
 
-_Static_assert(POWER_GRID_INJECTION_OBS_OFFSET + POWER_GRID_NUM_SUBSTATIONS ==
+_Static_assert(POWER_GRID_GENERATOR_Q_OBS_OFFSET + POWER_GRID_NUM_GENERATORS ==
                    POWER_GRID_OBS_SIZE,
-               "power-grid observation layout must total 144 floats");
+               "power-grid observation layout must total 221 floats");
 _Static_assert(POWER_GRID_EPISODE_STEPS % POWER_GRID_STEPS_PER_PERIOD == 0,
                "power-grid periods must divide the episode evenly");
 _Static_assert(POWER_GRID_ACTION_NONE == 0 && POWER_GRID_ACTION_LINE == 1 &&
@@ -109,6 +188,7 @@ typedef struct
     PowerGridOperatingPoint operating_point;
     PowerGridSolveResult solution;
     PowerGridACSolveResult ac_solution;
+    const PowerGridOfflineScenario *offline_scenario;
     PowerGridProfile episode_profiles[POWER_GRID_NUM_PERIODS];
     int episode_step;
     int current_period;
@@ -123,6 +203,13 @@ typedef struct
     PowerGridActionType last_action_type;
     int ac_power_flow;
     int evaluation_scenarios;
+    int offline_scenarios;
+    int offline_scenario_validation;
+    double offline_scenario_probability;
+    double branch_rating_scale;
+    double ambient_temperature_c;
+    double wind_speed_mps;
+    double solar_irradiance_wm2;
 } PowerGrid;
 
 void c_reset(PowerGrid *env);
@@ -197,13 +284,72 @@ static void power_grid_chronological_point(PowerGridOperatingPoint *point, int p
 
 static void power_grid_set_operating_period(PowerGrid *env, int period)
 {
+    env->branch_rating_scale = 1.0;
+    env->ambient_temperature_c = 3.6;
+    env->wind_speed_mps = 3.13;
+    env->solar_irradiance_wm2 = 7.0;
     if (env->evaluation_scenarios)
     {
         power_grid_chronological_point(&env->operating_point, period);
     }
+    else if (env->offline_scenarios && env->offline_scenario != NULL)
+    {
+        const PowerGridOfflineScenario *scenario = env->offline_scenario;
+        power_grid_operating_point_nominal(&env->operating_point);
+        for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+            env->operating_point.load_mw[load] *= scenario->load_scale[period];
+        env->operating_point.generator_mw[2] = scenario->solar_mw[period];
+        env->operating_point.generator_mw[3] = scenario->wind_mw[period];
+        env->ambient_temperature_c = scenario->ambient_temperature_c[period];
+        env->wind_speed_mps = scenario->wind_speed_mps[period];
+        env->solar_irradiance_wm2 = scenario->solar_irradiance_wm2[period];
+        env->branch_rating_scale = power_grid_weather_rating_scale(
+            env->ambient_temperature_c, env->wind_speed_mps,
+            env->solar_irradiance_wm2);
+    }
     else
     {
         power_grid_operating_point_profile(&env->operating_point, env->episode_profiles[period]);
+    }
+}
+
+static void power_grid_apply_dynamic_ratings(PowerGrid *env)
+{
+    if (env->offline_scenario == NULL || env->evaluation_scenarios ||
+        env->solution.status != POWER_GRID_SOLVE_OK)
+        return;
+
+    env->solution.max_rho = 0.0;
+    env->solution.congestion_cost = 0.0;
+    if (env->ac_power_flow)
+    {
+        env->ac_solution.max_rho = 0.0;
+        env->ac_solution.congestion_cost = 0.0;
+    }
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        double base_rating = env->ac_power_flow ? power_grid_ac_branch_rating_mva(line) :
+                                                 POWER_GRID_BRANCHES[line].thermal_limit_mw;
+        double rating = base_rating * env->branch_rating_scale;
+        double loading = fabs(env->solution.branch_flow_mw[line]);
+        if (env->ac_power_flow)
+            loading = fmax(env->ac_solution.branch_from_mva[line],
+                           env->ac_solution.branch_to_mva[line]);
+        double rho = loading / rating;
+        env->solution.branch_rho[line] = rho;
+        if (env->ac_power_flow)
+            env->ac_solution.branch_rho[line] = rho;
+        if (rho > env->solution.max_rho)
+            env->solution.max_rho = rho;
+        if (env->ac_power_flow && rho > env->ac_solution.max_rho)
+            env->ac_solution.max_rho = rho;
+        if (rho > 1.0)
+        {
+            double overload = rho - 1.0;
+            env->solution.congestion_cost += overload * overload;
+            if (env->ac_power_flow)
+                env->ac_solution.congestion_cost += overload * overload;
+        }
     }
 }
 
@@ -236,16 +382,22 @@ static PowerGridSolveStatus power_grid_solve_environment(PowerGrid *env)
     if (!env->ac_power_flow)
     {
         memset(&env->ac_solution, 0, sizeof(env->ac_solution));
-        return power_grid_solve(&env->topology, &env->operating_point, &env->solution);
+        PowerGridSolveStatus status = power_grid_solve(
+            &env->topology, &env->operating_point, &env->solution);
+        power_grid_apply_dynamic_ratings(env);
+        return status;
     }
     power_grid_ac_solve(&env->topology, &env->operating_point, &env->ac_solution);
     power_grid_ac_to_compatible(&env->ac_solution, &env->solution);
+    power_grid_apply_dynamic_ratings(env);
     return env->solution.status;
 }
 
 static double power_grid_branch_rating(const PowerGrid *env, int line)
 {
-    return env->ac_power_flow ? power_grid_ac_branch_rating_mva(line) : POWER_GRID_BRANCHES[line].thermal_limit_mw;
+    double base_rating = env->ac_power_flow ? power_grid_ac_branch_rating_mva(line) :
+                                             POWER_GRID_BRANCHES[line].thermal_limit_mw;
+    return base_rating * env->branch_rating_scale;
 }
 
 /* Evaluation-only inverse-time protection. Stress is an intentionally simple
@@ -297,6 +449,8 @@ static void power_grid_compute_observations(PowerGrid *env)
         env->observations[index++] = signed_loading;
         env->observations[index++] = rho;
         env->observations[index++] = env->topology.line_closed[line] ? 1.0f : 0.0f;
+        env->observations[index++] = env->line_available[line] ? 1.0f : 0.0f;
+        env->observations[index++] = (float)env->line_thermal_stress[line];
     }
     index = POWER_GRID_TERMINAL_OBS_OFFSET;
     /* A bit is the non-redundant one-hot encoding for each two-state busbar category. */
@@ -316,6 +470,38 @@ static void power_grid_compute_observations(PowerGrid *env)
         env->observations[index++] = (float)(env->solution.substation_injection_mw[bus] /
                                              POWER_GRID_BASE_MVA);
     }
+    env->observations[POWER_GRID_RATING_SCALE_OBS_OFFSET] =
+        (float)env->branch_rating_scale;
+    env->observations[POWER_GRID_WEATHER_OBS_OFFSET] =
+        (float)(env->ambient_temperature_c / 50.0);
+    env->observations[POWER_GRID_WEATHER_OBS_OFFSET + 1] =
+        (float)(env->wind_speed_mps / 10.0);
+    env->observations[POWER_GRID_WEATHER_OBS_OFFSET + 2] =
+        (float)(env->solar_irradiance_wm2 / 1000.0);
+    unsigned char active_node[POWER_GRID_NUM_NODES] = {0};
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        if (!env->topology.line_closed[line])
+            continue;
+        active_node[power_grid_terminal_node(&env->topology,
+            POWER_GRID_LINE_TERMINAL(line, 0), POWER_GRID_BRANCHES[line].from_bus)] = 1;
+        active_node[power_grid_terminal_node(&env->topology,
+            POWER_GRID_LINE_TERMINAL(line, 1), POWER_GRID_BRANCHES[line].to_bus)] = 1;
+    }
+    for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        active_node[power_grid_terminal_node(&env->topology,
+            POWER_GRID_GENERATOR_TERMINAL(generator), POWER_GRID_GENERATOR_BUSES[generator])] = 1;
+    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+        active_node[power_grid_terminal_node(&env->topology,
+            POWER_GRID_LOAD_TERMINAL(load), POWER_GRID_LOAD_BUSES[load])] = 1;
+    for (int node = 0; node < POWER_GRID_NUM_NODES; node++)
+        env->observations[POWER_GRID_VOLTAGE_OBS_OFFSET + node] = env->ac_power_flow ?
+            (float)env->ac_solution.node_voltage_pu[node] : (float)active_node[node];
+    for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        env->observations[POWER_GRID_GENERATOR_Q_OBS_OFFSET + generator] =
+            env->ac_power_flow ?
+                (float)(env->ac_solution.generator_q_mvar[generator] / POWER_GRID_BASE_MVA) :
+                0.0f;
 }
 
 /* Agent training-step pipeline. Keep reward and metric calculations pure so their
@@ -333,8 +519,10 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     if (action.type == POWER_GRID_ACTION_LINE)
     {
         int line = action.value - POWER_GRID_LINE_ACTION_OFFSET;
+        int previous_state = env->topology.line_closed[line] ^ 1;
         if (!env->line_available[line] || env->line_maintenance[line])
             env->topology.line_closed[line] = 0;
+        action.switched = env->topology.line_closed[line] != previous_state;
     }
     env->episode.no_op_actions += action.type == POWER_GRID_ACTION_NONE;
     env->episode.switches[0] += action.switched;
@@ -445,10 +633,31 @@ void c_reset(PowerGrid *env)
     env->last_action = POWER_GRID_ACTION_NONE;
     env->last_action_type = POWER_GRID_ACTION_NONE;
     env->episode_return = 0.0f;
+    env->offline_scenario = NULL;
+    env->branch_rating_scale = 1.0;
+    if (env->offline_scenarios && !env->evaluation_scenarios)
+    {
+        /* One draw chooses the curriculum branch and, when selected, a complete
+         * correlated cached day. No file or network access occurs in the hot path. */
+        env->rng = env->rng * 1664525u + 1013904223u;
+        unsigned int sample = env->rng ^ (env->rng >> 16);
+        double unit_sample = (double)(sample >> 8) / 16777216.0;
+        if (env->offline_scenario_validation ||
+            unit_sample < env->offline_scenario_probability)
+        {
+            unsigned int offset = env->offline_scenario_validation ?
+                                  POWER_GRID_OFFLINE_VALIDATION_OFFSET : 0u;
+            unsigned int count = env->offline_scenario_validation ?
+                                 POWER_GRID_OFFLINE_VALIDATION_COUNT :
+                                 POWER_GRID_OFFLINE_TRAIN_COUNT;
+            env->offline_scenario = &POWER_GRID_OFFLINE_SCENARIOS[
+                offset + sample % count];
+        }
+    }
     env->episode_profiles[0] = POWER_GRID_PROFILE_P0_NOMINAL;
     for (int period = 1; period < POWER_GRID_NUM_PERIODS; period++)
     {
-        if (env->evaluation_scenarios)
+        if (env->evaluation_scenarios || env->offline_scenario != NULL)
         {
             env->episode_profiles[period] = POWER_GRID_PROFILE_P0_NOMINAL;
         }
@@ -516,10 +725,10 @@ void c_step(PowerGrid *env)
     env->rewards[0] = calculate_reward(status, constraint_cost, action.switched, safe);
     env->terminals[0] = status != POWER_GRID_SOLVE_OK ||
                         env->episode_step >= POWER_GRID_EPISODE_STEPS;
-    env->episode_return += env->rewards[0];
 
     if (env->terminals[0])
     {
+        env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);
         return;
     }
@@ -534,6 +743,7 @@ void c_step(PowerGrid *env)
         power_grid_finish_episode(env);
         return;
     }
+    env->episode_return += env->rewards[0];
     power_grid_compute_observations(env);
 }
 
@@ -546,6 +756,7 @@ void power_grid_allocate(PowerGrid *env)
     env->rewards = calloc(1, sizeof(float));
     env->terminals = calloc(1, sizeof(float));
     env->owns_buffers = 1;
+    env->branch_rating_scale = 1.0;
 }
 
 /* Standalone and evaluation renderer. Training builds define POWER_GRID_NO_RENDER. */
@@ -954,6 +1165,9 @@ static void power_grid_draw_sidebar(const PowerGrid *env)
     if (env->evaluation_scenarios)
         snprintf(period_label, sizeof(period_label), "%s",
                  POWER_GRID_EVALUATION_TIMES[env->current_period]);
+    else if (env->offline_scenarios && env->offline_scenario != NULL)
+        snprintf(period_label, sizeof(period_label), "%u",
+                 env->offline_scenario->date_yyyymmdd);
     else
         snprintf(period_label, sizeof(period_label), "P%d",
                  (int)env->episode_profiles[env->current_period]);
@@ -967,6 +1181,15 @@ static void power_grid_draw_sidebar(const PowerGrid *env)
     float current_score = env->episode.no_op_actions / steps;
     DrawText(TextFormat("score %.3f   perf %.3f", current_score, current_perf),
              x + 18, 130, 17, POWER_GRID_TEXT);
+    if (env->offline_scenarios && env->offline_scenario != NULL)
+    {
+        int period = env->current_period;
+        DrawText(TextFormat("%.1f C  wind %.1f m/s  rating %.0f%%",
+                            env->offline_scenario->ambient_temperature_c[period],
+                            env->offline_scenario->wind_speed_mps[period],
+                            100.0 * env->branch_rating_scale),
+                 x + 18, 149, 14, POWER_GRID_MUTED);
+    }
 
     DrawRectangleRounded((Rectangle){x + 14.0f, 166.0f, width - 28.0f, 104.0f},
                          0.12f, 5, Fade(POWER_GRID_BG, 0.75f));
