@@ -275,7 +275,7 @@ typedef struct {
 #endif
 } PowerGridDCFactorCache;
 
-#define POWER_GRID_DC_CACHE_SLOTS 4
+#define POWER_GRID_DC_CACHE_SLOTS 1
 #ifdef POWER_GRID_DC_FLOAT
 typedef float PowerGridDCScalar;
 #define POWER_GRID_DC_SQRT sqrtf
