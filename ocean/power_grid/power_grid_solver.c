@@ -263,6 +263,10 @@ typedef struct {
     int from_node[POWER_GRID_NUM_BRANCHES];
     int to_node[POWER_GRID_NUM_BRANCHES];
     unsigned char pattern[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+    unsigned short factor_cols[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+    unsigned short factor_count[POWER_GRID_NUM_NODES];
+    unsigned short factor_rows[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+    unsigned short factor_row_count[POWER_GRID_NUM_NODES];
     PowerGridTopology topology;
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
 } PowerGridDCFactorCache;
@@ -340,12 +344,29 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
     }
 
     for (int row = 0; row < dimensions; row++) {
+        cache->factor_count[row] = 0;
+        for (int col = 0; col < row; col++) {
+            if (cache->pattern[row][col])
+                cache->factor_cols[row][cache->factor_count[row]++] = (unsigned short)col;
+        }
+    }
+    for (int col = 0; col < dimensions; col++) cache->factor_row_count[col] = 0;
+    for (int row = 0; row < dimensions; row++) {
+        for (int index = 0; index < cache->factor_count[row]; index++) {
+            int col = cache->factor_cols[row][index];
+            cache->factor_rows[col][cache->factor_row_count[col]++] = (unsigned short)row;
+        }
+    }
+
+    for (int row = 0; row < dimensions; row++) {
         for (int col = 0; col <= row; col++) {
             if (!cache->pattern[row][col]) continue;
             double value = cache->lu[row][col];
-            for (int k = 0; k < col; k++)
-                if (cache->pattern[row][k] && cache->pattern[col][k])
-                    value -= cache->lu[row][k] * cache->lu[col][k];
+            for (int index = 0; index < cache->factor_count[row]; index++) {
+                int k = cache->factor_cols[row][index];
+                if (k >= col) break;
+                if (cache->pattern[col][k]) value -= cache->lu[row][k] * cache->lu[col][k];
+            }
             if (row == col) {
                 if (!isfinite(value) || value < 1e-12) {
                     cache->valid = 0;
@@ -369,12 +390,17 @@ static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
     int dimensions = cache->dimensions;
     for (int i = 0; i < dimensions; i++) solution[i] = rhs[i];
     for (int row = 0; row < dimensions; row++) {
-        for (int col = 0; col < row; col++) solution[row] -= cache->lu[row][col] * solution[col];
+        for (int index = 0; index < cache->factor_count[row]; index++) {
+            int col = cache->factor_cols[row][index];
+            solution[row] -= cache->lu[row][col] * solution[col];
+        }
         solution[row] /= cache->lu[row][row];
     }
     for (int row = dimensions - 1; row >= 0; row--) {
-        for (int col = row + 1; col < dimensions; col++)
+        for (int index = 0; index < cache->factor_row_count[row]; index++) {
+            int col = cache->factor_rows[row][index];
             solution[row] -= cache->lu[col][row] * solution[col];
+        }
         solution[row] /= cache->lu[row][row];
         if (!isfinite(solution[row])) return 0;
     }
