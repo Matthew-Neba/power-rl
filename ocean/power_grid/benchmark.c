@@ -131,11 +131,12 @@ static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t
 
 static BenchmarkMetrics run_baseline(
     BaselinePolicy policy, int episodes, int ac_power_flow,
-    double random_event_probability, int random_outage_count)
+    double random_event_probability, int random_outage_count, int seed_offset)
 {
     BenchmarkMetrics total = {0};
-    for (int episode = 0; episode < episodes; episode++)
+    for (int episode_index = 0; episode_index < episodes; episode_index++)
     {
+        int episode = seed_offset + episode_index;
         PowerGrid env = {
             .rng = (unsigned int)episode,
             .ac_power_flow = ac_power_flow,
@@ -194,9 +195,21 @@ int main(int argc, char **argv)
     int ac_power_flow = argc > 2 ? atoi(argv[2]) : 0;
     double random_event_probability = argc > 3 ? atof(argv[3]) : 0.25;
     int random_outage_count = argc > 4 ? atoi(argv[4]) : 3;
+    int selected_policy = argc > 5 ? atoi(argv[5]) : -1;
+    int seed_offset = argc > 6 ? atoi(argv[6]) : 0;
     if (episodes <= 0)
     {
         fprintf(stderr, "episodes must be positive\n");
+        return 1;
+    }
+    if (selected_policy < -1 || selected_policy >= BASELINE_COUNT)
+    {
+        fprintf(stderr, "policy must be -1 or between 0 and %d\n", BASELINE_COUNT - 1);
+        return 1;
+    }
+    if (seed_offset < 0)
+    {
+        fprintf(stderr, "seed offset must be non-negative\n");
         return 1;
     }
 
@@ -204,11 +217,13 @@ int main(int argc, char **argv)
            "total_switches,random_events,demand_fulfilled,outage_completion,"
            "all_outages_survived,thermal_trips,thermal_trip_episode,"
            "peak_thermal_stress,peak_line_loading,overloaded_line_fraction\n");
-    for (int policy = 0; policy < BASELINE_COUNT; policy++)
+    int first_policy = selected_policy < 0 ? 0 : selected_policy;
+    int final_policy = selected_policy < 0 ? BASELINE_COUNT : selected_policy + 1;
+    for (int policy = first_policy; policy < final_policy; policy++)
     {
         BenchmarkMetrics metrics = run_baseline(
             (BaselinePolicy)policy, episodes, ac_power_flow,
-            random_event_probability, random_outage_count);
+            random_event_probability, random_outage_count, seed_offset);
         printf("%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                BASELINE_NAMES[policy], episodes, metrics.perf, metrics.score,
