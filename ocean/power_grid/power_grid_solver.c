@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 
 static const char* const POWER_GRID_PROFILE_NAMES[POWER_GRID_NUM_PROFILES] = {
@@ -272,12 +273,104 @@ static int power_grid_solve_dense_float(float* restrict matrix, float* restrict 
     return 1;
 }
 
+typedef struct {
+    int dimensions;
+    int pivot[POWER_GRID_NUM_NODES];
+    float factor[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+} PowerGridNormalFactor;
+
+static PowerGridNormalFactor power_grid_normal_factor;
+static atomic_int power_grid_normal_factor_state;
+
+static int power_grid_is_normal_topology(const PowerGridTopology* topology)
+{
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+        if (!topology->line_closed[line]) return 0;
+    for (int terminal = 0; terminal < POWER_GRID_NUM_TERMINALS; terminal++)
+        if (topology->terminal_busbar[terminal]) return 0;
+    for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
+        if (topology->coupler_closed[bus]) return 0;
+    return 1;
+}
+
+static int power_grid_factor_normal(float matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES],
+        int dimensions)
+{
+    memcpy(power_grid_normal_factor.factor, matrix, sizeof(power_grid_normal_factor.factor));
+    for (int col = 0; col < dimensions; col++) {
+        int pivot = col;
+        for (int row = col + 1; row < dimensions; row++)
+            if (fabsf(power_grid_normal_factor.factor[row][col]) >
+                fabsf(power_grid_normal_factor.factor[pivot][col])) pivot = row;
+        if (!isfinite(power_grid_normal_factor.factor[pivot][col]) ||
+            fabsf(power_grid_normal_factor.factor[pivot][col]) < 1e-12f) return 0;
+        power_grid_normal_factor.pivot[col] = pivot;
+        if (pivot != col)
+            for (int j = 0; j < dimensions; j++) {
+                float swap = power_grid_normal_factor.factor[col][j];
+                power_grid_normal_factor.factor[col][j] = power_grid_normal_factor.factor[pivot][j];
+                power_grid_normal_factor.factor[pivot][j] = swap;
+            }
+        for (int row = col + 1; row < dimensions; row++) {
+            power_grid_normal_factor.factor[row][col] /= power_grid_normal_factor.factor[col][col];
+            for (int j = col + 1; j < dimensions; j++)
+                power_grid_normal_factor.factor[row][j] -=
+                    power_grid_normal_factor.factor[row][col] * power_grid_normal_factor.factor[col][j];
+        }
+    }
+    power_grid_normal_factor.dimensions = dimensions;
+    return 1;
+}
+
+static int power_grid_solve_normal(float* rhs, float* solution, int dimensions)
+{
+    for (int col = 0; col < dimensions; col++) {
+        int pivot = power_grid_normal_factor.pivot[col];
+        if (pivot != col) {
+            float swap = rhs[col]; rhs[col] = rhs[pivot]; rhs[pivot] = swap;
+        }
+    }
+    for (int row = 0; row < dimensions; row++) {
+        float value = rhs[row];
+        for (int col = 0; col < row; col++)
+            value -= power_grid_normal_factor.factor[row][col] * solution[col];
+        solution[row] = value;
+    }
+    for (int row = dimensions - 1; row >= 0; row--) {
+        float value = solution[row];
+        for (int col = row + 1; col < dimensions; col++)
+            value -= power_grid_normal_factor.factor[row][col] * solution[col];
+        solution[row] = value / power_grid_normal_factor.factor[row][row];
+        if (!isfinite(solution[row])) return 0;
+    }
+    return 1;
+}
+
+static int power_grid_ensure_normal_factor(
+        float matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES], int dimensions)
+{
+    int state = atomic_load_explicit(&power_grid_normal_factor_state, memory_order_acquire);
+    if (state == 0) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&power_grid_normal_factor_state,
+                &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+            int valid = power_grid_factor_normal(matrix, dimensions);
+            atomic_store_explicit(&power_grid_normal_factor_state, valid ? 2 : -1,
+                memory_order_release);
+            state = valid ? 2 : -1;
+        } else state = expected;
+    }
+    while (state == 1)
+        state = atomic_load_explicit(&power_grid_normal_factor_state, memory_order_acquire);
+    return state == 2 && power_grid_normal_factor.dimensions == dimensions;
+}
+
 PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         const PowerGridOperatingPoint* point, PowerGridSolveResult* result) {
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int row_for_node[POWER_GRID_NUM_NODES];
     double injection[POWER_GRID_NUM_NODES] = {0};
-    float matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
+    float matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
     float rhs[POWER_GRID_NUM_NODES] = {0};
     float solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
@@ -331,26 +424,39 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         row_for_node[node] = -1;
         if (active[node] && node != reference) row_for_node[node] = dimensions++;
     }
-    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
-        if (!topology->line_closed[branch]) continue;
-        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
-        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
-        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
-        float susceptance = (float)(POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio));
-        int from_row = row_for_node[from];
-        int to_row = row_for_node[to];
-        if (from_row >= 0) matrix[from_row][from_row] += susceptance;
-        if (to_row >= 0) matrix[to_row][to_row] += susceptance;
-        if (from_row >= 0 && to_row >= 0) {
-            matrix[from_row][to_row] -= susceptance;
-            matrix[to_row][from_row] -= susceptance;
+    int normal_topology = power_grid_is_normal_topology(topology);
+    int normal_factor_ready = normal_topology &&
+        atomic_load_explicit(&power_grid_normal_factor_state, memory_order_acquire) == 2 &&
+        power_grid_normal_factor.dimensions == dimensions;
+    if (!normal_factor_ready) {
+        memset(matrix, 0, sizeof(matrix));
+        for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+            if (!topology->line_closed[branch]) continue;
+            const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
+            int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
+            int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+            float susceptance = (float)(POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio));
+            int from_row = row_for_node[from];
+            int to_row = row_for_node[to];
+            if (from_row >= 0) matrix[from_row][from_row] += susceptance;
+            if (to_row >= 0) matrix[to_row][to_row] += susceptance;
+            if (from_row >= 0 && to_row >= 0) {
+                matrix[from_row][to_row] -= susceptance;
+                matrix[to_row][from_row] -= susceptance;
+            }
         }
     }
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         if (row_for_node[node] >= 0) rhs[row_for_node[node]] = (float)injection[node];
     }
-    if (!power_grid_solve_dense_float(&matrix[0][0], rhs, solution, dimensions,
-            POWER_GRID_NUM_NODES)) {
+    int solved = 0;
+    if (normal_topology &&
+        power_grid_ensure_normal_factor(matrix, dimensions))
+        solved = power_grid_solve_normal(rhs, solution, dimensions);
+    else
+        solved = power_grid_solve_dense_float(&matrix[0][0], rhs, solution, dimensions,
+            POWER_GRID_NUM_NODES);
+    if (!solved) {
         result->status = POWER_GRID_SINGULAR;
         return result->status;
     }
