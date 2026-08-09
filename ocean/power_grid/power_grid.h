@@ -163,6 +163,7 @@ typedef struct
     int value;
     PowerGridActionType type;
     int switched;
+    int electrical_change;
 } PowerGridAppliedAction;
 
 typedef struct
@@ -498,6 +499,7 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
 {
     PowerGridAppliedAction action = {
         .value = isfinite(raw_action) ? (int)raw_action : -1,
+        .electrical_change = 0,
     };
     action.type = power_grid_apply_action(&env->topology, action.value);
     action.switched = action.type > POWER_GRID_ACTION_NONE;
@@ -511,6 +513,36 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
         if (!env->line_available[line])
             env->topology.line_closed[line] = 0;
         action.switched = env->topology.line_closed[line] != previous_state;
+        action.electrical_change = action.switched;
+    }
+    else if (action.type == POWER_GRID_ACTION_TERMINAL)
+    {
+        int terminal = action.value - POWER_GRID_TERMINAL_ACTION_OFFSET;
+        int substation;
+        if (terminal < 2 * POWER_GRID_NUM_BRANCHES)
+        {
+            int line = terminal / 2;
+            substation = terminal % 2 == 0 ? POWER_GRID_BRANCHES[line].from_bus :
+                                              POWER_GRID_BRANCHES[line].to_bus;
+        }
+        else if (terminal < 2 * POWER_GRID_NUM_BRANCHES + POWER_GRID_NUM_GENERATORS)
+        {
+            substation = POWER_GRID_GENERATOR_BUSES[
+                terminal - 2 * POWER_GRID_NUM_BRANCHES];
+        }
+        else
+        {
+            substation = POWER_GRID_LOAD_BUSES[
+                terminal - 2 * POWER_GRID_NUM_BRANCHES - POWER_GRID_NUM_GENERATORS];
+        }
+        /* With a closed coupler both busbars are one electrical node. The
+         * terminal bit remains observable and matters if the coupler opens,
+         * but it cannot change this step's power-flow solution. */
+        action.electrical_change = !env->topology.coupler_closed[substation];
+    }
+    else if (action.type == POWER_GRID_ACTION_COUPLER)
+    {
+        action.electrical_change = action.switched;
     }
     env->episode.no_op_actions += action.type == POWER_GRID_ACTION_NONE;
     env->episode.switches[0] += action.switched;
@@ -706,7 +738,7 @@ void c_step(PowerGrid *env)
     {
         status = env->solution.status = POWER_GRID_INVALID_INPUT;
     }
-    else if (!action.switched && !env->ac_power_flow)
+    else if (!action.electrical_change && !env->ac_power_flow)
     {
         /* In DC mode, a no-op cannot change topology, injections, or ratings;
          * the previous solved state is exactly the current solved state. */
