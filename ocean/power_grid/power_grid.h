@@ -697,6 +697,10 @@ void c_step(PowerGrid *env)
     }
     PowerGridAppliedAction action = apply_agent_action(env, env->actions[0]);
     env->terminals[0] = 0.0f;
+    /* In DC mode, a no-op before a period transition leaves every value in the
+     * observation vector unchanged. Track whether a later state mutation
+     * actually requires rebuilding the 1,985-float observation. */
+    int observations_dirty = action.switched || env->ac_power_flow;
 
     PowerGridSolveStatus status;
     if (action.type == POWER_GRID_ACTION_INVALID)
@@ -757,6 +761,7 @@ void c_step(PowerGrid *env)
     int next_period = env->episode_step / POWER_GRID_STEPS_PER_PERIOD;
     if (next_period != env->current_period)
     {
+        observations_dirty = 1;
         env->current_period = next_period;
         power_grid_set_operating_period(env, next_period);
         for (int event = 0; event < env->scheduled_random_event_count; event++)
@@ -783,7 +788,8 @@ void c_step(PowerGrid *env)
         return;
     }
     env->episode_return += env->rewards[0];
-    power_grid_compute_observations(env);
+    if (observations_dirty)
+        power_grid_compute_observations(env);
 }
 
 void power_grid_allocate(PowerGrid *env)
