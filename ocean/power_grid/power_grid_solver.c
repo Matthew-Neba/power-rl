@@ -138,59 +138,77 @@ static void build_topology_graph(const PowerGridTopology* topology,
     }
 }
 
-static void mark_component(
-        const unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES],
-        const unsigned char active[POWER_GRID_NUM_NODES], int start,
-        unsigned char visited[POWER_GRID_NUM_NODES]) {
-    int queue[POWER_GRID_NUM_NODES];
-    int head = 0, tail = 0;
-    visited[start] = 1;
-    queue[tail++] = start;
-    while (head < tail) {
-        int node = queue[head++];
-        for (int next = 0; next < POWER_GRID_NUM_NODES; next++) {
-            if (active[next] && adjacency[node][next] && !visited[next]) {
-                visited[next] = 1;
-                queue[tail++] = next;
-            }
-        }
-    }
-}
-
 PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topology,
         int* component_count, int* active_node_count) {
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
-    unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
-    unsigned char visited[POWER_GRID_NUM_NODES] = {0};
+    int parent[POWER_GRID_NUM_NODES];
+    int rank[POWER_GRID_NUM_NODES] = {0};
     if (component_count) *component_count = 0;
     if (active_node_count) *active_node_count = 0;
-    build_topology_graph(topology, active, adjacency);
+    for (int node = 0; node < POWER_GRID_NUM_NODES; node++) parent[node] = node;
+
+    /* Union-find is equivalent to the old adjacency/BFS validation here, but
+     * touches only the 186 closed branches instead of a 236x236 matrix. */
+    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+        if (!topology->line_closed[branch]) continue;
+        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
+        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0),
+            line->from_bus);
+        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1),
+            line->to_bus);
+        active[from] = active[to] = 1;
+        int root_from = from, root_to = to;
+        while (parent[root_from] != root_from) root_from = parent[root_from];
+        while (parent[root_to] != root_to) root_to = parent[root_to];
+        while (parent[from] != from) { int next = parent[from]; parent[from] = root_from; from = next; }
+        while (parent[to] != to) { int next = parent[to]; parent[to] = root_to; to = next; }
+        if (root_from != root_to) {
+            if (rank[root_from] < rank[root_to]) parent[root_from] = root_to;
+            else {
+                parent[root_to] = root_from;
+                if (rank[root_from] == rank[root_to]) rank[root_from]++;
+            }
+        }
+    }
+    for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
+        active[power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
+            POWER_GRID_GENERATOR_BUSES[gen])] = 1;
+    }
+    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
+        active[power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
+            POWER_GRID_LOAD_BUSES[load])] = 1;
+    }
 
     int active_count = 0;
     int components = 0;
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) active_count += active[node] != 0;
     for (int start = 0; start < POWER_GRID_NUM_NODES; start++) {
-        if (!active[start] || visited[start]) continue;
+        if (!active[start]) continue;
+        int root = start;
+        while (parent[root] != root) root = parent[root];
+        if (root != start) continue;
         components++;
-        mark_component(adjacency, active, start, visited);
     }
     if (component_count) *component_count = components;
     if (active_node_count) *active_node_count = active_count;
 
     int reference = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(0),
         POWER_GRID_GENERATOR_BUSES[0]);
-    /* Find exactly the nodes reachable from the slack/reference generator. */
-    memset(visited, 0, sizeof(visited));
-    mark_component(adjacency, active, reference, visited);
+    int reference_root = reference;
+    while (parent[reference_root] != reference_root) reference_root = parent[reference_root];
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
             POWER_GRID_LOAD_BUSES[load]);
-        if (!visited[node]) return POWER_GRID_DISCONNECTED_LOAD;
+        int root = node;
+        while (parent[root] != root) root = parent[root];
+        if (root != reference_root) return POWER_GRID_DISCONNECTED_LOAD;
     }
     for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
             POWER_GRID_GENERATOR_BUSES[gen]);
-        if (!visited[node]) return POWER_GRID_DISCONNECTED_GENERATOR;
+        int root = node;
+        while (parent[root] != root) root = parent[root];
+        if (root != reference_root) return POWER_GRID_DISCONNECTED_GENERATOR;
     }
     if (components != 1) return POWER_GRID_ISLANDED;
     return POWER_GRID_SOLVE_OK;
@@ -233,12 +251,111 @@ int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
     return 1;
 }
 
+/* A DC topology changes much less often than injections do. Keep one exact
+ * double-precision LU factorization per worker thread and reuse it whenever
+ * the complete topology is unchanged. The cache is deliberately private to
+ * this translation unit: direct solver callers retain the same API and no
+ * mutable state is added to each environment instance. */
+typedef struct {
+    int valid;
+    int dimensions;
+    int row_for_node[POWER_GRID_NUM_NODES];
+    int pivots[POWER_GRID_NUM_NODES];
+    PowerGridTopology topology;
+    double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+} PowerGridDCFactorCache;
+
+static __thread PowerGridDCFactorCache power_grid_dc_cache;
+
+static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
+        const PowerGridTopology* topology, const int* row_for_node, int dimensions) {
+    if (cache->valid && cache->dimensions == dimensions &&
+            memcmp(&cache->topology, topology, sizeof(*topology)) == 0 &&
+            memcmp(cache->row_for_node, row_for_node,
+                   sizeof(cache->row_for_node)) == 0) {
+        return 1;
+    }
+
+    memset(cache->lu, 0, sizeof(cache->lu));
+    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+        if (!topology->line_closed[branch]) continue;
+        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
+        int from = power_grid_terminal_node(topology,
+            POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
+        int to = power_grid_terminal_node(topology,
+            POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+        double susceptance = POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio);
+        int from_row = row_for_node[from];
+        int to_row = row_for_node[to];
+        if (from_row >= 0) cache->lu[from_row][from_row] += susceptance;
+        if (to_row >= 0) cache->lu[to_row][to_row] += susceptance;
+        if (from_row >= 0 && to_row >= 0) {
+            cache->lu[from_row][to_row] -= susceptance;
+            cache->lu[to_row][from_row] -= susceptance;
+        }
+    }
+
+    for (int col = 0; col < dimensions; col++) {
+        int pivot = col;
+        for (int row = col + 1; row < dimensions; row++) {
+            if (fabs(cache->lu[row][col]) > fabs(cache->lu[pivot][col])) pivot = row;
+        }
+        cache->pivots[col] = pivot;
+        if (!isfinite(cache->lu[pivot][col]) || fabs(cache->lu[pivot][col]) < 1e-12) {
+            cache->valid = 0;
+            return 0;
+        }
+        if (pivot != col) {
+            for (int j = 0; j < dimensions; j++) {
+                double swap = cache->lu[col][j];
+                cache->lu[col][j] = cache->lu[pivot][j];
+                cache->lu[pivot][j] = swap;
+            }
+        }
+        for (int row = col + 1; row < dimensions; row++) {
+            double factor = cache->lu[row][col] / cache->lu[col][col];
+            cache->lu[row][col] = factor;
+            for (int j = col + 1; j < dimensions; j++) {
+                cache->lu[row][j] -= factor * cache->lu[col][j];
+            }
+        }
+    }
+    cache->dimensions = dimensions;
+    cache->topology = *topology;
+    memcpy(cache->row_for_node, row_for_node, sizeof(cache->row_for_node));
+    cache->valid = 1;
+    return 1;
+}
+
+static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
+        const double* rhs, double* solution) {
+    int dimensions = cache->dimensions;
+    for (int i = 0; i < dimensions; i++) solution[i] = rhs[i];
+    for (int col = 0; col < dimensions; col++) {
+        int pivot = cache->pivots[col];
+        if (pivot != col) {
+            double swap = solution[col];
+            solution[col] = solution[pivot];
+            solution[pivot] = swap;
+        }
+        for (int row = col + 1; row < dimensions; row++)
+            solution[row] -= cache->lu[row][col] * solution[col];
+    }
+    for (int row = dimensions - 1; row >= 0; row--) {
+        double value = solution[row];
+        for (int col = row + 1; col < dimensions; col++)
+            value -= cache->lu[row][col] * solution[col];
+        solution[row] = value / cache->lu[row][row];
+        if (!isfinite(solution[row])) return 0;
+    }
+    return 1;
+}
+
 PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         const PowerGridOperatingPoint* point, PowerGridSolveResult* result) {
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int row_for_node[POWER_GRID_NUM_NODES];
     double injection[POWER_GRID_NUM_NODES] = {0};
-    double matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
     double rhs[POWER_GRID_NUM_NODES] = {0};
     double solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
@@ -292,26 +409,12 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         row_for_node[node] = -1;
         if (active[node] && node != reference) row_for_node[node] = dimensions++;
     }
-    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
-        if (!topology->line_closed[branch]) continue;
-        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
-        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
-        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
-        double susceptance = POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio);
-        int from_row = row_for_node[from];
-        int to_row = row_for_node[to];
-        if (from_row >= 0) matrix[from_row][from_row] += susceptance;
-        if (to_row >= 0) matrix[to_row][to_row] += susceptance;
-        if (from_row >= 0 && to_row >= 0) {
-            matrix[from_row][to_row] -= susceptance;
-            matrix[to_row][from_row] -= susceptance;
-        }
-    }
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         if (row_for_node[node] >= 0) rhs[row_for_node[node]] = injection[node];
     }
-    if (!power_grid_solve_dense(&matrix[0][0], rhs, solution, dimensions,
-            POWER_GRID_NUM_NODES)) {
+    if (!power_grid_factorize_cached(&power_grid_dc_cache, topology,
+            row_for_node, dimensions) ||
+            !power_grid_solve_cached_rhs(&power_grid_dc_cache, rhs, solution)) {
         result->status = POWER_GRID_SINGULAR;
         return result->status;
     }
