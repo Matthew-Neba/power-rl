@@ -248,6 +248,7 @@ typedef struct {
     unsigned char active[POWER_GRID_NUM_NODES];
     int from_node[POWER_GRID_NUM_BRANCHES];
     int to_node[POWER_GRID_NUM_BRANCHES];
+    unsigned char pattern[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
     PowerGridTopology topology;
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
 } PowerGridDCFactorCache;
@@ -278,6 +279,7 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
     }
 
     memset(cache->lu, 0, sizeof(cache->lu));
+    memset(cache->pattern, 0, sizeof(cache->pattern));
     for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
         cache->from_node[branch] = -1;
         cache->to_node[branch] = -1;
@@ -299,15 +301,37 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
         if (from_row >= 0 && to_row >= 0) {
             cache->lu[from_row][to_row] -= susceptance;
             cache->lu[to_row][from_row] -= susceptance;
+            int high = from_row > to_row ? from_row : to_row;
+            int low = from_row > to_row ? to_row : from_row;
+            cache->pattern[high][low] = 1;
+        }
+    }
+    for (int row = 0; row < dimensions; row++) cache->pattern[row][row] = 1;
+
+    /* Symbolic elimination connects the higher-index neighbors of each
+     * eliminated node. Numeric Cholesky then visits only this sparse fill
+     * pattern, while retaining exact double-precision arithmetic. */
+    for (int col = 0; col < dimensions; col++) {
+        int neighbors[POWER_GRID_NUM_NODES];
+        int count = 0;
+        for (int row = col + 1; row < dimensions; row++)
+            if (cache->pattern[row][col]) neighbors[count++] = row;
+        for (int a = 0; a < count; a++) {
+            for (int b = 0; b < a; b++) {
+                int high = neighbors[a] > neighbors[b] ? neighbors[a] : neighbors[b];
+                int low = neighbors[a] > neighbors[b] ? neighbors[b] : neighbors[a];
+                cache->pattern[high][low] = 1;
+            }
         }
     }
 
-    /* A connected reduced Laplacian is symmetric positive definite. Cholesky
-     * cuts factorization work substantially while staying in double precision. */
     for (int row = 0; row < dimensions; row++) {
         for (int col = 0; col <= row; col++) {
+            if (!cache->pattern[row][col]) continue;
             double value = cache->lu[row][col];
-            for (int k = 0; k < col; k++) value -= cache->lu[row][k] * cache->lu[col][k];
+            for (int k = 0; k < col; k++)
+                if (cache->pattern[row][k] && cache->pattern[col][k])
+                    value -= cache->lu[row][k] * cache->lu[col][k];
             if (row == col) {
                 if (!isfinite(value) || value < 1e-12) {
                     cache->valid = 0;
