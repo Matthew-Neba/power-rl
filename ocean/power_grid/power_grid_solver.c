@@ -243,6 +243,9 @@ typedef struct {
     int valid;
     int dimensions;
     int row_for_node[POWER_GRID_NUM_NODES];
+    int component_count;
+    int active_node_count;
+    unsigned char active[POWER_GRID_NUM_NODES];
     PowerGridTopology topology;
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
 } PowerGridDCFactorCache;
@@ -328,8 +331,21 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     double rhs[POWER_GRID_NUM_NODES] = {0};
     double solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
-    result->status = power_grid_validate_topology_internal(topology,
-        &result->component_count, &result->active_node_count, active);
+    int validation_cache_hit = 0;
+    for (int slot = 0; slot < POWER_GRID_DC_CACHE_SLOTS; slot++) {
+        PowerGridDCFactorCache* candidate = &power_grid_dc_cache[slot];
+        if (candidate->valid &&
+                memcmp(&candidate->topology, topology, sizeof(*topology)) == 0) {
+            memcpy(active, candidate->active, sizeof(active));
+            result->component_count = candidate->component_count;
+            result->active_node_count = candidate->active_node_count;
+            validation_cache_hit = 1;
+            break;
+        }
+    }
+    result->status = validation_cache_hit ? POWER_GRID_SOLVE_OK :
+        power_grid_validate_topology_internal(topology,
+            &result->component_count, &result->active_node_count, active);
     if (result->status != POWER_GRID_SOLVE_OK) return result->status;
 
     double total_load = 0.0;
@@ -400,6 +416,9 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         result->status = POWER_GRID_SINGULAR;
         return result->status;
     }
+    cache->component_count = result->component_count;
+    cache->active_node_count = result->active_node_count;
+    memcpy(cache->active, active, sizeof(cache->active));
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         if (row_for_node[node] >= 0) result->node_angle[node] = solution[row_for_node[node]];
     }
