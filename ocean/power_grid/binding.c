@@ -20,6 +20,7 @@ void my_init(Env* env, Dict* kwargs) {
     env->offline_scenario_probability = dict_get(kwargs, "offline_scenario_probability")->value;
     env->random_events = (int)dict_get(kwargs, "random_events")->value;
     env->random_event_probability = dict_get(kwargs, "random_event_probability")->value;
+    env->random_outage_count = (int)dict_get(kwargs, "random_outage_count")->value;
     env->single_episode_evaluation =
         (int)dict_get(kwargs, "single_episode_evaluation")->value;
 }

@@ -13,13 +13,11 @@
 #include "raylib.h"
 #endif
 
-#define POWER_GRID_OBS_SIZE 221
+#define POWER_GRID_OBS_SIZE 1985
 #define POWER_GRID_EPISODE_STEPS 72
 #define POWER_GRID_STEPS_PER_PERIOD 6
 #define POWER_GRID_NUM_PERIODS (POWER_GRID_EPISODE_STEPS / POWER_GRID_STEPS_PER_PERIOD)
-/* Any line except radial 7-8 can be removed without disconnecting the normal topology. */
-#define POWER_GRID_RANDOM_EVENT_LINE_MASK \
-    (((1u << POWER_GRID_NUM_BRANCHES) - 1u) & ~(1u << 13))
+#define POWER_GRID_MAX_RANDOM_OUTAGES 8
 
 typedef struct {
     unsigned int date_yyyymmdd;
@@ -34,7 +32,7 @@ typedef struct {
 #include "power_grid_scenarios_data.h"
 
 /* Steady-state IEEE 738 ampacity normalized to median 2019 ERA5 conditions.
- * IEEE-14 has no physical routes, so all lines use the published 26/7 Drake
+ * IEEE-118 has no physical routes, so all lines use the published 26/7 Drake
  * ACSR example parameters and perpendicular wind. Measured irradiance is
  * treated as effective incident flux. Synthetic ratings remain capped at
  * 0.90x-1.35x until real conductor and route data are available. */
@@ -113,7 +111,7 @@ static inline double power_grid_weather_rating_scale(
 
 _Static_assert(POWER_GRID_GENERATOR_Q_OBS_OFFSET + POWER_GRID_NUM_GENERATORS ==
                    POWER_GRID_OBS_SIZE,
-               "power-grid observation layout must total 221 floats");
+               "power-grid observation layout must total 1985 floats");
 _Static_assert(POWER_GRID_EPISODE_STEPS % POWER_GRID_STEPS_PER_PERIOD == 0,
                "power-grid periods must divide the episode evenly");
 _Static_assert(POWER_GRID_ACTION_NONE == 0 && POWER_GRID_ACTION_LINE == 1 &&
@@ -190,8 +188,9 @@ typedef struct
     PowerGridEpisodeStats episode;
     unsigned char line_available[POWER_GRID_NUM_BRANCHES];
     double line_thermal_stress[POWER_GRID_NUM_BRANCHES];
-    int scheduled_random_event_period;
-    int scheduled_random_event_line;
+    int scheduled_random_event_count;
+    int scheduled_random_event_period[POWER_GRID_MAX_RANDOM_OUTAGES];
+    int scheduled_random_event_line[POWER_GRID_MAX_RANDOM_OUTAGES];
     int active_random_event_line;
     float episode_return;
     int pending_reset;
@@ -203,6 +202,7 @@ typedef struct
     double offline_scenario_probability;
     int random_events;
     double random_event_probability;
+    int random_outage_count;
     int single_episode_evaluation;
     double branch_rating_scale;
     double ambient_temperature_c;
@@ -211,6 +211,67 @@ typedef struct
 } PowerGrid;
 
 void c_reset(PowerGrid *env);
+
+static int power_grid_generator_index_at_bus(int bus)
+{
+    for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        if (POWER_GRID_GENERATOR_BUSES[generator] == bus)
+            return generator;
+    return -1;
+}
+
+/* Preserve the canonical generator participation pattern while making the
+ * slack carry roughly nine percent of demand. Alberta wind and solar remain
+ * exogenous; dispatchable online generators absorb the remaining change. */
+static void power_grid_redispatch(PowerGridOperatingPoint *point)
+{
+    int solar = power_grid_generator_index_at_bus(POWER_GRID_SOLAR_GENERATOR_BUS);
+    int wind = power_grid_generator_index_at_bus(POWER_GRID_WIND_GENERATOR_BUS);
+    double total_load = 0.0, current = 0.0;
+    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+        total_load += point->load_mw[load];
+    for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        current += point->generator_mw[generator];
+    double required = 0.91 * total_load;
+    double difference = required - current;
+    if (difference > 0.0)
+    {
+        for (int pass = 0; pass < 3 && difference > 1e-8; pass++)
+        {
+            double headroom = 0.0;
+            for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+                if (generator != solar && generator != wind &&
+                    POWER_GRID_GENERATOR_P_NOMINAL[generator] > 0.0)
+                    headroom += fmax(0.0, POWER_GRID_GENERATOR_P_MAX[generator] -
+                                           point->generator_mw[generator]);
+            if (headroom <= 0.0)
+                break;
+            double applied = fmin(difference, headroom);
+            for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+            {
+                if (generator == solar || generator == wind ||
+                    POWER_GRID_GENERATOR_P_NOMINAL[generator] <= 0.0)
+                    continue;
+                double available = fmax(0.0, POWER_GRID_GENERATOR_P_MAX[generator] -
+                                              point->generator_mw[generator]);
+                point->generator_mw[generator] += applied * available / headroom;
+            }
+            difference -= applied;
+        }
+    }
+    else if (difference < 0.0)
+    {
+        double dispatchable = 0.0;
+        for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+            if (generator != solar && generator != wind)
+                dispatchable += point->generator_mw[generator];
+        double reduction = fmin(-difference, dispatchable);
+        if (dispatchable > 0.0)
+            for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+                if (generator != solar && generator != wind)
+                    point->generator_mw[generator] *= 1.0 - reduction / dispatchable;
+    }
+}
 
 static void power_grid_set_operating_period(PowerGrid *env, int period)
 {
@@ -224,8 +285,13 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
         power_grid_operating_point_nominal(&env->operating_point);
         for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
             env->operating_point.load_mw[load] *= scenario->load_scale[period];
-        env->operating_point.generator_mw[2] = scenario->solar_mw[period];
-        env->operating_point.generator_mw[3] = scenario->wind_mw[period];
+        for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+            env->operating_point.generator_mw[generator] *= scenario->load_scale[period];
+        int solar = power_grid_generator_index_at_bus(POWER_GRID_SOLAR_GENERATOR_BUS);
+        int wind = power_grid_generator_index_at_bus(POWER_GRID_WIND_GENERATOR_BUS);
+        env->operating_point.generator_mw[solar] = scenario->solar_mw[period];
+        env->operating_point.generator_mw[wind] = scenario->wind_mw[period];
+        power_grid_redispatch(&env->operating_point);
         env->ambient_temperature_c = scenario->ambient_temperature_c[period];
         env->wind_speed_mps = scenario->wind_speed_mps[period];
         env->solar_irradiance_wm2 = scenario->solar_irradiance_wm2[period];
@@ -254,6 +320,7 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
                 scale * (target.generator_mw[generator] -
                          env->operating_point.generator_mw[generator]);
         }
+        power_grid_redispatch(&env->operating_point);
     }
 }
 
@@ -475,11 +542,12 @@ static void power_grid_finish_episode(PowerGrid *env)
     env->log.random_events += (float)env->episode.random_events;
     env->log.demand_fulfilled +=
         (float)env->episode.demand_served_steps / POWER_GRID_EPISODE_STEPS;
-    if (env->scheduled_random_event_period > 0)
+    if (env->scheduled_random_event_count > 0)
     {
-        env->log.outage_completion += env->episode.random_events;
+        env->log.outage_completion += (float)env->episode.random_events /
+                                      env->scheduled_random_event_count;
         env->log.all_outages_survived +=
-            !failed && env->episode.random_events == 1;
+            !failed && env->episode.random_events == env->scheduled_random_event_count;
     }
     env->log.thermal_trips += (float)env->episode.thermal_trips;
     env->log.thermal_trip_episode += env->episode.thermal_trips > 0;
@@ -556,26 +624,56 @@ void c_reset(PowerGrid *env)
         env->synthetic_profile = (PowerGridProfile)(
             1 + next_random(env) % (POWER_GRID_NUM_PROFILES - 1));
     }
-    env->scheduled_random_event_period = -1;
-    env->scheduled_random_event_line = -1;
+    env->scheduled_random_event_count = 0;
+    for (int event = 0; event < POWER_GRID_MAX_RANDOM_OUTAGES; event++)
+    {
+        env->scheduled_random_event_period[event] = -1;
+        env->scheduled_random_event_line[event] = -1;
+    }
     if (env->random_events)
     {
         double unit_sample = (double)(next_random(env) >> 8) / 16777216.0;
         if (unit_sample < env->random_event_probability)
         {
-            env->scheduled_random_event_period = 1 +
-                (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
-            unsigned int selected = next_random(env) %
-                (unsigned int)__builtin_popcount(POWER_GRID_RANDOM_EVENT_LINE_MASK);
-            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            int requested = env->random_outage_count > 0 ? env->random_outage_count : 1;
+            env->scheduled_random_event_count =
+                requested < POWER_GRID_MAX_RANDOM_OUTAGES ? requested :
+                                                            POWER_GRID_MAX_RANDOM_OUTAGES;
+            for (int event = 0; event < env->scheduled_random_event_count; event++)
             {
-                if ((POWER_GRID_RANDOM_EVENT_LINE_MASK & (1u << line)) == 0)
-                    continue;
-                if (selected-- == 0)
+                int period;
+                int unique_period;
+                do
                 {
-                    env->scheduled_random_event_line = line;
-                    break;
+                    period = 1 + (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
+                    unique_period = 1;
+                    for (int prior = 0; prior < event; prior++)
+                        unique_period &= env->scheduled_random_event_period[prior] != period;
                 }
+                while (!unique_period);
+                env->scheduled_random_event_period[event] = period;
+
+                int line;
+                int unique_line;
+                do
+                {
+                    line = (int)(next_random(env) % POWER_GRID_NUM_BRANCHES);
+                    unique_line = power_grid_random_event_eligible(line);
+                    for (int prior = 0; prior < event; prior++)
+                        unique_line &= env->scheduled_random_event_line[prior] != line;
+                    if (unique_line)
+                    {
+                        PowerGridTopology candidate;
+                        power_grid_topology_normal(&candidate);
+                        candidate.line_closed[line] = 0;
+                        for (int prior = 0; prior < event; prior++)
+                            candidate.line_closed[env->scheduled_random_event_line[prior]] = 0;
+                        unique_line = power_grid_validate_topology(
+                            &candidate, NULL, NULL) == POWER_GRID_SOLVE_OK;
+                    }
+                }
+                while (!unique_line);
+                env->scheduled_random_event_line[event] = line;
             }
         }
     }
@@ -656,9 +754,11 @@ void c_step(PowerGrid *env)
     {
         env->current_period = next_period;
         power_grid_set_operating_period(env, next_period);
-        if (next_period == env->scheduled_random_event_period)
+        for (int event = 0; event < env->scheduled_random_event_count; event++)
         {
-            int line = env->scheduled_random_event_line;
+            if (next_period != env->scheduled_random_event_period[event])
+                continue;
+            int line = env->scheduled_random_event_line[event];
             env->line_available[line] = 0;
             env->topology.line_closed[line] = 0;
             env->active_random_event_line = line;
@@ -711,45 +811,22 @@ static const Color POWER_GRID_BB2 = {190, 105, 255, 255};
 static const Color POWER_GRID_TEXT = {225, 232, 242, 255};
 static const Color POWER_GRID_MUTED = {145, 158, 178, 255};
 
-static const Vector2 POWER_GRID_STATION_POSITIONS[POWER_GRID_NUM_SUBSTATIONS] = {
-    {100, 285},
-    {315, 205},
-    {570, 135},
-    {575, 355},
-    {305, 415},
-    {455, 620},
-    {785, 350},
-    {1020, 205},
-    {1020, 485},
-    {1250, 570},
-    {870, 635},
-    {530, 835},
-    {870, 845},
-    {1235, 810},
-};
+static Vector2 POWER_GRID_STATION_POSITIONS[POWER_GRID_NUM_SUBSTATIONS];
 
-static const Vector2 POWER_GRID_LABEL_OFFSETS[POWER_GRID_NUM_BRANCHES] = {
-    {30, 25},
-    {-34, 18},
-    {30, 0},
-    {-5, 30},
-    {-30, 22},
-    {24, 0},
-    {0, 24},
-    {-24, -27},
-    {25, 10},
-    {-28, 5},
-    {-34, -22},
-    {-32, 14},
-    {25, 16},
-    {0, -25},
-    {24, 10},
-    {18, -23},
-    {30, 18},
-    {-27, 16},
-    {0, -23},
-    {20, 11},
-};
+static void power_grid_prepare_layout(void)
+{
+    static int initialized;
+    if (initialized)
+        return;
+    for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
+    {
+        POWER_GRID_STATION_POSITIONS[bus] = (Vector2){
+            58.0f + 112.0f * (bus % 12),
+            108.0f + 83.0f * (bus / 12),
+        };
+    }
+    initialized = 1;
+}
 
 static Color power_grid_line_color(const PowerGrid *env, int line)
 {
@@ -769,9 +846,9 @@ static Vector2 power_grid_branch_endpoint(Vector2 station, Vector2 other, int bu
 {
     float dx = other.x - station.x;
     float x = station.x;
-    if (fabsf(dx) > 12.0f)
-        x += dx > 0.0f ? 54.0f : -54.0f;
-    return (Vector2){x, station.y + (busbar ? 8.0f : -8.0f)};
+    if (fabsf(dx) > 4.0f)
+        x += dx > 0.0f ? 17.0f : -17.0f;
+    return (Vector2){x, station.y + (busbar ? 3.0f : -3.0f)};
 }
 
 static void power_grid_draw_dashed_line(Vector2 from, Vector2 to, float dash, float gap,
@@ -792,63 +869,6 @@ static void power_grid_draw_dashed_line(Vector2 from, Vector2 to, float dash, fl
     }
 }
 
-static void power_grid_draw_flow_arrow(Vector2 from, Vector2 to, double flow, float phase,
-                                       Color color)
-{
-    float dx = to.x - from.x;
-    float dy = to.y - from.y;
-    float length = sqrtf(dx * dx + dy * dy);
-    if (length < 1.0f)
-        return;
-
-    dx /= length;
-    dy /= length;
-
-    /* Near-zero active power has no meaningful direction. The branch label
-       states this explicitly; the solid conductor still shows that it is closed. */
-    if (fabs(flow) < 0.05)
-        return;
-
-    if (flow < 0.0)
-    {
-        Vector2 tmp = from;
-        from = to;
-        to = tmp;
-        dx = to.x - from.x;
-        dy = to.y - from.y;
-        dx /= length;
-        dy /= length;
-    }
-
-    float progress = fmodf((float)(GetTime() * 0.40) + phase, 1.0f);
-    float head = fminf(7.0f, length * 0.12f);
-    float tail = fminf(6.0f, length * 0.10f);
-    for (int marker = 0; marker < 2; marker++)
-    {
-        /* Keep markers away from the center, where the branch label is placed. */
-        float fraction = marker == 0 ? 0.10f + 0.22f * progress : 0.68f + 0.22f * progress;
-        float distance = fminf(fmaxf(length * fraction, tail), length - head);
-        Vector2 tip = {from.x + dx * (distance + head), from.y + dy * (distance + head)};
-        Vector2 left = {from.x + dx * (distance - tail) - dy * tail,
-                        from.y + dy * (distance - tail) + dx * tail};
-        Vector2 right = {from.x + dx * (distance - tail) + dy * tail,
-                         from.y + dy * (distance - tail) - dx * tail};
-        DrawLineEx(left, tip, 5.0f, Fade(BLACK, 0.75f));
-        DrawLineEx(right, tip, 5.0f, Fade(BLACK, 0.75f));
-        DrawLineEx(left, tip, 2.5f, color);
-        DrawLineEx(right, tip, 2.5f, color);
-    }
-}
-
-static void power_grid_draw_label(Vector2 position, const char *text, Color border)
-{
-    int width = MeasureText(text, 16) + 8;
-    Rectangle box = {position.x - width * 0.5f, position.y - 12.0f, (float)width, 24.0f};
-    DrawRectangleRounded(box, 0.3f, 4, Fade(POWER_GRID_BG, 0.94f));
-    DrawRectangleRoundedLinesEx(box, 0.3f, 4, 1.0f, Fade(border, 0.75f));
-    DrawText(text, (int)(box.x + 4), (int)(box.y + 4), 16, POWER_GRID_TEXT);
-}
-
 static void power_grid_draw_branches(const PowerGrid *env)
 {
     for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
@@ -861,78 +881,16 @@ static void power_grid_draw_branches(const PowerGrid *env)
         Vector2 from = power_grid_branch_endpoint(from_station, to_station, from_bar);
         Vector2 to = power_grid_branch_endpoint(to_station, from_station, to_bar);
         Color color = power_grid_line_color(env, line);
-        DrawLineEx(from, to, 7.0f, Fade(BLACK, 0.65f));
+        DrawLineEx(from, to, 3.5f, Fade(BLACK, 0.65f));
         if (env->topology.line_closed[line])
         {
-            float width = 2.5f + 2.5f * fminf((float)env->solution.branch_rho[line], 1.2f);
+            float width = 1.0f + 1.5f * fminf((float)env->solution.branch_rho[line], 1.2f);
             DrawLineEx(from, to, width, color);
         }
         else
         {
-            power_grid_draw_dashed_line(from, to, 9.0f, 7.0f, 2.5f, color);
-            DrawCircleLines((int)from.x, (int)from.y, 5.0f, POWER_GRID_OPEN);
-            DrawCircleLines((int)to.x, (int)to.y, 5.0f, POWER_GRID_OPEN);
+            power_grid_draw_dashed_line(from, to, 5.0f, 4.0f, 1.5f, color);
         }
-    }
-
-    /* Labels are a second pass so they remain legible over crossing conductors. */
-    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-    {
-        const PowerGridBranch *branch = &POWER_GRID_BRANCHES[line];
-        Vector2 from = POWER_GRID_STATION_POSITIONS[branch->from_bus];
-        Vector2 to = POWER_GRID_STATION_POSITIONS[branch->to_bus];
-        Vector2 label = {(from.x + to.x) * 0.5f + POWER_GRID_LABEL_OFFSETS[line].x,
-                         (from.y + to.y) * 0.5f + POWER_GRID_LABEL_OFFSETS[line].y};
-        char text[80];
-        if (env->topology.line_closed[line])
-        {
-            if (env->ac_power_flow)
-            {
-                double active_power_mw = env->ac_solution.branch_from_p_mw[line];
-                char active_power_text[24];
-                if (fabs(active_power_mw) < 0.05)
-                    snprintf(active_power_text, sizeof(active_power_text), "NO MW FLOW");
-                else
-                    snprintf(active_power_text, sizeof(active_power_text), "%+.0fMW",
-                             active_power_mw);
-                snprintf(text, sizeof(text), "%s%s  %s %.0f/%.0fMVA %.0f%%",
-                         branch->tap_ratio != 1.0 ? "T " : "", POWER_GRID_BRANCH_NAMES[line],
-                         active_power_text,
-                         fmax(env->ac_solution.branch_from_mva[line],
-                              env->ac_solution.branch_to_mva[line]),
-                         power_grid_branch_rating(env, line),
-                         100.0 * env->solution.branch_rho[line]);
-            }
-            else
-            {
-                snprintf(text, sizeof(text), "%s%s  %+.0f/%.0fMW  %.0f%%",
-                         branch->tap_ratio != 1.0 ? "T " : "", POWER_GRID_BRANCH_NAMES[line],
-                         env->solution.branch_flow_mw[line], branch->thermal_limit_mw,
-                         100.0 * env->solution.branch_rho[line]);
-            }
-        }
-        else
-        {
-            snprintf(text, sizeof(text), "%s  %s", POWER_GRID_BRANCH_NAMES[line],
-                     env->ac_power_flow && !env->line_available[line] ? "TRIPPED" : "OPEN");
-        }
-        power_grid_draw_label(label, text, power_grid_line_color(env, line));
-    }
-
-    /* Draw flow markers last so wide branch labels cannot hide them. */
-    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-    {
-        if (!env->topology.line_closed[line])
-            continue;
-        const PowerGridBranch *branch = &POWER_GRID_BRANCHES[line];
-        Vector2 from_station = POWER_GRID_STATION_POSITIONS[branch->from_bus];
-        Vector2 to_station = POWER_GRID_STATION_POSITIONS[branch->to_bus];
-        int from_bar = env->topology.terminal_busbar[POWER_GRID_LINE_TERMINAL(line, 0)];
-        int to_bar = env->topology.terminal_busbar[POWER_GRID_LINE_TERMINAL(line, 1)];
-        Vector2 from = power_grid_branch_endpoint(from_station, to_station, from_bar);
-        Vector2 to = power_grid_branch_endpoint(to_station, from_station, to_bar);
-        power_grid_draw_flow_arrow(from, to, env->solution.branch_flow_mw[line],
-                                   0.13f * line, RAYWHITE);
     }
 }
 
@@ -942,23 +900,8 @@ static void power_grid_draw_generator(const PowerGrid *env, int generator)
     int terminal = POWER_GRID_GENERATOR_TERMINAL(generator);
     int bar = env->topology.terminal_busbar[terminal];
     Vector2 station = POWER_GRID_STATION_POSITIONS[bus];
-    Vector2 busbar = {station.x - 19.0f, station.y + (bar ? 8.0f : -8.0f)};
-    Vector2 symbol = {station.x - 19.0f, station.y - 49.0f};
-    DrawLineEx(busbar, (Vector2){symbol.x, symbol.y + 13.0f}, 2.0f,
-               bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
-    DrawCircleV(symbol, 17.0f, (Color){34, 78, 100, 255});
-    DrawCircleLines((int)symbol.x, (int)symbol.y, 17.0f, POWER_GRID_BB1);
-    DrawText("G", (int)symbol.x - 7, (int)symbol.y - 11, 21, RAYWHITE);
-    double output = generator == 0 ? env->solution.slack_generation_mw : env->operating_point.generator_mw[generator];
-    const char *label = env->ac_power_flow ? TextFormat("%.0fMW %+.0fMVAr", output,
-                                                        env->ac_solution.generator_q_mvar[generator])
-                                           : TextFormat("%.1f MW", output);
-    int font_size = env->ac_power_flow ? 16 : 18;
-    int label_x = (int)symbol.x + 22;
-    int label_width = MeasureText(label, font_size);
-    if (label_x + label_width > POWER_GRID_MAP_WIDTH - 8)
-        label_x = (int)symbol.x - 22 - label_width;
-    DrawText(label, label_x, (int)symbol.y - 10, font_size, POWER_GRID_TEXT);
+    Vector2 symbol = {station.x - 10.0f + 4.0f * (generator % 4), station.y - 13.0f};
+    DrawCircleV(symbol, 2.5f, bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
 }
 
 static void power_grid_draw_load(const PowerGrid *env, int load)
@@ -967,24 +910,8 @@ static void power_grid_draw_load(const PowerGrid *env, int load)
     int terminal = POWER_GRID_LOAD_TERMINAL(load);
     int bar = env->topology.terminal_busbar[terminal];
     Vector2 station = POWER_GRID_STATION_POSITIONS[bus];
-    Vector2 busbar = {station.x + 19.0f, station.y + (bar ? 8.0f : -8.0f)};
-    Vector2 symbol = {station.x + 19.0f, station.y + 49.0f};
-    DrawLineEx(busbar, (Vector2){symbol.x, symbol.y - 12.0f}, 2.0f,
-               bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
-    Rectangle load_box = {symbol.x - 15.0f, symbol.y - 13.0f, 30.0f, 26.0f};
-    DrawRectangleRounded(load_box, 0.25f, 4, (Color){178, 77, 50, 255});
-    DrawRectangleRoundedLinesEx(load_box, 0.25f, 4, 1.0f, (Color){255, 154, 105, 255});
-    DrawText("L", (int)symbol.x - 6, (int)symbol.y - 10, 20, RAYWHITE);
-    const char *label = env->ac_power_flow ? TextFormat("%.0fMW %+.0fMVAr",
-                                                        env->operating_point.load_mw[load],
-                                                        power_grid_ac_load_q_mvar(&env->operating_point, load))
-                                           : TextFormat("%.1f MW", env->operating_point.load_mw[load]);
-    int font_size = env->ac_power_flow ? 16 : 18;
-    int label_x = (int)symbol.x + 20;
-    int label_width = MeasureText(label, font_size);
-    if (label_x + label_width > POWER_GRID_MAP_WIDTH - 8)
-        label_x = (int)symbol.x - 20 - label_width;
-    DrawText(label, label_x, (int)symbol.y - 10, font_size, POWER_GRID_TEXT);
+    Vector2 symbol = {station.x - 10.0f + 4.0f * (load % 6), station.y + 14.0f};
+    DrawCircleV(symbol, 2.0f, bar ? POWER_GRID_BB2 : (Color){255, 154, 105, 255});
 }
 
 static void power_grid_draw_stations(const PowerGrid *env)
@@ -992,30 +919,25 @@ static void power_grid_draw_stations(const PowerGrid *env)
     for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
     {
         Vector2 position = POWER_GRID_STATION_POSITIONS[bus];
-        Rectangle panel = {position.x - 60.0f, position.y - 29.0f, 120.0f, 58.0f};
+        Rectangle panel = {position.x - 18.0f, position.y - 9.0f, 36.0f, 18.0f};
         DrawRectangleRounded(panel, 0.18f, 4, POWER_GRID_PANEL);
         DrawRectangleRoundedLinesEx(panel, 0.18f, 4, 1.0f, POWER_GRID_PANEL_EDGE);
-        DrawText(TextFormat("SUB %d", bus + 1), (int)position.x - 54, (int)position.y - 27,
-                 14, POWER_GRID_MUTED);
-        DrawLineEx((Vector2){position.x - 51, position.y - 8},
-                   (Vector2){position.x + 51, position.y - 8}, 6.0f, POWER_GRID_BB1);
-        DrawLineEx((Vector2){position.x - 51, position.y + 8},
-                   (Vector2){position.x + 51, position.y + 8}, 6.0f, POWER_GRID_BB2);
+        DrawText(TextFormat("%d", bus + 1), (int)position.x - 7, (int)position.y - 7,
+                 11, POWER_GRID_TEXT);
+        DrawLineEx((Vector2){position.x - 15, position.y - 3},
+                   (Vector2){position.x + 15, position.y - 3}, 2.0f, POWER_GRID_BB1);
+        DrawLineEx((Vector2){position.x - 15, position.y + 3},
+                   (Vector2){position.x + 15, position.y + 3}, 2.0f, POWER_GRID_BB2);
         if (env->topology.coupler_closed[bus])
         {
-            DrawLineEx((Vector2){position.x, position.y - 8},
-                       (Vector2){position.x, position.y + 8}, 5.0f, POWER_GRID_SAFE);
+            DrawLineEx((Vector2){position.x, position.y - 3},
+                       (Vector2){position.x, position.y + 3}, 2.0f, POWER_GRID_SAFE);
         }
         else
         {
-            DrawCircleLines((int)position.x, (int)position.y - 5, 3.0f, POWER_GRID_OPEN);
-            DrawCircleLines((int)position.x, (int)position.y + 5, 3.0f, POWER_GRID_OPEN);
+            DrawCircleLines((int)position.x, (int)position.y - 2, 1.0f, POWER_GRID_OPEN);
+            DrawCircleLines((int)position.x, (int)position.y + 2, 1.0f, POWER_GRID_OPEN);
         }
-        DrawText("1", (int)position.x - 58, (int)position.y - 16, 12, POWER_GRID_BB1);
-        DrawText("2", (int)position.x - 58, (int)position.y + 1, 12, POWER_GRID_BB2);
-        double injection = env->solution.substation_injection_mw[bus];
-        DrawText(TextFormat("NET %+.0f", injection), (int)position.x + 2,
-                 (int)position.y - 27, 14, injection >= 0.0 ? POWER_GRID_SAFE : POWER_GRID_MUTED);
     }
     for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
     {
@@ -1048,19 +970,21 @@ static void power_grid_action_summary(const PowerGrid *env, char *buffer, size_t
     {
         int terminal = action - POWER_GRID_TERMINAL_ACTION_OFFSET;
         int busbar = env->topology.terminal_busbar[terminal] + 1;
-        if (terminal < 40)
+        if (terminal < 2 * POWER_GRID_NUM_BRANCHES)
         {
             snprintf(buffer, size, "LINE %s %s -> BUSBAR %d",
                      POWER_GRID_BRANCH_NAMES[terminal / 2], terminal % 2 ? "TO" : "FROM", busbar);
         }
-        else if (terminal < 45)
+        else if (terminal < 2 * POWER_GRID_NUM_BRANCHES + POWER_GRID_NUM_GENERATORS)
         {
-            int generator = terminal - 40;
+            int generator = terminal - 2 * POWER_GRID_NUM_BRANCHES;
             snprintf(buffer, size, "GENERATOR %d -> BUSBAR %d", generator, busbar);
         }
         else
         {
-            snprintf(buffer, size, "LOAD %d -> BUSBAR %d", terminal - 45, busbar);
+            snprintf(buffer, size, "LOAD %d -> BUSBAR %d",
+                     terminal - 2 * POWER_GRID_NUM_BRANCHES - POWER_GRID_NUM_GENERATORS,
+                     busbar);
         }
     }
     else if (env->last_action_type == POWER_GRID_ACTION_COUPLER)
@@ -1205,17 +1129,18 @@ void c_render(PowerGrid *env)
     {
         env->rendering = 1;
         InitWindow(POWER_GRID_RENDER_WIDTH, POWER_GRID_RENDER_HEIGHT,
-                   "IEEE-14 Power Grid Topology Control");
+                   "IEEE-118 Power Grid Topology Control");
         SetTargetFPS(POWER_GRID_RENDER_FPS);
     }
     if (IsKeyDown(KEY_ESCAPE))
         exit(0);
     BeginDrawing();
     ClearBackground(POWER_GRID_BG);
-    DrawText(TextFormat("IEEE-14  |  %s SINGLE-LINE DIAGRAM",
+    power_grid_prepare_layout();
+    DrawText(TextFormat("IEEE-118  |  %s TOPOLOGY OVERVIEW",
                         env->ac_power_flow ? "AC VALIDATION" : "DC"),
              22, 14, 32, POWER_GRID_TEXT);
-    DrawText(env->ac_power_flow ? "Arrows show active-power direction. NO MW FLOW lines stay solid because they are closed. Loading uses MVA." : "Arrows show active-power direction. NO MW FLOW lines stay solid because they are closed. Loading uses DC MW.",
+    DrawText(env->ac_power_flow ? "Compact 12-column layout; line color shows MVA loading, dotted lines are open." : "Compact 12-column layout; line color shows DC MW loading, dotted lines are open.",
              22, 52, 20, POWER_GRID_MUTED);
     power_grid_draw_branches(env);
     power_grid_draw_stations(env);

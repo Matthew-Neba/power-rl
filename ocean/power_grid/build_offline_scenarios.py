@@ -37,10 +37,12 @@ WEATHER_FIELDS = (
     "shortwave_radiation",
 )
 PERIODS = 12
-NOMINAL_TOTAL_LOAD_MW = 259.0
-FIXED_GENERATION_MW = 40.0
-SOLAR_NAMEPLATE_MW = 80.0
-WIND_NAMEPLATE_MW = 70.0
+NOMINAL_TOTAL_LOAD_MW = 4242.0
+# Approximate always-online conventional output retained while the two selected
+# IEEE-118 generators follow Alberta renewable capacity factors.
+FIXED_GENERATION_MW = 1500.0
+SOLAR_NAMEPLATE_MW = 500.0
+WIND_NAMEPLATE_MW = 700.0
 
 
 def fetch_cached(url: str, path: pathlib.Path, refresh: bool = False) -> bytes:
@@ -173,7 +175,7 @@ def build_scenarios(aeso_rows, weather_rows, train_year: int, validation_year: i
                    renewable_reference[date.year, "wind"]))
                    for value in aeso[date]["wind"]]
 
-        # Preserve the observed renewable mix while keeping the IEEE-14 slack
+        # Preserve the observed renewable mix while keeping the IEEE-118 slack
         # generator non-negative under the scaled aggregate load.
         for period in range(PERIODS):
             maximum_renewable = max(

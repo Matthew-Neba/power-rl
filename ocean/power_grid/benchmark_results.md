@@ -1,63 +1,164 @@
-# Power Grid policy benchmark — 2026-08-08
+# IEEE-118 Power Grid policy benchmark — 2026-08-08
 
-PPO was configured for 40 million steps and finished at the final rollout boundary of 39,976,960
-steps. It trained for 2m23s on the 65% historical / 35% synthetic DC curriculum with a 25% chance
-of an exogenous persistent line outage. The corrected-event checkpoint is:
+The reference PPO policy was trained from scratch with the IEEE-118 environment for a configured 40
+million DC agent steps. Training reached the final rollout boundary at 39,976,960 steps in 2,550
+seconds (42m30s). It used the original low-credit-assignment settings `gamma = 0.8` and
+`gae_lambda = 0.6119008620196786`; its checkpoint is:
 
 ```text
-checkpoints/power_grid/1786231242192/0000000039976960.bin
+checkpoints/power_grid/1786239474232/0000000039976960.bin
 ```
 
-Every comparison below uses AC physics, the same environment seeds 0–511, held-out 2020 days, and
-exactly one 72-step episode per vector slot. `perf` is the fraction of AC-secure steps, forced to
-zero after catastrophe. `score` is the no-op fraction, and return is the raw environment return.
+The run used 1,024 agents, a 128-step rollout horizon, a 512-unit three-layer policy, the cached
+2019 training pool, a 90% historical / 10% synthetic curriculum, and a 50% probability of three
+distinct persistent line outages. Its post-training DC evaluation over 10,083 episodes reported
+`perf = 0.6755`, `total_failure = 0.2313`, and 64.21 physical switches per episode.
 
-## AC control: no random outage
+The controlled long-horizon experiment changed only those two values to `gamma = 0.99` and
+`gae_lambda = 0.95`. It also reached 39,976,960 steps, taking 2,518 seconds (41m58s). Its
+checkpoint is:
 
-| Policy | Perf | Score | Return | Failure | Event failure | Switches |
+```text
+checkpoints/power_grid/1786243504654/0000000039976960.bin
+```
+
+Its post-training DC evaluation over 11,123 episodes reported `perf = 0.6115`,
+`total_failure = 0.3201`, and 58.72 physical switches per episode.
+
+## Comparison protocol
+
+Both comparisons below use:
+
+- the same held-out 2020 historical operating days and environment seeds 0–63;
+- one 72-step episode per seed;
+- AC power flow for the environment's realized trajectory and reported security metrics;
+- no evaluation return metric;
+- DC candidate screening for greedy and safe-random baselines, so they do not receive an expensive
+  AC-solver oracle unavailable to PPO; and
+- eight deterministic CPU shards whose weighted results were checked against an unsharded run.
+
+`perf` is the fraction of AC-secure steps, forced to zero after a catastrophic termination. `score`
+is the no-action fraction. `failure` is the fraction of episodes terminated by an invalid,
+disconnected, islanded, singular, non-finite, or otherwise unsolved topology. `outage completion`
+is the fraction of the three scheduled outages reached before termination, and `all survived` is
+the fraction of episodes that remained alive through all three.
+
+## Nominal AC control: no scheduled outages
+
+| Policy | Perf | Score | Failure | Switches | Demand fulfilled | Trip episode | Peak rho | Overloaded line-steps |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| PPO agent | 0.3579 | 0.0000 | 0.6094 | 44.578 | 61.07% | 0.00% | 0.998 | 0.057% |
+| No action | 0.6367 | 1.0000 | 0.0156 | 0.000 | 99.67% | 9.38% | 1.097 | 0.387% |
+| Uniform random | 0.0000 | 0.0000 | 1.0000 | 4.625 | 5.03% | 1.56% | 0.826 | 0.011% |
+| Random lines | 0.0000 | 0.0015 | 1.0000 | 10.453 | 13.17% | 18.75% | 1.146 | 0.039% |
+| Safe random | 0.0247 | 0.0003 | 0.9531 | 33.141 | 44.75% | 60.94% | 1.595 | 0.206% |
+| Greedy lines | 0.7747 | 0.9644 | 0.0000 | 2.562 | 100.00% | 3.12% | 1.060 | 0.196% |
+| Greedy all | 0.7747 | 0.9644 | 0.0000 | 2.562 | 100.00% | 3.12% | 1.060 | 0.196% |
+
+PPO underperforms no-action by 0.2788 perf and greedy by 0.4168. Its 60.94% failure rate and
+44.58 switches per episode show that it learned a highly active policy that frequently destroys a
+valid topology. Its low peak loading is therefore not evidence of successful congestion control:
+many episodes terminate before serving their full demand trajectory.
+
+## Forced AC stress: three scheduled outages in every episode
+
+| Policy | Perf | Failure | Event failure | Switches | Applied outages | Demand fulfilled | Outage completion | All survived | Trip episode | Peak rho |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| PPO agent | 0.3032 | 0.6406 | 0.0469 | 42.391 | 1.781 | 59.14% | 59.38% | 35.94% | 1.56% | 1.007 |
+| No action | 0.5677 | 0.0625 | 0.0156 | 0.000 | 2.953 | 98.05% | 98.44% | 93.75% | 14.06% | 1.131 |
+| Uniform random | 0.0000 | 1.0000 | 0.0156 | 4.594 | 0.047 | 5.01% | 1.56% | 0.00% | 1.56% | 0.827 |
+| Random lines | 0.0000 | 1.0000 | 0.0156 | 10.406 | 0.281 | 13.15% | 9.38% | 0.00% | 18.75% | 1.144 |
+| Safe random | 0.0126 | 0.9844 | 0.1094 | 30.844 | 1.172 | 41.78% | 39.06% | 1.56% | 64.06% | 1.587 |
+| Greedy lines | 0.6758 | 0.0781 | 0.0469 | 2.641 | 2.938 | 97.48% | 97.92% | 92.19% | 6.25% | 1.083 |
+| Greedy all | 0.6758 | 0.0781 | 0.0469 | 2.641 | 2.938 | 97.48% | 97.92% | 92.19% | 6.25% | 1.083 |
+
+Under forced contingencies, PPO underperforms no-action by 0.2645 perf and greedy by 0.3726. PPO
+reaches only 59.38% of scheduled outages and survives all three in 35.94% of episodes. No-action
+and greedy both exceed 92% full-outage survival. Greedy obtains the best secure-step performance
+and cuts AC thermal-trip episodes from no-action's 14.06% to 6.25%, although its 7.81% total
+failure rate is slightly higher than no-action's 6.25% on this 64-seed sample.
+
+Greedy-lines and greedy-all are identical in both suites, meaning the immediate greedy objective
+never preferred a busbar-terminal or coupler operation over its branch-only choices on these
+scenarios.
+
+## Credit-assignment experiment: long-horizon PPO
+
+The long-horizon checkpoint was replayed on the same 64 held-out seeds and AC settings as the
+reference checkpoint. The invariant baselines above therefore remain the comparison points.
+
+| AC suite | Reference PPO (`gamma=.8`, `lambda=.6119`) | Long-horizon PPO (`gamma=.99`, `lambda=.95`) | Change |
+|---|---:|---:|---:|
+| Nominal perf | 0.3579 | **0.4891** | +0.1312 |
+| Nominal failure | 60.94% | **45.31%** | −15.63 pp |
+| Nominal switches | 44.58 | 55.13 | +10.55 |
+| Forced-outage perf | 0.3032 | **0.4388** | +0.1356 |
+| Forced-outage failure | 64.06% | **50.00%** | −14.06 pp |
+| Forced-outage completion | 59.38% | **71.87%** | +12.49 pp |
+| Full three-outage survival | 35.94% | **50.00%** | +14.06 pp |
+| Forced-outage switches | 42.39 | 52.88 | +10.48 |
+
+Favoring longer returns helped substantially on both AC suites, especially contingency completion
+and survival. It did not make PPO competitive with the invariant baselines: nominal no-action and
+greedy perf remain 0.6367 and 0.7747, while forced-outage no-action and greedy remain 0.5677 and
+0.6758. The improvement came with roughly ten additional switches per episode, and the training
+dashboard showed unusually high KL values (roughly 0.4–0.6) and entropy collapse. This suggests
+that `gamma`/GAE were part of the problem, but the unchanged learning rate is now too aggressive for
+the longer-horizon targets.
+
+## Conclusion
+
+## Best screened PPO: horizon 64, conservative optimizer
+
+The best verified checkpoint was trained for 39,976,960 saved steps with
+`horizon=64`, `gamma=.99`, `gae_lambda=.95`, `learning_rate=.0025`,
+`ent_coef=.0001`, and training event probability `.25`:
+`checkpoints/power_grid/1786250866399/0000000039976960.bin`.
+
+| AC suite | PPO perf | Failure | Switches | Demand fulfilled | Outage completion | All survived |
 |---|---:|---:|---:|---:|---:|---:|
-| PPO agent | 0.9582 | 0.9394 | 13.758 | 0.0039 | 0.0000 | 4.346 |
-| No action | 0.9230 | 1.0000 | 13.236 | 0.0195 | 0.0000 | 0.000 |
-| Uniform random | 0.0000 | 0.0074 | -5.017 | 1.0000 | 0.0000 | 3.484 |
-| Random lines | 0.0000 | 0.0418 | -5.108 | 1.0000 | 0.0000 | 4.393 |
-| Safe random | 0.0006 | 0.0114 | -5.452 | 0.9980 | 0.0000 | 11.461 |
-| Greedy lines | 0.9650 | 0.9940 | 13.889 | 0.0078 | 0.0000 | 0.428 |
-| Greedy all | 0.9662 | 0.9938 | 13.908 | 0.0078 | 0.0000 | 0.439 |
+| Nominal | **0.7613** | 3.12% | 71.19 | 98.83% | — | — |
+| Forced outages | **0.6595** | 10.94% | 69.17 | 95.96% | 96.88% | 89.06% |
 
-## AC stress: every episode schedules a random outage
+This beats no-action on both suites (0.6367 / 0.5677) and is close to, but does
+not yet exceed, greedy (0.7747 / 0.6758) on the 64 held-out seeds. Dashboard
+timing stayed CPU/environment dominated: approximately 71–76% environment,
+19–21% train/forward, and 2% GPU evaluation.
 
-The failed line and its later period are randomized from the shared seed. The event applies even
-after a policy changes topology, preventing policies from avoiding the contingency by switching
-early. Policies that fail before the scheduled period can still record no applied event.
+The IEEE-118 transfer and scaled contingency machinery work. Moving to longer-horizon credit
+assignment improved PPO materially, but the inherited optimizer still produces near-continuous
+switching and remains behind no-action and greedy on held-out AC. The next controlled experiment
+should retain `gamma = 0.99`/`gae_lambda = 0.95` while lowering the learning rate and/or adding
+action validity masking; changing credit assignment alone is not enough to make PPO competitive.
 
-| Policy | Perf | Score | Return | Failure | Event failure | Switches | Applied events |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| PPO agent | 0.7186 | 0.8502 | 10.575 | 0.1992 | 0.0234 | 7.574 | 0.9980 |
-| No action | 0.6748 | 1.0000 | 9.369 | 0.2168 | 0.0117 | 0.000 | 0.9980 |
-| Uniform random | 0.0000 | 0.0074 | -5.019 | 1.0000 | 0.0020 | 3.480 | 0.0215 |
-| Random lines | 0.0000 | 0.0418 | -5.110 | 1.0000 | 0.0039 | 4.383 | 0.0156 |
-| Safe random | 0.0000 | 0.0114 | -5.466 | 1.0000 | 0.0566 | 10.539 | 0.1289 |
-| Greedy lines | 0.7623 | 0.9818 | 11.060 | 0.1621 | 0.0156 | 1.105 | 0.9980 |
-| Greedy all | 0.7619 | 0.9806 | 11.064 | 0.1660 | 0.0176 | 1.168 | 0.9980 |
+## Event-rich curriculum winner
 
-On the no-outage control, PPO improves perf by 0.0352 over no-action but remains 0.0080 below
-greedy-all. Under guaranteed random outages, PPO improves perf by 0.0438 and failure rate by 0.0176
-over no-action. Greedy-lines remains strongest: 0.0437 higher perf, 0.0371 fewer failures, and 6.47
-fewer switches per episode than PPO.
+The promoted 20M-step checkpoint uses `offline_scenario_probability=.75` and
+`random_event_probability=.50`, with the verified horizon-64 optimizer unchanged:
+`checkpoints/power_grid/1786266784207/0000000019988480.bin`.
 
-The original checkpoint trained with policy-dependent event skipping scored 0.6726 on the forced
-AC outage suite. Retraining with exogenous events raised this to 0.7186, a 0.0460 absolute gain.
-The remaining gap indicates that PPO has learned useful contingency response, but its switching
-policy is still less efficient and less reliable than immediate greedy branch control on this grid.
+The 64-seed AC validation was run as two stable 32-seed batches (seeds 0--31 and
+32--63) because the 64-agent CUDA-graph benchmark intermittently failed to initialize.
+The weighted results are:
 
-Reproduce both suites with:
+| AC suite | PPO perf | Failure | Demand fulfilled | Full-outage survival |
+|---|---:|---:|---:|---:|
+| Nominal | **0.8182** | **0.00%** | 100.00% | — |
+| Forced outages | **0.7131** | **6.25%** | 97.57% | 93.75% |
+
+This exceeds greedy on both suites (0.7747 nominal, 0.6758 forced) and exceeds
+no-action (0.6367 nominal, 0.5677 forced). Training remained CPU/environment
+dominated at approximately 78--80% environment, 19--21% train/forward, and 2%
+GPU evaluation; the switch penalty remains `0.001f`.
+
+Reproduce the two suites from the IEEE-118 worktree with:
 
 ```sh
 uv run ./build.sh power_grid
 uv run python ocean/power_grid/benchmark.py \
-  --checkpoint checkpoints/power_grid/1786231242192/0000000039976960.bin \
-  --episodes 512 --physics ac --random-event-probability 0
+  --checkpoint checkpoints/power_grid/1786243504654/0000000039976960.bin \
+  --episodes 64 --physics ac --random-event-probability 0 --random-outages 3 --jobs 8
 uv run python ocean/power_grid/benchmark.py \
-  --checkpoint checkpoints/power_grid/1786231242192/0000000039976960.bin \
-  --episodes 512 --physics ac --random-event-probability 1
+  --checkpoint checkpoints/power_grid/1786243504654/0000000039976960.bin \
+  --episodes 64 --physics ac --random-event-probability 1 --random-outages 3 --jobs 8
 ```

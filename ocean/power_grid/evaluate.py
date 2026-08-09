@@ -14,7 +14,6 @@ import pufferlib._C as backend
 METRICS = (
     "perf",
     "score",
-    "episode_return",
     "total_failure",
     "connectivity_failure",
     "solver_failure",
@@ -44,7 +43,7 @@ def resolve_checkpoint(path):
 
 def replay(
     base_args, checkpoint, ac_power_flow, rollouts, agents, horizon=48,
-    random_event_probability=None,
+    random_event_probability=None, random_outage_count=None,
 ):
     args = copy.deepcopy(base_args)
     args["env"]["ac_power_flow"] = ac_power_flow
@@ -54,6 +53,8 @@ def replay(
     if random_event_probability is not None:
         args["env"]["random_events"] = random_event_probability > 0.0
         args["env"]["random_event_probability"] = random_event_probability
+    if random_outage_count is not None:
+        args["env"]["random_outage_count"] = random_outage_count
     args["vec"]["total_agents"] = agents
     args["reset_state"] = False
     args["train"]["horizon"] = horizon

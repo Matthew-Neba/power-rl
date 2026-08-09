@@ -21,7 +21,6 @@ typedef enum {
 typedef struct {
     double perf;
     double score;
-    double episode_return;
     double total_failure;
     double event_failure;
     double total_switches;
@@ -63,14 +62,8 @@ static double immediate_action_value(const PowerGrid *env, int action)
     }
 
     PowerGridSolveResult solution;
-    PowerGridACSolveResult ac_solution;
-    if (env->ac_power_flow)
-    {
-        power_grid_ac_solve(&topology, &env->operating_point, &ac_solution);
-        power_grid_ac_to_compatible(&ac_solution, &solution);
-    }
-    else if (power_grid_solve(&topology, &env->operating_point, &solution) !=
-             POWER_GRID_SOLVE_OK)
+    if (power_grid_solve(&topology, &env->operating_point, &solution) !=
+        POWER_GRID_SOLVE_OK)
     {
         return -INFINITY;
     }
@@ -81,13 +74,9 @@ static double immediate_action_value(const PowerGrid *env, int action)
     double max_rho = 0.0;
     for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
     {
-        double rating = (env->ac_power_flow ? power_grid_ac_branch_rating_mva(line) :
-                         POWER_GRID_BRANCHES[line].thermal_limit_mw) *
+        double rating = POWER_GRID_BRANCHES[line].thermal_limit_mw *
                         env->branch_rating_scale;
-        double loading = env->ac_power_flow ?
-                         fmax(ac_solution.branch_from_mva[line],
-                              ac_solution.branch_to_mva[line]) :
-                         fabs(solution.branch_flow_mw[line]);
+        double loading = fabs(solution.branch_flow_mw[line]);
         double rho = loading / rating;
         max_rho = fmax(max_rho, rho);
         if (rho > 1.0)
@@ -142,11 +131,12 @@ static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t
 
 static BenchmarkMetrics run_baseline(
     BaselinePolicy policy, int episodes, int ac_power_flow,
-    double random_event_probability)
+    double random_event_probability, int random_outage_count, int seed_offset)
 {
     BenchmarkMetrics total = {0};
-    for (int episode = 0; episode < episodes; episode++)
+    for (int episode_index = 0; episode_index < episodes; episode_index++)
     {
+        int episode = seed_offset + episode_index;
         PowerGrid env = {
             .rng = (unsigned int)episode,
             .ac_power_flow = ac_power_flow,
@@ -155,6 +145,7 @@ static BenchmarkMetrics run_baseline(
             .offline_scenario_probability = 0.65,
             .random_events = random_event_probability > 0.0,
             .random_event_probability = random_event_probability,
+            .random_outage_count = random_outage_count,
         };
         uint32_t action_rng = UINT32_C(0x9e3779b9) ^ (uint32_t)episode;
         power_grid_allocate(&env);
@@ -166,7 +157,6 @@ static BenchmarkMetrics run_baseline(
         }
         total.perf += env.log.perf;
         total.score += env.log.score;
-        total.episode_return += env.log.episode_return;
         total.total_failure += env.log.total_failure;
         total.event_failure += env.log.event_failure;
         total.total_switches += env.log.total_switches;
@@ -184,7 +174,6 @@ static BenchmarkMetrics run_baseline(
     double scale = 1.0 / episodes;
     total.perf *= scale;
     total.score *= scale;
-    total.episode_return *= scale;
     total.total_failure *= scale;
     total.event_failure *= scale;
     total.total_switches *= scale;
@@ -205,25 +194,40 @@ int main(int argc, char **argv)
     int episodes = argc > 1 ? atoi(argv[1]) : 1024;
     int ac_power_flow = argc > 2 ? atoi(argv[2]) : 0;
     double random_event_probability = argc > 3 ? atof(argv[3]) : 0.25;
+    int random_outage_count = argc > 4 ? atoi(argv[4]) : 3;
+    int selected_policy = argc > 5 ? atoi(argv[5]) : -1;
+    int seed_offset = argc > 6 ? atoi(argv[6]) : 0;
     if (episodes <= 0)
     {
         fprintf(stderr, "episodes must be positive\n");
         return 1;
     }
+    if (selected_policy < -1 || selected_policy >= BASELINE_COUNT)
+    {
+        fprintf(stderr, "policy must be -1 or between 0 and %d\n", BASELINE_COUNT - 1);
+        return 1;
+    }
+    if (seed_offset < 0)
+    {
+        fprintf(stderr, "seed offset must be non-negative\n");
+        return 1;
+    }
 
-    printf("policy,episodes,perf,score,episode_return,total_failure,event_failure,"
+    printf("policy,episodes,perf,score,total_failure,event_failure,"
            "total_switches,random_events,demand_fulfilled,outage_completion,"
            "all_outages_survived,thermal_trips,thermal_trip_episode,"
            "peak_thermal_stress,peak_line_loading,overloaded_line_fraction\n");
-    for (int policy = 0; policy < BASELINE_COUNT; policy++)
+    int first_policy = selected_policy < 0 ? 0 : selected_policy;
+    int final_policy = selected_policy < 0 ? BASELINE_COUNT : selected_policy + 1;
+    for (int policy = first_policy; policy < final_policy; policy++)
     {
         BenchmarkMetrics metrics = run_baseline(
             (BaselinePolicy)policy, episodes, ac_power_flow,
-            random_event_probability);
-        printf("%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            random_event_probability, random_outage_count, seed_offset);
+        printf("%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                BASELINE_NAMES[policy], episodes, metrics.perf, metrics.score,
-               metrics.episode_return, metrics.total_failure, metrics.event_failure,
+               metrics.total_failure, metrics.event_failure,
                metrics.total_switches, metrics.random_events,
                metrics.demand_fulfilled, metrics.outage_completion,
                metrics.all_outages_survived, metrics.thermal_trips,

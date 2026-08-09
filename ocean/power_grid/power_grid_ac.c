@@ -7,32 +7,17 @@
 #define AC_STATE_SIZE (2 * POWER_GRID_NUM_NODES)
 #define AC_TOLERANCE 1e-8
 
-/* IEEE-14 AC data from MATPOWER case14. Branch ratings remain this environment's
- * documented synthetic limits because the reference case has no usable ratings. */
-static const double AC_BRANCH_R[POWER_GRID_NUM_BRANCHES] = {
-    .01938, .05403, .04699, .05811, .05695, .06701, .01335, 0, 0, 0,
-    .09498, .12291, .06615, 0, 0, .03181, .12711, .08205, .22092, .17093,
-};
-static const double AC_BRANCH_B[POWER_GRID_NUM_BRANCHES] = {
-    .0528, .0492, .0438, .0340, .0346, .0128, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-};
-static const double AC_BRANCH_RATING_MVA[POWER_GRID_NUM_BRANCHES] = {
-    160, 145, 130, 80, 70, 50, 80, 50, 35, 65,
-    25, 25, 30, 25, 50, 20, 15, 20, 20, 25,
-};
-static const double AC_LOAD_Q_NOMINAL[POWER_GRID_NUM_LOADS] = {
-    12.7, 19.0, -3.9, 1.6, 7.5, 16.6, 5.8, 1.8, 1.6, 5.8, 5.0,
-};
-static const double AC_LOAD_P_NOMINAL[POWER_GRID_NUM_LOADS] = {
-    21.7, 94.2, 47.8, 7.6, 11.2, 29.5, 9.0, 3.5, 6.1, 13.5, 14.9,
-};
-static const double AC_GEN_V_SETPOINT[POWER_GRID_NUM_GENERATORS] = {
-    1.060, 1.045, 1.010, 1.070, 1.090,
-};
-static const double AC_GEN_Q_MIN[POWER_GRID_NUM_GENERATORS] = {0, -40, 0, -6, -6};
-static const double AC_GEN_Q_MAX[POWER_GRID_NUM_GENERATORS] = {0, 50, 40, 24, 24};
-static const double AC_GEN_P_MAX[POWER_GRID_NUM_GENERATORS] = {332.4, 140, 100, 100, 100};
+/* Electrical data comes from canonical MATPOWER case118. The source case has
+ * unlimited ratings, so the generated data supplies documented voltage-class
+ * ratings for both the DC training proxy and AC validation. */
+#define AC_BRANCH_R POWER_GRID_BRANCH_R
+#define AC_BRANCH_B POWER_GRID_BRANCH_B
+#define AC_LOAD_Q_NOMINAL POWER_GRID_LOAD_Q_NOMINAL
+#define AC_LOAD_P_NOMINAL POWER_GRID_LOAD_P_NOMINAL
+#define AC_GEN_V_SETPOINT POWER_GRID_GENERATOR_V_SETPOINT
+#define AC_GEN_Q_MIN POWER_GRID_GENERATOR_Q_MIN
+#define AC_GEN_Q_MAX POWER_GRID_GENERATOR_Q_MAX
+#define AC_GEN_P_MAX POWER_GRID_GENERATOR_P_MAX
 
 typedef struct {
     unsigned char active[POWER_GRID_NUM_NODES];
@@ -53,7 +38,7 @@ double power_grid_ac_load_q_mvar(const PowerGridOperatingPoint* point, int load)
 }
 
 double power_grid_ac_branch_rating_mva(int branch) {
-    return AC_BRANCH_RATING_MVA[branch];
+    return POWER_GRID_BRANCHES[branch].thermal_limit_mw;
 }
 
 double power_grid_ac_thermal_step(double previous_stress, double rho) {
@@ -95,9 +80,11 @@ static void ac_build_network(const PowerGridTopology* topology, ACNetwork* ac) {
             POWER_GRID_LOAD_BUSES[load]);
         ac->active[node] = 1;
     }
-    /* MATPOWER bus 9 has a 19 MVAr capacitive shunt. It follows the bus-9 load terminal. */
-    int bus9_node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(5), 8);
-    ac->b[bus9_node][bus9_node] += 19.0 / POWER_GRID_BASE_MVA;
+    for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
+    {
+        int node = 2 * bus;
+        ac->b[node][node] += POWER_GRID_BUS_SHUNT_B_MVAR[bus] / POWER_GRID_BASE_MVA;
+    }
 }
 
 static void ac_calculate_power(const ACNetwork* ac, double* p, double* q) {
@@ -363,7 +350,7 @@ PowerGridACStatus power_grid_ac_solve(const PowerGridTopology* topology,
         int node = ac.generator_node[gen];
         result->generator_p_mw[gen] = gen == 0 ?
             p[node] * POWER_GRID_BASE_MVA : point->generator_mw[gen];
-        /* No IEEE-14 load exists at bus 1; all other generator buses have at most one load. */
+        /* Canonical IEEE-118 has at most one aggregated load and generator per bus. */
         double local_load_p = 0.0;
         for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
             int load_node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),

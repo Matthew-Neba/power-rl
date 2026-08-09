@@ -4,53 +4,19 @@
 #include <stdio.h>
 #include <string.h>
 
-const PowerGridBranch POWER_GRID_BRANCHES[POWER_GRID_NUM_BRANCHES] = {
-    {0, 1, 0.05917, 1.000, 155}, {0, 4, 0.22304, 1.000, 145},
-    {1, 2, 0.19797, 1.000, 130}, {1, 3, 0.17632, 1.000, 80},
-    {1, 4, 0.17388, 1.000, 70},  {2, 3, 0.17103, 1.000, 50},
-    {3, 4, 0.04211, 1.000, 80},  {3, 6, 0.20912, 0.978, 50},
-    {3, 8, 0.55618, 0.969, 35},  {4, 5, 0.25202, 0.932, 65},
-    {5, 10, 0.19890, 1.000, 25}, {5, 11, 0.25581, 1.000, 25},
-    {5, 12, 0.13027, 1.000, 30}, {6, 7, 0.17615, 1.000, 25},
-    {6, 8, 0.11001, 1.000, 50},  {8, 9, 0.08450, 1.000, 20},
-    {8, 13, 0.27038, 1.000, 15}, {9, 10, 0.19207, 1.000, 20},
-    {11, 12, 0.19988, 1.000, 20},{12, 13, 0.34802, 1.000, 25},
+static const char* const POWER_GRID_PROFILE_NAMES[POWER_GRID_NUM_PROFILES] = {
+    "P0 nominal", "P1 high load", "P2 low load", "P3 region A peak",
+    "P4 region B peak", "P5 region C peak", "P6 region D peak",
+    "P7 A-to-D shift", "P8 D-to-A shift", "P9 high wind", "P10 high solar",
 };
 
-const int POWER_GRID_GENERATOR_BUSES[POWER_GRID_NUM_GENERATORS] = {0, 1, 2, 5, 7};
-const int POWER_GRID_LOAD_BUSES[POWER_GRID_NUM_LOADS] = {1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13};
-const char* const POWER_GRID_BRANCH_NAMES[POWER_GRID_NUM_BRANCHES] = {
-    "1-2", "1-5", "2-3", "2-4", "2-5", "3-4", "4-5", "4-7", "4-9", "5-6",
-    "6-11", "6-12", "6-13", "7-8", "7-9", "9-10", "9-14", "10-11", "12-13", "13-14",
-};
-
-typedef struct {
-    const char* name;
-    double load_scale;
-    int source_load;
-    int target_load;
-    double transfer_mw;
-    int generator;
-    double generation_mw;
-} PowerGridProfileSpec;
-
-static const PowerGridProfileSpec POWER_GRID_PROFILES[POWER_GRID_NUM_PROFILES] = {
-    {"P0 nominal",             1.00, -1, -1,  0.0, -1,  0.0},
-    {"P1 high load",           1.10, -1, -1,  0.0,  1, 44.0},
-    {"P2 bus 14 shift",        1.00,  1, 10, 10.0, -1,  0.0},
-    {"P3 bus 4 restoration",   1.00,  1,  2, 45.0, -1,  0.0},
-    {"P4 bus 6 load shift",    1.00,  1,  4, 40.0, -1,  0.0},
-    {"P5 bus 9 load shift",    1.00,  1,  5, 50.0, -1,  0.0},
-    {"P6 bus 10 load shift",   1.00,  1,  6, 20.0, -1,  0.0},
-    {"P7 bus 6 generation",    1.00, -1, -1,  0.0,  3, 90.0},
-    {"P8 bus 13 load shift",   1.00,  5,  9, 20.0, -1,  0.0},
-    {"P9 bus 3 generation",    1.00, -1, -1,  0.0,  2, 170.0},
-    {"P10 bus 4 load/gen",     1.00, -1,  2, 60.0,  1, 120.0},
-    {"P11 bus 5 load/gen",     1.00, -1,  3, 80.0,  1, 140.0},
-    {"P12 bus 11 load/gen",    1.00, -1,  7, 20.0,  3, 60.0},
-    {"P13 bus 12 load/gen",    1.00, -1,  8, 30.0,  3, 60.0},
-    {"P14 bus 2 local peak",   1.00, -1,  0, 30.0, -1,  0.0},
-};
+static int generator_for_bus(int bus)
+{
+    for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        if (POWER_GRID_GENERATOR_BUSES[generator] == bus)
+            return generator;
+    return -1;
+}
 
 void power_grid_topology_normal(PowerGridTopology* topology) {
     memset(topology, 0, sizeof(*topology));
@@ -81,27 +47,70 @@ int power_grid_terminal_node(const PowerGridTopology* topology, int terminal, in
 }
 
 void power_grid_operating_point_nominal(PowerGridOperatingPoint* point) {
-    static const double loads[POWER_GRID_NUM_LOADS] = {
-        21.7, 94.2, 47.8, 7.6, 11.2, 29.5, 9.0, 3.5, 6.1, 13.5, 14.9,
-    };
     memset(point, 0, sizeof(*point));
-    memcpy(point->load_mw, loads, sizeof(loads));
-    point->generator_mw[1] = 40.0;
+    memcpy(point->load_mw, POWER_GRID_LOAD_P_NOMINAL, sizeof(point->load_mw));
+    memcpy(point->generator_mw, POWER_GRID_GENERATOR_P_NOMINAL,
+           sizeof(point->generator_mw));
 }
 
 void power_grid_operating_point_profile(PowerGridOperatingPoint* point, PowerGridProfile profile) {
-    const PowerGridProfileSpec* spec = &POWER_GRID_PROFILES[profile];
     power_grid_operating_point_nominal(point);
-    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
-        point->load_mw[load] *= spec->load_scale;
+    if (profile == POWER_GRID_PROFILE_P1_HIGH || profile == POWER_GRID_PROFILE_P2_LOW)
+    {
+        double scale = profile == POWER_GRID_PROFILE_P1_HIGH ? 1.15 : 0.95;
+        for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+            point->load_mw[load] *= scale;
     }
-    if (spec->source_load >= 0) point->load_mw[spec->source_load] -= spec->transfer_mw;
-    if (spec->target_load >= 0) point->load_mw[spec->target_load] += spec->transfer_mw;
-    if (spec->generator >= 0) point->generator_mw[spec->generator] = spec->generation_mw;
+    else if (profile >= POWER_GRID_PROFILE_P3_REGION_A_PEAK &&
+             profile <= POWER_GRID_PROFILE_P6_REGION_D_PEAK)
+    {
+        int region = profile - POWER_GRID_PROFILE_P3_REGION_A_PEAK;
+        for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+            if (POWER_GRID_LOAD_BUSES[load] / 30 == region)
+                point->load_mw[load] *= 1.30;
+    }
+    else if (profile == POWER_GRID_PROFILE_P7_A_TO_D_SHIFT ||
+             profile == POWER_GRID_PROFILE_P8_D_TO_A_SHIFT)
+    {
+        int source = profile == POWER_GRID_PROFILE_P7_A_TO_D_SHIFT ? 0 : 3;
+        int target = 3 - source;
+        double removed = 0.0, target_total = 0.0;
+        for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+        {
+            int region = POWER_GRID_LOAD_BUSES[load] / 30;
+            if (region == source)
+            {
+                double transfer = 0.20 * point->load_mw[load];
+                point->load_mw[load] -= transfer;
+                removed += transfer;
+            }
+            if (region == target)
+                target_total += point->load_mw[load];
+        }
+        for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+            if (POWER_GRID_LOAD_BUSES[load] / 30 == target)
+                point->load_mw[load] += removed * point->load_mw[load] / target_total;
+    }
+    else if (profile == POWER_GRID_PROFILE_P9_HIGH_WIND ||
+             profile == POWER_GRID_PROFILE_P10_HIGH_SOLAR)
+    {
+        int bus = profile == POWER_GRID_PROFILE_P9_HIGH_WIND ?
+                  POWER_GRID_WIND_GENERATOR_BUS : POWER_GRID_SOLAR_GENERATOR_BUS;
+        int generator = generator_for_bus(bus);
+        if (generator >= 0)
+            point->generator_mw[generator] = profile == POWER_GRID_PROFILE_P9_HIGH_WIND ?
+                POWER_GRID_WIND_NAMEPLATE_MW : POWER_GRID_SOLAR_NAMEPLATE_MW;
+    }
 }
 
 const char* power_grid_profile_name(PowerGridProfile profile) {
-    return POWER_GRID_PROFILES[profile].name;
+    return POWER_GRID_PROFILE_NAMES[profile];
+}
+
+int power_grid_random_event_eligible(int line)
+{
+    return line >= 0 && line < POWER_GRID_NUM_BRANCHES &&
+           POWER_GRID_RANDOM_EVENT_ELIGIBLE[line];
 }
 
 static void build_topology_graph(const PowerGridTopology* topology,
@@ -352,15 +361,15 @@ const char* power_grid_action_name(int action, char* buffer, size_t size) {
     } else if (action >= POWER_GRID_TERMINAL_ACTION_OFFSET &&
             action < POWER_GRID_COUPLER_ACTION_OFFSET) {
         int terminal = action - POWER_GRID_TERMINAL_ACTION_OFFSET;
-        if (terminal < 40) {
+        if (terminal < 2 * POWER_GRID_NUM_BRANCHES) {
             snprintf(buffer, size, "toggle-line-%s-%s-end-busbar",
                 POWER_GRID_BRANCH_NAMES[terminal / 2], terminal % 2 == 0 ? "from" : "to");
-        } else if (terminal < 45) {
-            int gen = terminal - 40;
+        } else if (terminal < 2 * POWER_GRID_NUM_BRANCHES + POWER_GRID_NUM_GENERATORS) {
+            int gen = terminal - 2 * POWER_GRID_NUM_BRANCHES;
             snprintf(buffer, size, "toggle-generator-%d-bus-%d-busbar", gen,
                 POWER_GRID_GENERATOR_BUSES[gen] + 1);
         } else {
-            int load = terminal - 45;
+            int load = terminal - 2 * POWER_GRID_NUM_BRANCHES - POWER_GRID_NUM_GENERATORS;
             snprintf(buffer, size, "toggle-load-%d-bus-%d-busbar", load,
                 POWER_GRID_LOAD_BUSES[load] + 1);
         }

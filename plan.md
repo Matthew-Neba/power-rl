@@ -1,76 +1,74 @@
-# Power-Grid Topology Control Design
+# IEEE-118 Power-Grid Topology Control Design
 
-## Status (audited 2026-08-08)
+## Status
 
-Implemented: a dependency-free IEEE-14 DC solver; two-busbar topology model; 91-action PufferLib environment; rewards, logs, renderer, and vectorization; AC replay with voltage, reactive-power, loss, Q-limit, and thermal-stress checks; random outages; and DC/AC checkpoint comparison.
+The IEEE-14 environment has been ported to canonical MATPOWER IEEE-118 while retaining its
+two-busbar topology actions, fast DC training, AC replay, chronological Alberta scenarios,
+weather-adjusted ratings, inverse-time thermal protection, and deterministic baseline harness.
+This branch is intentionally isolated from `main` until benchmark review and explicit merge approval.
 
-Offline scenarios combine correlated AESO load/wind/solar and ERA5 weather. The reproducible cache contains 365 training days from 2019 and 366 held-out days from 2020, each with twelve two-hour periods. Runtime selection is deterministic from the environment RNG and uses compile-time, read-only data: no network, files, parsing, allocation, copies, or added Python dependency. Training defaults to 90% historical and 10% synthetic curriculum; validation always uses 2020.
+## Electrical model
 
-Weather adjusts synthetic limits from 0.90x to 1.35x using a steady-state IEEE 738 heat balance and published Drake ACSR parameters. Tests cover electrical invariants, bookkeeping, deterministic selection, train/validation separation, lifecycle, topology persistence, and all 8,772 cached periods. Normal cached points converge in AC without voltage violations; random-event outages are DC-solvable from normal topology.
+- 118 substations, 186 branches, 54 generators, 99 loads, 100 MVA base.
+- Two ideal busbars at every substation; all 525 equipment terminals move independently.
+- 118 couplers merge or separate local busbars.
+- Canonical case118 resistance, reactance, charging, taps, shunts, voltage targets, and Q/P limits.
+- Synthetic ratings of 225 MVA at 138/161 kV and 550 MVA at 345 kV/transformers because the
+  canonical source declares its ratings unlimited.
+- Bus 69 is the slack/reference generator.
 
-Audit fixes ensure rejected closes are not counted as switches, period-advance failures return exactly `-5`, validation ignores the training mixture, configuration reaches the environment directly, and weather/equipment/AC state is observable through one stable DC/AC contract.
+DC solves `B theta = P`, rejects equipment outside the slack component, and computes branch MW
+loading. AC Newton-Raphson evaluation performs PV-to-PQ conversion at Q limits, branch-end P/Q/MVA,
+losses, voltage checks, and thermal protection. DC omits voltage/reactive, frequency, transient,
+fault, synchronization, and detailed protection dynamics.
 
-Unproven or out of scope: the rating model uses one reference conductor, perpendicular wind, effective irradiance, and one scale because IEEE-14 lacks route and asset data; it does not model sag or transient conductor temperature. Event states are not guaranteed AC-feasible, arbitrary policy-created topologies need not remain recoverable, and full N-1 security requires redispatch, shedding, or tighter scenarios. AC overload remains an evaluation signal. PPO quality, held-out robustness, real ratings, and deployment protection need empirical validation.
+## Environment contract
 
-## 1. Goal and safety
-
-Train quickly with DC power flow, then replay policies under AC physics and chronological scenarios. Relieve congestion with minimal switching while keeping all loads and generators in the slack-connected grid. A disconnected terminal, island, invalid topology, or failed solve is terminal; overload is recoverable. Priorities are connectivity/solvability, thermal limits, then switching cost. V1 excludes shedding, intentional islands, and dispatch control.
-
-## 2. Grid and code
-
-Use MATPOWER IEEE-14: 14 substations, 20 switchable branches (17 lines, 3 transformers), 5 generators, 11 loads, and a 100 MVA base. Each substation has two busbars and a controllable ideal coupler. All 40 branch endpoints and generator/load terminals move independently. Normal topology assigns terminals to busbar 1, closes branches, and opens couplers. Connectivity is built from busbar nodes, terminal assignments, branches, and couplers—not substation adjacency.
-
-Synthetic DC limits, in branch order, are `[155,145,130,80,70,50,80,50,35,65,25,25,30,25,50,20,15,20,20,25]` MW. They are scenario parameters, not real ratings.
-
-- `power_grid_solver.[ch]`: data, topology, DC flow, profiles, dense solve.
-- `power_grid_ac.[ch]`: AC replay, constraints, losses, thermal support.
-- `power_grid.h`: environment contract, episodes, logging, renderer.
-- `binding.c`, `power_grid.c`, `evaluate.py`: PufferLib binding, playback, DC/AC comparison.
-
-## 3. Electrical simulation
-
-Active generation and demand are exogenous. Generator bus 1 is slack and its busbar angle is zero. For connected topology solve `B theta = P`, then compute closed-branch flow from angle difference, reactance, 100 MVA base, and tap. This enforces KCL/KVL, zero open-line flow, and active-power balance. Before solving, reject equipment outside the slack component, multiple energized components, islands, singular/non-finite solves, and invalid inputs.
-
-For branch `l`, `rho_l = abs(F_l) / Fmax_l`; congestion is `C = sum(max(0, rho_l - 1)^2)`. Step order: observe solved state; apply one action; rebuild/validate; solve unchanged injections; reward/log/terminate; advance and solve the next injection period.
-
-## 4. Environment contract
-
-Observation: 221 unclipped floats in stable order.
+Observation size is 1,985 floats:
 
 | Count | Encoding |
 |---:|---|
-| 100 | Per branch: signed `F/Fmax`, `rho`, closed, available, thermal stress |
-| 40 | Branch-end busbar bits; busbar 1=`0`, busbar 2=`1` |
-| 5 / 11 | Generator/load busbar bits |
-| 14 | Coupler bits; open=`0`, closed=`1` |
-| 14 | Net substation injection `P_MW/100` |
-| 1 / 3 | Rating scale; temperature `/50`, wind `/10`, irradiance `/1000` |
-| 28 / 5 | Busbar voltage (DC active=`1`, inactive=`0`); generator Q `/100` (DC=`0`) |
+| 930 | 186 branches × signed loading, rho, closed, available, thermal stress |
+| 525 | equipment-terminal busbar bits |
+| 118 | coupler bits |
+| 118 | substation net injections divided by 100 MVA |
+| 4 | rating scale and normalized temperature/wind/irradiance |
+| 236 | busbar voltage or DC active bit |
+| 54 | generator Q/100, zero in DC |
 
-Do not expose timestep, remaining fraction, prior action, or switch count; recurrence carries history. Action `0` is no-op; `1..20` toggle branches; `21..60` move branch ends; `61..65` move generators; `66..76` move loads; `77..90` toggle couplers. Actions are unmasked and change one item. Safe transfer may close a coupler, move terminals, then reopen it.
+There are 830 unmasked discrete actions: no-op, 186 line toggles, 525 terminal transfers, and 118
+coupler toggles. Valid reward is squared-overload cost plus a 0.001 switching penalty and 0.20 safe
+bonus. Invalid topology/solve returns -5 and terminates. AC-only voltage and trip outcomes remain
+evaluation metrics and do not change DC learning.
 
-For valid states, `safe = (max_rho <= 1)` and `reward = -C - 0.001*N_switch + 0.20*safe`, without a lower cap. Safety/solver failure returns exactly `-5` and terminates. Episodes normally last 72 actions. `perf` is overload-free step fraction, forced to zero after catastrophe; `score` is no-op fraction. Mutually exclusive connectivity and solver failures sum to `total_failure`; invalid input is folded into solver failure, and `event_failure` separately tags only an immediate failure while applying an outage. Log return, length, switches, and failure causes; sweeps maximize `perf`.
+## Scenarios and outages
 
-## 5. Episodes and validation
+The compiled cache preserves twelve two-hour periods for every day of 2019 and 2020. Training uses
+2019, validation uses held-out 2020. AESO load scales the 4,242 MW base demand; Alberta wind/solar
+capacity factors drive 700/500 MW generators; canonical online generators redispatch; ERA5 weather
+scales ratings from 0.90x to 1.35x. Ten synthetic profiles supply global, regional-shift, and
+renewable stresses.
 
-Each episode has 12 six-action periods. Historical episodes retain correlated two-hour demand, generation, and weather trajectories. Synthetic episodes uniformly choose `P1..P14` and follow a smooth nominal-stress-nominal daily ramp. Scenario IDs stay hidden because observations expose actionable state.
+Training mixes 90% historical and 10% synthetic episodes. Half schedule three distinct outages at
+distinct periods. The nine canonical bridge branches are excluded, and each selected three-line set
+must leave the normal topology connected. Policy-created combinations and AC security are measured,
+not assumed safe.
 
-- `P1`: scale load/gen-2 by 1.10, overload 1-2; validated split moves ends 2-4 and 2-5.
-- `P2/P3`: move load 3→14 / 3→4; overload 9-14 / restore after P1 split.
-- `P4/P5/P6`: move load 3→6/9/10; overload 5-6 / 4-7 / 9-10.
-- `P7/P8/P9`: gen 6=90 MW / load 9→13 / gen 3=170 MW; overload 10-11 / 9-14 / 3-4.
-- `P10/P11`: add load at 4/5 and generation at 2; overload 4-5 / 2-5.
-- `P12/P13`: add load at 11/12 and generation at 6; overload 6-11 / 6-13.
-- `P14`: add 30 MW demand at 2; overload 1-2 differently from P1.
+## Evaluation
 
-Tests cover reference flows and AC values, profile stress, slack balance, KCL/KVL, taps, and topology failures; profiles need not have a known safe recovery. Held-out evaluation uses 2020 trajectories. DC/AC comparisons share scenarios, and either mode may enable outages. Curriculum grows from safe/no-op and one-switch cases through busbar sequences, unsafe alternatives, multi-action solutions, restoration, and broader randomization while retaining earlier cases.
+PPO and all baselines receive the same held-out days, environment seeds, outage lines, and outage
+periods. Primary results are AC `perf`, catastrophic failure, full-demand service, outage completion,
+all-outage survival, voltage safety through `perf`, thermal-trip incidence/count, peak loading/stress,
+overload exposure, and switch count. Evaluation return is deliberately omitted.
 
-## 6. AC evaluation and roadmap
+Baselines are no-action, uniform random, random lines, DC-screened safe random, greedy lines, and
+greedy all. Greedy candidate scoring is DC even when the episode is evaluated in AC, preventing an
+unfair AC-model oracle. The main report separates no-outage control, matched 50%/three-outage
+distribution, and forced three-outage stress suites.
 
-AC replay preserves observations/actions while solving voltage magnitude/angle, P/Q, resistance, taps, charging, bus-9 shunt, losses, generator Q-limit PV→PQ conversion, and worst-end MVA loading. The first AC rating is 160 MVA; other synthetic values match DC. Detailed AC diagnostics remain in the renderer instead of the training dashboard. Voltage violations still make AC `perf` unsafe, while thermal trips affect the simulated topology. The thermal proxy trips at 200% after one step, 150% after four, about 120% after 25, cools when safe, and locks tripped lines for the episode.
+## Limitations
 
-DC omits voltage collapse, reactive shortage, frequency/transient stability, faults, synchronization, and protection. Roadmap: dynamics/frequency control; full IEEE 738 temperature, geometry, ratings, and relays; transformer thermal state; switching interlocks/protection zones; real ratings; N-1; redispatch and DC/AC OPF; curtailment; emergency shedding; validated islands; switching costs; randomized safe starts; larger grids.
-
-## 7. Target architecture
-
-Offline domain randomization produces robust policies from validated trajectories; PPO trains on fast DC physics; AC replay provides physics-faithful evaluation; runtime guardrails enforce topology, solver, and thermal safety with controlled fallback actions.
+IEEE-118 is not Alberta topology. Ratings, weather exposure, two-busbar layouts, generator mapping,
+and regional synthetic profiles are benchmark assumptions. Real deployment requires authenticated
+network cases, facility ratings, route/conductor geometry, dispatch rules, remedial-action schemes,
+protection/interlocks, transient/frequency validation, and operational review.
