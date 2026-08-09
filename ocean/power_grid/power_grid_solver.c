@@ -10,6 +10,20 @@ static const char* const POWER_GRID_PROFILE_NAMES[POWER_GRID_NUM_PROFILES] = {
     "P7 A-to-D shift", "P8 D-to-A shift", "P9 high wind", "P10 high solar",
 };
 
+/* A fixed minimum-degree ordering for the IEEE-118 bus graph. Applying the
+ * same bus ordering to both busbars preserves exact DC solutions while
+ * substantially reducing sparse-Cholesky fill for all valid topologies. */
+static const int POWER_GRID_BUS_ORDER[POWER_GRID_NUM_SUBSTATIONS] = {
+    9, 8, 72, 86, 85, 110, 111, 115, 116, 0, 1, 2, 3, 5, 6, 7, 12,
+    13, 15, 17, 19, 20, 21, 25, 27, 28, 32, 34, 35, 38, 40, 39, 41,
+    42, 43, 47, 49, 51, 52, 56, 57, 62, 66, 70, 71, 23, 73, 75, 77,
+    78, 80, 83, 82, 87, 84, 89, 90, 88, 92, 94, 96, 97, 98, 100, 101,
+    106, 105, 107, 108, 109, 112, 113, 114, 117, 4, 10, 11, 24, 30,
+    31, 26, 33, 37, 45, 46, 50, 54, 53, 55, 59, 60, 58, 61, 63, 65,
+    67, 69, 74, 81, 93, 91, 95, 102, 103, 104, 99, 76, 79, 14, 16,
+    18, 29, 22, 36, 44, 48, 64, 68,
+};
+
 static int generator_for_bus(int bus)
 {
     for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
@@ -459,9 +473,13 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
     int reference = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(0),
         POWER_GRID_GENERATOR_BUSES[0]);
     int dimensions = 0;
-    for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
-        row_for_node[node] = -1;
-        if (active[node] && node != reference) row_for_node[node] = dimensions++;
+    for (int node = 0; node < POWER_GRID_NUM_NODES; node++) row_for_node[node] = -1;
+    for (int rank = 0; rank < POWER_GRID_NUM_SUBSTATIONS; rank++) {
+        int bus = POWER_GRID_BUS_ORDER[rank];
+        for (int bar = 0; bar < POWER_GRID_NUM_BUSBARS; bar++) {
+            int node = 2 * bus + bar;
+            if (active[node] && node != reference) row_for_node[node] = dimensions++;
+        }
     }
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         if (row_for_node[node] >= 0) rhs[row_for_node[node]] = injection[node];
