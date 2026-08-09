@@ -247,7 +247,9 @@ typedef struct {
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
 } PowerGridDCFactorCache;
 
-static __thread PowerGridDCFactorCache power_grid_dc_cache;
+#define POWER_GRID_DC_CACHE_SLOTS 4
+static __thread PowerGridDCFactorCache power_grid_dc_cache[POWER_GRID_DC_CACHE_SLOTS];
+static __thread unsigned int power_grid_dc_cache_next;
 
 static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
         const PowerGridTopology* topology, const int* row_for_node, int dimensions) {
@@ -378,9 +380,23 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         if (row_for_node[node] >= 0) rhs[row_for_node[node]] = injection[node];
     }
-    if (!power_grid_factorize_cached(&power_grid_dc_cache, topology,
+    PowerGridDCFactorCache* cache = NULL;
+    for (int slot = 0; slot < POWER_GRID_DC_CACHE_SLOTS; slot++) {
+        PowerGridDCFactorCache* candidate = &power_grid_dc_cache[slot];
+        if (candidate->valid && candidate->dimensions == dimensions &&
+                memcmp(&candidate->topology, topology, sizeof(*topology)) == 0 &&
+                memcmp(candidate->row_for_node, row_for_node,
+                       sizeof(candidate->row_for_node)) == 0) {
+            cache = candidate;
+            break;
+        }
+    }
+    if (!cache) {
+        cache = &power_grid_dc_cache[power_grid_dc_cache_next++ % POWER_GRID_DC_CACHE_SLOTS];
+    }
+    if (!power_grid_factorize_cached(cache, topology,
             row_for_node, dimensions) ||
-            !power_grid_solve_cached_rhs(&power_grid_dc_cache, rhs, solution)) {
+            !power_grid_solve_cached_rhs(cache, rhs, solution)) {
         result->status = POWER_GRID_SINGULAR;
         return result->status;
     }
