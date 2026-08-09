@@ -246,6 +246,8 @@ typedef struct {
     int component_count;
     int active_node_count;
     unsigned char active[POWER_GRID_NUM_NODES];
+    int from_node[POWER_GRID_NUM_BRANCHES];
+    int to_node[POWER_GRID_NUM_BRANCHES];
     PowerGridTopology topology;
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
 } PowerGridDCFactorCache;
@@ -277,12 +279,18 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
 
     memset(cache->lu, 0, sizeof(cache->lu));
     for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+        cache->from_node[branch] = -1;
+        cache->to_node[branch] = -1;
+    }
+    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
         if (!topology->line_closed[branch]) continue;
         const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
         int from = power_grid_terminal_node(topology,
             POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
         int to = power_grid_terminal_node(topology,
             POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+        cache->from_node[branch] = from;
+        cache->to_node[branch] = to;
         double susceptance = POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio);
         int from_row = row_for_node[from];
         int to_row = row_for_node[to];
@@ -464,8 +472,8 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
     for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
         if (!topology->line_closed[branch]) continue;
         const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
-        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
-        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+        int from = cache->from_node[branch];
+        int to = cache->to_node[branch];
         double flow = POWER_GRID_BASE_MVA * (result->node_angle[from] - result->node_angle[to]) /
             (line->reactance * line->tap_ratio);
         double rho = fabs(flow) / (line->thermal_limit_mw * branch_rating_scale);
