@@ -113,33 +113,9 @@ int power_grid_random_event_eligible(int line)
            POWER_GRID_RANDOM_EVENT_ELIGIBLE[line];
 }
 
-static void build_topology_graph(const PowerGridTopology* topology,
-        unsigned char active[POWER_GRID_NUM_NODES],
-        unsigned char adjacency[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES]) {
-    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
-        if (!topology->line_closed[branch]) continue;
-        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
-        int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0),
-            line->from_bus);
-        int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1),
-            line->to_bus);
-        active[from] = active[to] = 1;
-        if (adjacency != NULL) adjacency[from][to] = adjacency[to][from] = 1;
-    }
-    for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
-        int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
-            POWER_GRID_GENERATOR_BUSES[gen]);
-        active[node] = 1;
-    }
-    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
-        int node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
-            POWER_GRID_LOAD_BUSES[load]);
-        active[node] = 1;
-    }
-}
-
-PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topology,
-        int* component_count, int* active_node_count) {
+static PowerGridSolveStatus power_grid_validate_topology_internal(
+        const PowerGridTopology* topology, int* component_count,
+        int* active_node_count, unsigned char* active_out) {
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int parent[POWER_GRID_NUM_NODES];
     int rank[POWER_GRID_NUM_NODES] = {0};
@@ -182,6 +158,7 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
     int active_count = 0;
     int components = 0;
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) active_count += active[node] != 0;
+    if (active_out) memcpy(active_out, active, sizeof(active));
     for (int start = 0; start < POWER_GRID_NUM_NODES; start++) {
         if (!active[start]) continue;
         int root = start;
@@ -212,6 +189,12 @@ PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topol
     }
     if (components != 1) return POWER_GRID_ISLANDED;
     return POWER_GRID_SOLVE_OK;
+}
+
+PowerGridSolveStatus power_grid_validate_topology(const PowerGridTopology* topology,
+        int* component_count, int* active_node_count) {
+    return power_grid_validate_topology_internal(topology, component_count,
+        active_node_count, NULL);
 }
 
 int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
@@ -359,8 +342,8 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     double rhs[POWER_GRID_NUM_NODES] = {0};
     double solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
-    result->status = power_grid_validate_topology(topology, &result->component_count,
-        &result->active_node_count);
+    result->status = power_grid_validate_topology_internal(topology,
+        &result->component_count, &result->active_node_count, active);
     if (result->status != POWER_GRID_SOLVE_OK) return result->status;
 
     double total_load = 0.0;
@@ -385,7 +368,6 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         return result->status;
     }
 
-    build_topology_graph(topology, active, NULL);
     for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
             POWER_GRID_GENERATOR_BUSES[gen]);
