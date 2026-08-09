@@ -164,6 +164,7 @@ typedef struct
     PowerGridActionType type;
     int switched;
     int electrical_change;
+    int observation_only_terminal;
 } PowerGridAppliedAction;
 
 typedef struct
@@ -500,6 +501,7 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     PowerGridAppliedAction action = {
         .value = isfinite(raw_action) ? (int)raw_action : -1,
         .electrical_change = 0,
+        .observation_only_terminal = -1,
     };
     action.type = power_grid_apply_action(&env->topology, action.value);
     action.switched = action.type > POWER_GRID_ACTION_NONE;
@@ -539,6 +541,13 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
          * terminal bit remains observable and matters if the coupler opens,
          * but it cannot change this step's power-flow solution. */
         action.electrical_change = !env->topology.coupler_closed[substation];
+        /* An open line endpoint has no incident branch, so moving that
+         * endpoint between open busbars cannot alter injections or flows. */
+        if (action.electrical_change && terminal < 2 * POWER_GRID_NUM_BRANCHES &&
+            !env->topology.line_closed[terminal / 2])
+            action.electrical_change = 0;
+        if (!action.electrical_change)
+            action.observation_only_terminal = terminal;
     }
     else if (action.type == POWER_GRID_ACTION_COUPLER)
     {
@@ -732,6 +741,7 @@ void c_step(PowerGrid *env)
      * observation vector unchanged. Track whether a later state mutation
      * actually requires rebuilding the 1,985-float observation. */
     int observations_dirty = action.switched || env->ac_power_flow;
+    int observation_only_terminal = action.observation_only_terminal;
 
     PowerGridSolveStatus status;
     if (action.type == POWER_GRID_ACTION_INVALID)
@@ -793,6 +803,7 @@ void c_step(PowerGrid *env)
     if (next_period != env->current_period)
     {
         observations_dirty = 1;
+        observation_only_terminal = -1;
         env->current_period = next_period;
         power_grid_set_operating_period(env, next_period);
         for (int event = 0; event < env->scheduled_random_event_count; event++)
@@ -820,7 +831,14 @@ void c_step(PowerGrid *env)
     }
     env->episode_return += env->rewards[0];
     if (observations_dirty)
-        power_grid_compute_observations(env);
+    {
+        if (observation_only_terminal >= 0)
+            env->observations[POWER_GRID_TERMINAL_OBS_OFFSET +
+                              observation_only_terminal] =
+                env->topology.terminal_busbar[observation_only_terminal] ? 1.0f : 0.0f;
+        else
+            power_grid_compute_observations(env);
+    }
 }
 
 void power_grid_allocate(PowerGrid *env)
