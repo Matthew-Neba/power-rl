@@ -1,8 +1,9 @@
 # IEEE-118 Power Grid policy benchmark — 2026-08-08
 
-The PPO policy was trained from scratch with the IEEE-118 environment for a configured 40 million
-DC agent steps. Training reached the final rollout boundary at 39,976,960 steps in 2,550 seconds
-(42m30s). The final checkpoint is:
+The reference PPO policy was trained from scratch with the IEEE-118 environment for a configured 40
+million DC agent steps. Training reached the final rollout boundary at 39,976,960 steps in 2,550
+seconds (42m30s). It used the original low-credit-assignment settings `gamma = 0.8` and
+`gae_lambda = 0.6119008620196786`; its checkpoint is:
 
 ```text
 checkpoints/power_grid/1786239474232/0000000039976960.bin
@@ -12,6 +13,17 @@ The run used 1,024 agents, a 128-step rollout horizon, a 512-unit three-layer po
 2019 training pool, a 90% historical / 10% synthetic curriculum, and a 50% probability of three
 distinct persistent line outages. Its post-training DC evaluation over 10,083 episodes reported
 `perf = 0.6755`, `total_failure = 0.2313`, and 64.21 physical switches per episode.
+
+The controlled long-horizon experiment changed only those two values to `gamma = 0.99` and
+`gae_lambda = 0.95`. It also reached 39,976,960 steps, taking 2,518 seconds (41m58s). Its
+checkpoint is:
+
+```text
+checkpoints/power_grid/1786243504654/0000000039976960.bin
+```
+
+Its post-training DC evaluation over 11,123 episodes reported `perf = 0.6115`,
+`total_failure = 0.3201`, and 58.72 physical switches per episode.
 
 ## Comparison protocol
 
@@ -70,25 +82,46 @@ Greedy-lines and greedy-all are identical in both suites, meaning the immediate 
 never preferred a busbar-terminal or coupler operation over its branch-only choices on these
 scenarios.
 
+## Credit-assignment experiment: long-horizon PPO
+
+The long-horizon checkpoint was replayed on the same 64 held-out seeds and AC settings as the
+reference checkpoint. The invariant baselines above therefore remain the comparison points.
+
+| AC suite | Reference PPO (`gamma=.8`, `lambda=.6119`) | Long-horizon PPO (`gamma=.99`, `lambda=.95`) | Change |
+|---|---:|---:|---:|
+| Nominal perf | 0.3579 | **0.4891** | +0.1312 |
+| Nominal failure | 60.94% | **45.31%** | −15.63 pp |
+| Nominal switches | 44.58 | 55.13 | +10.55 |
+| Forced-outage perf | 0.3032 | **0.4388** | +0.1356 |
+| Forced-outage failure | 64.06% | **50.00%** | −14.06 pp |
+| Forced-outage completion | 59.38% | **71.87%** | +12.49 pp |
+| Full three-outage survival | 35.94% | **50.00%** | +14.06 pp |
+| Forced-outage switches | 42.39 | 52.88 | +10.48 |
+
+Favoring longer returns helped substantially on both AC suites, especially contingency completion
+and survival. It did not make PPO competitive with the invariant baselines: nominal no-action and
+greedy perf remain 0.6367 and 0.7747, while forced-outage no-action and greedy remain 0.5677 and
+0.6758. The improvement came with roughly ten additional switches per episode, and the training
+dashboard showed unusually high KL values (roughly 0.4–0.6) and entropy collapse. This suggests
+that `gamma`/GAE were part of the problem, but the unchanged learning rate is now too aggressive for
+the longer-horizon targets.
+
 ## Conclusion
 
-The IEEE-118 transfer and scaled contingency machinery work, but the inherited IEEE-14 PPO setup
-does not transfer successfully in this single 40-million-step run. The action space grew to 830
-choices, and the learned policy converged toward near-continuous switching rather than preserving a
-valid topology. On held-out AC operation, no-action is a substantially stronger baseline and the
-DC-screened greedy branch policy is the clear winner. A subsequent training iteration should first
-address action validity and switching behavior (for example action masking or a hierarchical
-no-op/branch-selection policy) and should retain intermediate checkpoints; simply extending this
-final policy's evaluation does not change the observed failure mechanism.
+The IEEE-118 transfer and scaled contingency machinery work. Moving to longer-horizon credit
+assignment improved PPO materially, but the inherited optimizer still produces near-continuous
+switching and remains behind no-action and greedy on held-out AC. The next controlled experiment
+should retain `gamma = 0.99`/`gae_lambda = 0.95` while lowering the learning rate and/or adding
+action validity masking; changing credit assignment alone is not enough to make PPO competitive.
 
 Reproduce the two suites from the IEEE-118 worktree with:
 
 ```sh
 uv run ./build.sh power_grid
 uv run python ocean/power_grid/benchmark.py \
-  --checkpoint checkpoints/power_grid/1786239474232/0000000039976960.bin \
+  --checkpoint checkpoints/power_grid/1786243504654/0000000039976960.bin \
   --episodes 64 --physics ac --random-event-probability 0 --random-outages 3 --jobs 8
 uv run python ocean/power_grid/benchmark.py \
-  --checkpoint checkpoints/power_grid/1786239474232/0000000039976960.bin \
+  --checkpoint checkpoints/power_grid/1786243504654/0000000039976960.bin \
   --episodes 64 --physics ac --random-event-probability 1 --random-outages 3 --jobs 8
 ```
