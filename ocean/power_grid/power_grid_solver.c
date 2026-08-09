@@ -543,7 +543,7 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
         return result->status;
     }
 #ifdef POWER_GRID_DC_FLOAT
-    /* Recover most of the double-precision solution accuracy with two cheap
+    /* Recover most of the double-precision solution accuracy with one cheap
      * residual corrections while retaining the faster float factorization. */
     double refined[POWER_GRID_NUM_NODES] = {0};
     double residual[POWER_GRID_NUM_NODES];
@@ -553,7 +553,7 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++)
         if (row_for_node[node] >= 0) node_for_row[row_for_node[node]] = node;
     for (int row = 0; row < dimensions; row++) refined[row] = solution[row];
-    for (int iteration = 0; iteration < 2; iteration++) {
+    for (int iteration = 0; iteration < 1; iteration++) {
         for (int row = 0; row < dimensions; row++) {
             residual[row] = injection[node_for_row[row]];
         }
