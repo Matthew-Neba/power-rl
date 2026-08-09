@@ -9,6 +9,7 @@ int main(void) {
     env.offline_scenario_validation = 1;
     env.random_events = 1;
     env.random_event_probability = 0.25;
+    env.random_outage_count = 3;
     power_grid_allocate(&env);
     c_reset(&env);
     c_render(&env);
