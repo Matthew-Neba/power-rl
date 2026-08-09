@@ -374,10 +374,9 @@ static PowerGridSolveStatus power_grid_solve_environment(PowerGrid *env)
     if (!env->ac_power_flow)
     {
         memset(&env->ac_solution, 0, sizeof(env->ac_solution));
-        PowerGridSolveStatus status = power_grid_solve(
-            &env->topology, &env->operating_point, &env->solution);
-        power_grid_apply_dynamic_ratings(env);
-        return status;
+        return power_grid_solve_scaled(
+            &env->topology, &env->operating_point, &env->solution,
+            env->branch_rating_scale);
     }
     power_grid_ac_solve(&env->topology, &env->operating_point, &env->ac_solution);
     power_grid_ac_to_compatible(&env->ac_solution, &env->solution);

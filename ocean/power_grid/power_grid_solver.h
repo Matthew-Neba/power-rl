@@ -114,6 +114,12 @@ PowerGridSolveStatus power_grid_solve(
     const PowerGridOperatingPoint* point,
     PowerGridSolveResult* result
 );
+PowerGridSolveStatus power_grid_solve_scaled(
+    const PowerGridTopology* topology,
+    const PowerGridOperatingPoint* point,
+    PowerGridSolveResult* result,
+    double branch_rating_scale
+);
 const char* power_grid_solve_status_name(PowerGridSolveStatus status);
 const char* power_grid_action_name(int action, char* buffer, size_t size);
 

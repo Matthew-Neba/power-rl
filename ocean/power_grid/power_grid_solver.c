@@ -335,8 +335,9 @@ static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
     return 1;
 }
 
-PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
-        const PowerGridOperatingPoint* point, PowerGridSolveResult* result) {
+PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
+        const PowerGridOperatingPoint* point, PowerGridSolveResult* result,
+        double branch_rating_scale) {
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int row_for_node[POWER_GRID_NUM_NODES];
     double injection[POWER_GRID_NUM_NODES] = {0};
@@ -467,7 +468,7 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
         double flow = POWER_GRID_BASE_MVA * (result->node_angle[from] - result->node_angle[to]) /
             (line->reactance * line->tap_ratio);
-        double rho = fabs(flow) / line->thermal_limit_mw;
+        double rho = fabs(flow) / (line->thermal_limit_mw * branch_rating_scale);
         if (!isfinite(flow) || !isfinite(rho)) {
             result->status = POWER_GRID_NONFINITE;
             return result->status;
@@ -482,6 +483,11 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     }
     result->status = POWER_GRID_SOLVE_OK;
     return result->status;
+}
+
+PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
+        const PowerGridOperatingPoint* point, PowerGridSolveResult* result) {
+    return power_grid_solve_scaled(topology, point, result, 1.0);
 }
 
 const char* power_grid_solve_status_name(PowerGridSolveStatus status) {
