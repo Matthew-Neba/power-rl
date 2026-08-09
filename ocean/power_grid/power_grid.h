@@ -88,6 +88,14 @@ static inline double power_grid_weather_rating_scale(
     return fmin(1.35, fmax(0.90, ampacity[0] / ampacity[1]));
 }
 
+/* Historical scenarios are immutable compile-time data. Cache their twelve
+ * weather-rating scales per worker so the IEEE-738 pow/sqrt path runs once
+ * per scenario rather than once per episode period. */
+static __thread unsigned char power_grid_weather_scale_ready[
+    POWER_GRID_OFFLINE_SCENARIO_COUNT];
+static __thread double power_grid_weather_scale_cache[
+    POWER_GRID_OFFLINE_SCENARIO_COUNT][POWER_GRID_NUM_PERIODS];
+
 /* Reward configuration. */
 #define POWER_GRID_FAILURE_REWARD (-5.0f)
 #define POWER_GRID_SAFE_STEP_REWARD 0.2f
@@ -284,6 +292,19 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
     if (env->offline_scenarios && env->offline_scenario != NULL)
     {
         const PowerGridOfflineScenario *scenario = env->offline_scenario;
+        size_t scenario_index = (size_t)(scenario - POWER_GRID_OFFLINE_SCENARIOS);
+        if (scenario_index < POWER_GRID_OFFLINE_SCENARIO_COUNT &&
+            !power_grid_weather_scale_ready[scenario_index])
+        {
+            for (int cached_period = 0; cached_period < POWER_GRID_NUM_PERIODS;
+                 cached_period++)
+                power_grid_weather_scale_cache[scenario_index][cached_period] =
+                    power_grid_weather_rating_scale(
+                        scenario->ambient_temperature_c[cached_period],
+                        scenario->wind_speed_mps[cached_period],
+                        scenario->solar_irradiance_wm2[cached_period]);
+            power_grid_weather_scale_ready[scenario_index] = 1;
+        }
         power_grid_operating_point_nominal(&env->operating_point);
         for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
             env->operating_point.load_mw[load] *= scenario->load_scale[period];
@@ -297,9 +318,10 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
         env->ambient_temperature_c = scenario->ambient_temperature_c[period];
         env->wind_speed_mps = scenario->wind_speed_mps[period];
         env->solar_irradiance_wm2 = scenario->solar_irradiance_wm2[period];
-        env->branch_rating_scale = power_grid_weather_rating_scale(
-            env->ambient_temperature_c, env->wind_speed_mps,
-            env->solar_irradiance_wm2);
+        env->branch_rating_scale = scenario_index < POWER_GRID_OFFLINE_SCENARIO_COUNT ?
+            power_grid_weather_scale_cache[scenario_index][period] :
+            power_grid_weather_rating_scale(env->ambient_temperature_c,
+                env->wind_speed_mps, env->solar_irradiance_wm2);
     }
     else
     {
