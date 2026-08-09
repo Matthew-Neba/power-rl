@@ -704,6 +704,12 @@ void c_step(PowerGrid *env)
     {
         status = env->solution.status = POWER_GRID_INVALID_INPUT;
     }
+    else if (!action.switched && !env->ac_power_flow)
+    {
+        /* In DC mode, a no-op cannot change topology, injections, or ratings;
+         * the previous solved state is exactly the current solved state. */
+        status = env->solution.status;
+    }
     else
     {
         status = power_grid_solve_environment(env);
