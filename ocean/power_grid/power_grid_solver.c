@@ -233,53 +233,14 @@ int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
     return 1;
 }
 
-/* Training uses DC flows; float32 is sufficient for IEEE-118 branch/rating
- * scales and halves the nodal workspace/bandwidth. AC evaluation keeps its
- * independent double-precision Newton solve in power_grid_ac.c. */
-static int power_grid_solve_dense_float(float* restrict matrix, float* restrict rhs,
-        float* restrict solution,
-        int dimensions, int stride)
-{
-    for (int col = 0; col < dimensions; col++) {
-        int pivot = col;
-        for (int row = col + 1; row < dimensions; row++)
-            if (fabsf(matrix[row * stride + col]) > fabsf(matrix[pivot * stride + col])) pivot = row;
-        if (!isfinite(matrix[pivot * stride + col]) || fabsf(matrix[pivot * stride + col]) < 1e-12f)
-            return 0;
-        if (pivot != col) {
-            for (int j = col; j < dimensions; j++) {
-                float swap = matrix[col * stride + j];
-                matrix[col * stride + j] = matrix[pivot * stride + j];
-                matrix[pivot * stride + j] = swap;
-            }
-            float swap = rhs[col]; rhs[col] = rhs[pivot]; rhs[pivot] = swap;
-        }
-        for (int row = col + 1; row < dimensions; row++) {
-            float factor = matrix[row * stride + col] / matrix[col * stride + col];
-            matrix[row * stride + col] = 0.0f;
-            for (int j = col + 1; j < dimensions; j++)
-                matrix[row * stride + j] -= factor * matrix[col * stride + j];
-            rhs[row] -= factor * rhs[col];
-        }
-    }
-    for (int row = dimensions - 1; row >= 0; row--) {
-        float value = rhs[row];
-        for (int col = row + 1; col < dimensions; col++)
-            value -= matrix[row * stride + col] * solution[col];
-        solution[row] = value / matrix[row * stride + row];
-        if (!isfinite(solution[row])) return 0;
-    }
-    return 1;
-}
-
 PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         const PowerGridOperatingPoint* point, PowerGridSolveResult* result) {
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int row_for_node[POWER_GRID_NUM_NODES];
     double injection[POWER_GRID_NUM_NODES] = {0};
-    float matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
-    float rhs[POWER_GRID_NUM_NODES] = {0};
-    float solution[POWER_GRID_NUM_NODES] = {0};
+    double matrix[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES] = {{0}};
+    double rhs[POWER_GRID_NUM_NODES] = {0};
+    double solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
     result->status = power_grid_validate_topology(topology, &result->component_count,
         &result->active_node_count);
@@ -336,7 +297,7 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
         int from = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
         int to = power_grid_terminal_node(topology, POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
-        float susceptance = (float)(POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio));
+        double susceptance = POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio);
         int from_row = row_for_node[from];
         int to_row = row_for_node[to];
         if (from_row >= 0) matrix[from_row][from_row] += susceptance;
@@ -347,9 +308,9 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         }
     }
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
-        if (row_for_node[node] >= 0) rhs[row_for_node[node]] = (float)injection[node];
+        if (row_for_node[node] >= 0) rhs[row_for_node[node]] = injection[node];
     }
-    if (!power_grid_solve_dense_float(&matrix[0][0], rhs, solution, dimensions,
+    if (!power_grid_solve_dense(&matrix[0][0], rhs, solution, dimensions,
             POWER_GRID_NUM_NODES)) {
         result->status = POWER_GRID_SINGULAR;
         return result->status;
