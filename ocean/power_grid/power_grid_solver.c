@@ -321,6 +321,8 @@ static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
             solution[col] = solution[pivot];
             solution[pivot] = swap;
         }
+    }
+    for (int col = 0; col < dimensions; col++) {
         for (int row = col + 1; row < dimensions; row++)
             solution[row] -= cache->lu[row][col] * solution[col];
     }
