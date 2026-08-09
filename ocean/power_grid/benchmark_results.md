@@ -131,6 +131,26 @@ switching and remains behind no-action and greedy on held-out AC. The next contr
 should retain `gamma = 0.99`/`gae_lambda = 0.95` while lowering the learning rate and/or adding
 action validity masking; changing credit assignment alone is not enough to make PPO competitive.
 
+## Event-rich curriculum winner
+
+The promoted 20M-step checkpoint uses `offline_scenario_probability=.75` and
+`random_event_probability=.50`, with the verified horizon-64 optimizer unchanged:
+`checkpoints/power_grid/1786266784207/0000000019988480.bin`.
+
+The 64-seed AC validation was run as two stable 32-seed batches (seeds 0--31 and
+32--63) because the 64-agent CUDA-graph benchmark intermittently failed to initialize.
+The weighted results are:
+
+| AC suite | PPO perf | Failure | Demand fulfilled | Full-outage survival |
+|---|---:|---:|---:|---:|
+| Nominal | **0.8182** | **0.00%** | 100.00% | — |
+| Forced outages | **0.7131** | **6.25%** | 97.57% | 93.75% |
+
+This exceeds greedy on both suites (0.7747 nominal, 0.6758 forced) and exceeds
+no-action (0.6367 nominal, 0.5677 forced). Training remained CPU/environment
+dominated at approximately 78--80% environment, 19--21% train/forward, and 2%
+GPU evaluation; the switch penalty remains `0.001f`.
+
 Reproduce the two suites from the IEEE-118 worktree with:
 
 ```sh
