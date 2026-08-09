@@ -243,7 +243,6 @@ typedef struct {
     int valid;
     int dimensions;
     int row_for_node[POWER_GRID_NUM_NODES];
-    int pivots[POWER_GRID_NUM_NODES];
     PowerGridTopology topology;
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
 } PowerGridDCFactorCache;
@@ -278,28 +277,20 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
         }
     }
 
-    for (int col = 0; col < dimensions; col++) {
-        int pivot = col;
-        for (int row = col + 1; row < dimensions; row++) {
-            if (fabs(cache->lu[row][col]) > fabs(cache->lu[pivot][col])) pivot = row;
-        }
-        cache->pivots[col] = pivot;
-        if (!isfinite(cache->lu[pivot][col]) || fabs(cache->lu[pivot][col]) < 1e-12) {
-            cache->valid = 0;
-            return 0;
-        }
-        if (pivot != col) {
-            for (int j = 0; j < dimensions; j++) {
-                double swap = cache->lu[col][j];
-                cache->lu[col][j] = cache->lu[pivot][j];
-                cache->lu[pivot][j] = swap;
-            }
-        }
-        for (int row = col + 1; row < dimensions; row++) {
-            double factor = cache->lu[row][col] / cache->lu[col][col];
-            cache->lu[row][col] = factor;
-            for (int j = col + 1; j < dimensions; j++) {
-                cache->lu[row][j] -= factor * cache->lu[col][j];
+    /* A connected reduced Laplacian is symmetric positive definite. Cholesky
+     * cuts factorization work substantially while staying in double precision. */
+    for (int row = 0; row < dimensions; row++) {
+        for (int col = 0; col <= row; col++) {
+            double value = cache->lu[row][col];
+            for (int k = 0; k < col; k++) value -= cache->lu[row][k] * cache->lu[col][k];
+            if (row == col) {
+                if (!isfinite(value) || value < 1e-12) {
+                    cache->valid = 0;
+                    return 0;
+                }
+                cache->lu[row][col] = sqrt(value);
+            } else {
+                cache->lu[row][col] = value / cache->lu[col][col];
             }
         }
     }
@@ -314,23 +305,14 @@ static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
         const double* rhs, double* solution) {
     int dimensions = cache->dimensions;
     for (int i = 0; i < dimensions; i++) solution[i] = rhs[i];
-    for (int col = 0; col < dimensions; col++) {
-        int pivot = cache->pivots[col];
-        if (pivot != col) {
-            double swap = solution[col];
-            solution[col] = solution[pivot];
-            solution[pivot] = swap;
-        }
-    }
-    for (int col = 0; col < dimensions; col++) {
-        for (int row = col + 1; row < dimensions; row++)
-            solution[row] -= cache->lu[row][col] * solution[col];
+    for (int row = 0; row < dimensions; row++) {
+        for (int col = 0; col < row; col++) solution[row] -= cache->lu[row][col] * solution[col];
+        solution[row] /= cache->lu[row][row];
     }
     for (int row = dimensions - 1; row >= 0; row--) {
-        double value = solution[row];
         for (int col = row + 1; col < dimensions; col++)
-            value -= cache->lu[row][col] * solution[col];
-        solution[row] = value / cache->lu[row][row];
+            solution[row] -= cache->lu[col][row] * solution[col];
+        solution[row] /= cache->lu[row][row];
         if (!isfinite(solution[row])) return 0;
     }
     return 1;
