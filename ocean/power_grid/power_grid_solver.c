@@ -286,6 +286,22 @@ typedef double PowerGridDCScalar;
 
 static __thread PowerGridDCFactorCache power_grid_dc_cache[POWER_GRID_DC_CACHE_SLOTS];
 static __thread unsigned int power_grid_dc_cache_next;
+static __thread int power_grid_branch_constants_initialized;
+static __thread double power_grid_branch_susceptance[POWER_GRID_NUM_BRANCHES];
+static __thread double power_grid_branch_angle_factor[POWER_GRID_NUM_BRANCHES];
+
+static inline void power_grid_init_branch_constants(void)
+{
+    if (power_grid_branch_constants_initialized)
+        return;
+    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+        const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
+        double denominator = line->reactance * line->tap_ratio;
+        power_grid_branch_susceptance[branch] = POWER_GRID_BASE_MVA / denominator;
+        power_grid_branch_angle_factor[branch] = POWER_GRID_BASE_MVA / denominator;
+    }
+    power_grid_branch_constants_initialized = 1;
+}
 
 #define POWER_GRID_VALIDATION_CACHE_SLOTS 32
 typedef struct {
@@ -323,7 +339,7 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
             POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
         cache->from_node[branch] = from;
         cache->to_node[branch] = to;
-        double susceptance = POWER_GRID_BASE_MVA / (line->reactance * line->tap_ratio);
+        double susceptance = power_grid_branch_susceptance[branch];
         int from_row = row_for_node[from];
         int to_row = row_for_node[to];
         if (from_row >= 0) cache->lu[from_row][from_row] += susceptance;
@@ -422,6 +438,7 @@ static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
 PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
         const PowerGridOperatingPoint* point, PowerGridSolveResult* result,
         double branch_rating_scale) {
+    power_grid_init_branch_constants();
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int row_for_node[POWER_GRID_NUM_NODES];
     double injection[POWER_GRID_NUM_NODES] = {0};
@@ -495,7 +512,6 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
     for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
             POWER_GRID_GENERATOR_BUSES[gen]);
-        active[node] = 1;
         double output = gen == 0 ? result->slack_generation_mw : point->generator_mw[gen];
         injection[node] += output;
         result->substation_injection_mw[POWER_GRID_GENERATOR_BUSES[gen]] += output;
@@ -503,7 +519,6 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
             POWER_GRID_LOAD_BUSES[load]);
-        active[node] = 1;
         injection[node] -= point->load_mw[load];
         result->substation_injection_mw[POWER_GRID_LOAD_BUSES[load]] -= point->load_mw[load];
     }
@@ -559,15 +574,14 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
         }
         for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
             if (!topology->line_closed[branch]) continue;
-            const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
             int from = cache->from_node[branch];
             int to = cache->to_node[branch];
             int from_row = row_for_node[from];
             int to_row = row_for_node[to];
             double from_angle = from_row >= 0 ? refined[from_row] : 0.0;
             double to_angle = to_row >= 0 ? refined[to_row] : 0.0;
-            double flow = POWER_GRID_BASE_MVA *
-                (from_angle - to_angle) / (line->reactance * line->tap_ratio);
+            double flow = power_grid_branch_angle_factor[branch] *
+                (from_angle - to_angle);
             if (from_row >= 0) residual[from_row] -= flow;
             if (to_row >= 0) residual[to_row] += flow;
         }
@@ -597,8 +611,8 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
         const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
         int from = cache->from_node[branch];
         int to = cache->to_node[branch];
-        double flow = POWER_GRID_BASE_MVA * (result->node_angle[from] - result->node_angle[to]) /
-            (line->reactance * line->tap_ratio);
+        double flow = power_grid_branch_angle_factor[branch] *
+            (result->node_angle[from] - result->node_angle[to]);
         double rho = fabs(flow) / (line->thermal_limit_mw * branch_rating_scale);
         if (!isfinite(flow) || !isfinite(rho)) {
             result->status = POWER_GRID_NONFINITE;
