@@ -1,3 +1,7 @@
+/* Training uses the refined float DC factorization for throughput. The public
+ * solver and standalone benchmark builds remain double precision unless this
+ * environment binding selects the optimized path. */
+#define POWER_GRID_DC_FLOAT
 #include "power_grid_solver.c"
 #include "power_grid_ac.c"
 #include "power_grid.h"

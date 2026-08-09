@@ -268,10 +268,22 @@ typedef struct {
     unsigned short factor_rows[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
     unsigned short factor_row_count[POWER_GRID_NUM_NODES];
     PowerGridTopology topology;
+#ifdef POWER_GRID_DC_FLOAT
+    float lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+#else
     double lu[POWER_GRID_NUM_NODES][POWER_GRID_NUM_NODES];
+#endif
 } PowerGridDCFactorCache;
 
 #define POWER_GRID_DC_CACHE_SLOTS 4
+#ifdef POWER_GRID_DC_FLOAT
+typedef float PowerGridDCScalar;
+#define POWER_GRID_DC_SQRT sqrtf
+#else
+typedef double PowerGridDCScalar;
+#define POWER_GRID_DC_SQRT sqrt
+#endif
+
 static __thread PowerGridDCFactorCache power_grid_dc_cache[POWER_GRID_DC_CACHE_SLOTS];
 static __thread unsigned int power_grid_dc_cache_next;
 
@@ -361,7 +373,7 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
     for (int row = 0; row < dimensions; row++) {
         for (int col = 0; col <= row; col++) {
             if (!cache->pattern[row][col]) continue;
-            double value = cache->lu[row][col];
+            PowerGridDCScalar value = cache->lu[row][col];
             for (int index = 0; index < cache->factor_count[row]; index++) {
                 int k = cache->factor_cols[row][index];
                 if (k >= col) break;
@@ -372,7 +384,7 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
                     cache->valid = 0;
                     return 0;
                 }
-                cache->lu[row][col] = sqrt(value);
+                cache->lu[row][col] = POWER_GRID_DC_SQRT(value);
             } else {
                 cache->lu[row][col] = value / cache->lu[col][col];
             }
@@ -386,7 +398,7 @@ static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
 }
 
 static int power_grid_solve_cached_rhs(const PowerGridDCFactorCache* cache,
-        const double* rhs, double* solution) {
+        const PowerGridDCScalar* rhs, PowerGridDCScalar* solution) {
     int dimensions = cache->dimensions;
     for (int i = 0; i < dimensions; i++) solution[i] = rhs[i];
     for (int row = 0; row < dimensions; row++) {
@@ -413,8 +425,8 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
     unsigned char active[POWER_GRID_NUM_NODES] = {0};
     int row_for_node[POWER_GRID_NUM_NODES];
     double injection[POWER_GRID_NUM_NODES] = {0};
-    double rhs[POWER_GRID_NUM_NODES] = {0};
-    double solution[POWER_GRID_NUM_NODES] = {0};
+    PowerGridDCScalar rhs[POWER_GRID_NUM_NODES] = {0};
+    PowerGridDCScalar solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
     int validation_cache_hit = 0;
     for (int slot = 0; slot < POWER_GRID_DC_CACHE_SLOTS; slot++) {
@@ -508,7 +520,7 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
         }
     }
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
-        if (row_for_node[node] >= 0) rhs[row_for_node[node]] = injection[node];
+        if (row_for_node[node] >= 0) rhs[row_for_node[node]] = (PowerGridDCScalar)injection[node];
     }
     PowerGridDCFactorCache* cache = NULL;
     for (int slot = 0; slot < POWER_GRID_DC_CACHE_SLOTS; slot++) {
@@ -530,11 +542,54 @@ PowerGridSolveStatus power_grid_solve_scaled(const PowerGridTopology* topology,
         result->status = POWER_GRID_SINGULAR;
         return result->status;
     }
+#ifdef POWER_GRID_DC_FLOAT
+    /* Recover most of the double-precision solution accuracy with two cheap
+     * residual corrections while retaining the faster float factorization. */
+    double refined[POWER_GRID_NUM_NODES] = {0};
+    double residual[POWER_GRID_NUM_NODES];
+    PowerGridDCScalar correction_rhs[POWER_GRID_NUM_NODES];
+    PowerGridDCScalar correction[POWER_GRID_NUM_NODES];
+    int node_for_row[POWER_GRID_NUM_NODES];
+    for (int node = 0; node < POWER_GRID_NUM_NODES; node++)
+        if (row_for_node[node] >= 0) node_for_row[row_for_node[node]] = node;
+    for (int row = 0; row < dimensions; row++) refined[row] = solution[row];
+    for (int iteration = 0; iteration < 2; iteration++) {
+        for (int row = 0; row < dimensions; row++) {
+            residual[row] = injection[node_for_row[row]];
+        }
+        for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+            if (!topology->line_closed[branch]) continue;
+            const PowerGridBranch* line = &POWER_GRID_BRANCHES[branch];
+            int from = cache->from_node[branch];
+            int to = cache->to_node[branch];
+            int from_row = row_for_node[from];
+            int to_row = row_for_node[to];
+            double from_angle = from_row >= 0 ? refined[from_row] : 0.0;
+            double to_angle = to_row >= 0 ? refined[to_row] : 0.0;
+            double flow = POWER_GRID_BASE_MVA *
+                (from_angle - to_angle) / (line->reactance * line->tap_ratio);
+            if (from_row >= 0) residual[from_row] -= flow;
+            if (to_row >= 0) residual[to_row] += flow;
+        }
+        for (int row = 0; row < dimensions; row++) correction_rhs[row] =
+            (PowerGridDCScalar)residual[row];
+        if (!power_grid_solve_cached_rhs(cache, correction_rhs, correction)) {
+            result->status = POWER_GRID_SINGULAR;
+            return result->status;
+        }
+        for (int row = 0; row < dimensions; row++) refined[row] += correction[row];
+    }
+#endif
     cache->component_count = result->component_count;
     cache->active_node_count = result->active_node_count;
     memcpy(cache->active, active, sizeof(cache->active));
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
-        if (row_for_node[node] >= 0) result->node_angle[node] = solution[row_for_node[node]];
+        if (row_for_node[node] >= 0)
+#ifdef POWER_GRID_DC_FLOAT
+            result->node_angle[node] = refined[row_for_node[node]];
+#else
+            result->node_angle[node] = solution[row_for_node[node]];
+#endif
     }
 
     for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
