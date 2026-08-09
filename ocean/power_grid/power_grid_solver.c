@@ -254,6 +254,18 @@ typedef struct {
 static __thread PowerGridDCFactorCache power_grid_dc_cache[POWER_GRID_DC_CACHE_SLOTS];
 static __thread unsigned int power_grid_dc_cache_next;
 
+#define POWER_GRID_VALIDATION_CACHE_SLOTS 32
+typedef struct {
+    int valid;
+    PowerGridSolveStatus status;
+    int component_count;
+    int active_node_count;
+    unsigned char active[POWER_GRID_NUM_NODES];
+    PowerGridTopology topology;
+} PowerGridValidationCache;
+static __thread PowerGridValidationCache power_grid_validation_cache[POWER_GRID_VALIDATION_CACHE_SLOTS];
+static __thread unsigned int power_grid_validation_cache_next;
+
 static int power_grid_factorize_cached(PowerGridDCFactorCache* cache,
         const PowerGridTopology* topology, const int* row_for_node, int dimensions) {
     if (cache->valid && cache->dimensions == dimensions &&
@@ -343,9 +355,34 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
             break;
         }
     }
-    result->status = validation_cache_hit ? POWER_GRID_SOLVE_OK :
-        power_grid_validate_topology_internal(topology,
+    if (!validation_cache_hit) {
+        for (int slot = 0; slot < POWER_GRID_VALIDATION_CACHE_SLOTS; slot++) {
+            PowerGridValidationCache* candidate = &power_grid_validation_cache[slot];
+            if (candidate->valid &&
+                    memcmp(&candidate->topology, topology, sizeof(*topology)) == 0) {
+                memcpy(active, candidate->active, sizeof(active));
+                result->status = candidate->status;
+                result->component_count = candidate->component_count;
+                result->active_node_count = candidate->active_node_count;
+                validation_cache_hit = 1;
+                break;
+            }
+        }
+    }
+    if (!validation_cache_hit) {
+        result->status = power_grid_validate_topology_internal(topology,
             &result->component_count, &result->active_node_count, active);
+        if (result->status != POWER_GRID_SOLVE_OK) {
+            PowerGridValidationCache* entry = &power_grid_validation_cache[
+                power_grid_validation_cache_next++ % POWER_GRID_VALIDATION_CACHE_SLOTS];
+            entry->valid = 1;
+            entry->status = result->status;
+            entry->component_count = result->component_count;
+            entry->active_node_count = result->active_node_count;
+            memcpy(entry->active, active, sizeof(entry->active));
+            entry->topology = *topology;
+        }
+    }
     if (result->status != POWER_GRID_SOLVE_OK) return result->status;
 
     double total_load = 0.0;
