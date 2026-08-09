@@ -108,6 +108,23 @@ the longer-horizon targets.
 
 ## Conclusion
 
+## Best screened PPO: horizon 64, conservative optimizer
+
+The best verified checkpoint was trained for 39,976,960 saved steps with
+`horizon=64`, `gamma=.99`, `gae_lambda=.95`, `learning_rate=.0025`,
+`ent_coef=.0001`, and training event probability `.25`:
+`checkpoints/power_grid/1786250866399/0000000039976960.bin`.
+
+| AC suite | PPO perf | Failure | Switches | Demand fulfilled | Outage completion | All survived |
+|---|---:|---:|---:|---:|---:|---:|
+| Nominal | **0.7613** | 3.12% | 71.19 | 98.83% | — | — |
+| Forced outages | **0.6595** | 10.94% | 69.17 | 95.96% | 96.88% | 89.06% |
+
+This beats no-action on both suites (0.6367 / 0.5677) and is close to, but does
+not yet exceed, greedy (0.7747 / 0.6758) on the 64 held-out seeds. Dashboard
+timing stayed CPU/environment dominated: approximately 71–76% environment,
+19–21% train/forward, and 2% GPU evaluation.
+
 The IEEE-118 transfer and scaled contingency machinery work. Moving to longer-horizon credit
 assignment improved PPO materially, but the inherited optimizer still produces near-continuous
 switching and remains behind no-action and greedy on held-out AC. The next controlled experiment
