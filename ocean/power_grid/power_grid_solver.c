@@ -374,16 +374,9 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
     float rhs[POWER_GRID_NUM_NODES] = {0};
     float solution[POWER_GRID_NUM_NODES] = {0};
     memset(result, 0, sizeof(*result));
-    int normal_topology = power_grid_is_normal_topology(topology);
-    if (normal_topology) {
-        result->status = POWER_GRID_SOLVE_OK;
-        result->component_count = 1;
-        result->active_node_count = POWER_GRID_NUM_SUBSTATIONS;
-    } else {
-        result->status = power_grid_validate_topology(topology, &result->component_count,
-            &result->active_node_count);
-        if (result->status != POWER_GRID_SOLVE_OK) return result->status;
-    }
+    result->status = power_grid_validate_topology(topology, &result->component_count,
+        &result->active_node_count);
+    if (result->status != POWER_GRID_SOLVE_OK) return result->status;
 
     double total_load = 0.0;
     double non_slack_generation = 0.0;
@@ -431,6 +424,7 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         row_for_node[node] = -1;
         if (active[node] && node != reference) row_for_node[node] = dimensions++;
     }
+    int normal_topology = power_grid_is_normal_topology(topology);
     int normal_factor_ready = normal_topology &&
         atomic_load_explicit(&power_grid_normal_factor_state, memory_order_acquire) == 2 &&
         power_grid_normal_factor.dimensions == dimensions;
