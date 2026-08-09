@@ -68,20 +68,55 @@ static void test_episode_metrics(void)
     env.episode_step = 10;
     env.episode.safe_steps = 7;
     env.episode.no_op_actions = 8;
+    env.episode.demand_served_steps = 10;
+    env.episode.overloaded_line_steps = 3;
+    env.episode.thermal_trips = 2;
+    env.episode.peak_thermal_stress = 1.25;
+    env.episode.peak_line_loading = 1.5;
+    env.scheduled_random_event_period = 1;
+    env.episode.random_events = 1;
     env.solution.status = POWER_GRID_SOLVE_OK;
     power_grid_finish_episode(&env);
     CHECK_CLOSE(env.log.perf, 0.7);
     CHECK_CLOSE(env.log.score, 0.8);
-    CHECK_CLOSE(env.log.event_failure, 0.0);
+    CHECK_CLOSE(env.log.total_failure, 0.0);
+    CHECK_CLOSE(env.log.connectivity_failure, 0.0);
+    CHECK_CLOSE(env.log.solver_failure, 0.0);
+    CHECK_CLOSE(env.log.demand_fulfilled, 10.0 / POWER_GRID_EPISODE_STEPS);
+    CHECK_CLOSE(env.log.outage_completion, 1.0);
+    CHECK_CLOSE(env.log.all_outages_survived, 1.0);
+    CHECK_CLOSE(env.log.thermal_trips, 2.0);
+    CHECK_CLOSE(env.log.thermal_trip_episode, 1.0);
+    CHECK_CLOSE(env.log.peak_thermal_stress, 1.25);
+    CHECK_CLOSE(env.log.peak_line_loading, 1.5);
+    CHECK_CLOSE(env.log.overloaded_line_fraction,
+                3.0 / (POWER_GRID_EPISODE_STEPS * POWER_GRID_NUM_BRANCHES));
 
     memset(&env.log, 0, sizeof(env.log));
     env.pending_reset = 0;
-    env.episode.random_events = 1;
     env.solution.status = POWER_GRID_ISLANDED;
     power_grid_finish_episode(&env);
     CHECK_CLOSE(env.log.perf, 0.0);
     CHECK_CLOSE(env.log.score, 0.8);
-    CHECK_CLOSE(env.log.event_failure, 1.0);
+    CHECK_CLOSE(env.log.total_failure, 1.0);
+    CHECK_CLOSE(env.log.connectivity_failure, 1.0);
+    CHECK_CLOSE(env.log.solver_failure, 0.0);
+
+    memset(&env.log, 0, sizeof(env.log));
+    env.pending_reset = 0;
+    env.solution.status = POWER_GRID_SINGULAR;
+    power_grid_finish_episode(&env);
+    CHECK_CLOSE(env.log.total_failure, 1.0);
+    CHECK_CLOSE(env.log.connectivity_failure, 0.0);
+    CHECK_CLOSE(env.log.solver_failure, 1.0);
+
+    memset(&env.log, 0, sizeof(env.log));
+    env.pending_reset = 0;
+    env.solution.status = POWER_GRID_INVALID_INPUT;
+    power_grid_finish_episode(&env);
+    CHECK_CLOSE(env.log.total_failure, 1.0);
+    CHECK_CLOSE(env.log.connectivity_failure, 0.0);
+    CHECK_CLOSE(env.log.solver_failure, 1.0);
     c_close(&env);
 }
 
@@ -93,7 +128,7 @@ static void test_offline_scenario_cache(void)
     int weather_derated_periods = 0;
     int weather_uprated_periods = 0;
     int overloaded_periods = 0;
-    int ac_nonconvergence = 0;
+    int ac_solve_failures = 0;
     int ac_voltage_infeasible = 0;
     unsigned int previous_date = 0;
     PowerGridTopology topology;
@@ -145,7 +180,7 @@ static void test_offline_scenario_cache(void)
             PowerGridACSolveResult ac_solution;
             PowerGridACStatus ac_status = power_grid_ac_solve(
                 &topology, &point, &ac_solution);
-            ac_nonconvergence += ac_status != POWER_GRID_AC_OK;
+            ac_solve_failures += ac_status != POWER_GRID_AC_OK;
             if (ac_status == POWER_GRID_AC_OK)
                 ac_voltage_infeasible += ac_solution.voltage_violation_count > 0;
 
@@ -163,7 +198,7 @@ static void test_offline_scenario_cache(void)
     CHECK(weather_derated_periods > 0);
     CHECK(weather_uprated_periods > 0);
     CHECK(overloaded_periods > 0);
-    CHECK(ac_nonconvergence == 0);
+    CHECK(ac_solve_failures == 0);
     CHECK(ac_voltage_infeasible == 0);
 
     for (int profile = 0; profile < POWER_GRID_NUM_PROFILES; profile++)
@@ -245,9 +280,27 @@ static void test_offline_episode_sampling(void)
     power_grid_allocate(&curriculum);
     c_reset(&curriculum);
     CHECK(curriculum.offline_scenario == NULL);
-    CHECK(curriculum.episode_profiles[0] == POWER_GRID_PROFILE_P0_NOMINAL);
-    for (int period = 1; period < POWER_GRID_NUM_PERIODS; period++)
-        CHECK(curriculum.episode_profiles[period] > POWER_GRID_PROFILE_P0_NOMINAL);
+    CHECK(curriculum.synthetic_profile > POWER_GRID_PROFILE_P0_NOMINAL);
+    for (int profile = 1; profile < POWER_GRID_NUM_PROFILES; profile++)
+    {
+        curriculum.synthetic_profile = (PowerGridProfile)profile;
+        power_grid_set_operating_period(&curriculum, 0);
+        PowerGridOperatingPoint previous = curriculum.operating_point;
+        for (int period = 1; period < POWER_GRID_NUM_PERIODS; period++)
+        {
+            power_grid_set_operating_period(&curriculum, period);
+            double largest_change = 0.0;
+            for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+                largest_change = fmax(largest_change,
+                    fabs(curriculum.operating_point.load_mw[load] - previous.load_mw[load]));
+            for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
+                largest_change = fmax(largest_change,
+                    fabs(curriculum.operating_point.generator_mw[generator] -
+                         previous.generator_mw[generator]));
+            CHECK(largest_change <= 34.0 + 1e-6);
+            previous = curriculum.operating_point;
+        }
+    }
 
     PowerGrid validation = {
         .rng = 12345u,
@@ -332,35 +385,88 @@ static void test_topology_persists_across_periods(void)
 
 static void test_solvable_random_event_lifecycle(void)
 {
-    PowerGrid env = {
-        .rng = 12345u,
-        .offline_scenarios = 1,
-        .offline_scenario_probability = 1.0,
-        .random_events = 1,
-        .random_event_probability = 1.0,
-    };
+    for (int ac_power_flow = 0; ac_power_flow <= 1; ac_power_flow++)
+    {
+        PowerGrid env = {
+            .rng = 12345u,
+            .ac_power_flow = ac_power_flow,
+            .random_events = 1,
+            .random_event_probability = 1.0,
+        };
+        power_grid_allocate(&env);
+        c_reset(&env);
+        CHECK(env.scheduled_random_event_period > 0);
+        CHECK(env.scheduled_random_event_period < POWER_GRID_NUM_PERIODS);
+        CHECK(env.scheduled_random_event_line >= 0);
+        CHECK(env.scheduled_random_event_line < POWER_GRID_NUM_BRANCHES);
+        env.synthetic_profile = POWER_GRID_PROFILE_P0_NOMINAL;
+
+        while (env.current_period < env.scheduled_random_event_period)
+        {
+            env.actions[0] = POWER_GRID_ACTION_NONE;
+            c_step(&env);
+            CHECK(env.terminals[0] == 0.0f);
+        }
+        int outage_line = env.scheduled_random_event_line;
+        CHECK(env.active_random_event_line == outage_line);
+        CHECK(env.episode.random_events == 1);
+        CHECK(env.line_available[outage_line] == 0);
+        CHECK(env.topology.line_closed[outage_line] == 0);
+        CHECK_CLOSE(env.observations[POWER_GRID_LINE_OBS_OFFSET +
+                                     outage_line * POWER_GRID_LINE_OBS_FEATURES + 3], 0.0);
+        CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
+
+        env.actions[0] = NAN;
+        c_step(&env);
+        CHECK_CLOSE(env.log.solver_failure, 1.0);
+        CHECK_CLOSE(env.log.event_failure, 0.0);
+
+        c_close(&env);
+    }
+}
+
+static void test_immediate_random_event_failure(void)
+{
+    PowerGrid env = {0};
     power_grid_allocate(&env);
     c_reset(&env);
-    CHECK(env.scheduled_random_event_period > 0);
-    CHECK(env.scheduled_random_event_period < POWER_GRID_NUM_PERIODS);
-    CHECK(env.scheduled_random_event_line >= 0);
-    CHECK(env.scheduled_random_event_line < POWER_GRID_NUM_BRANCHES);
+    env.scheduled_random_event_period = 1;
+    env.scheduled_random_event_line = 13; /* Radial 7-8 branch, excluded from normal events. */
 
-    while (env.current_period < env.scheduled_random_event_period)
+    for (int step = 0; step < POWER_GRID_STEPS_PER_PERIOD; step++)
     {
         env.actions[0] = POWER_GRID_ACTION_NONE;
         c_step(&env);
-        CHECK(env.terminals[0] == 0.0f);
     }
-    int outage_line = env.scheduled_random_event_line;
-    CHECK(env.active_random_event_line == outage_line);
-    CHECK(env.episode.random_events == 1);
-    CHECK(env.line_available[outage_line] == 0);
-    CHECK(env.topology.line_closed[outage_line] == 0);
-    CHECK_CLOSE(env.observations[POWER_GRID_LINE_OBS_OFFSET +
-                                 outage_line * POWER_GRID_LINE_OBS_FEATURES + 3], 0.0);
-    CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
 
+    CHECK_CLOSE(env.log.random_events, 1.0);
+    CHECK_CLOSE(env.log.event_failure, 1.0);
+    CHECK_CLOSE(env.log.connectivity_failure, 1.0);
+    CHECK_CLOSE(env.log.solver_failure, 0.0);
+    CHECK_CLOSE(env.log.total_failure, 1.0);
+    c_close(&env);
+}
+
+static void test_random_event_applies_after_switching(void)
+{
+    PowerGrid env = {0};
+    power_grid_allocate(&env);
+    c_reset(&env);
+    env.synthetic_profile = POWER_GRID_PROFILE_P0_NOMINAL;
+    env.topology.line_closed[0] = 0;
+    env.scheduled_random_event_period = 1;
+    env.scheduled_random_event_line = 16;
+
+    for (int step = 0; step < POWER_GRID_STEPS_PER_PERIOD; step++)
+    {
+        env.actions[0] = POWER_GRID_ACTION_NONE;
+        c_step(&env);
+    }
+
+    CHECK(env.episode.random_events == 1);
+    CHECK(env.active_random_event_line == 16);
+    CHECK(env.line_available[16] == 0);
+    CHECK(env.topology.line_closed[16] == 0);
     c_close(&env);
 }
 
@@ -370,9 +476,8 @@ static void test_randomized_environment_lifecycle(void)
         {.rng = 7u},
         {.rng = 11u, .offline_scenarios = 1, .offline_scenario_probability = 1.0},
         {.rng = 13u, .offline_scenarios = 1, .offline_scenario_validation = 1},
-        {.rng = 17u, .evaluation_scenarios = 1},
         {.rng = 19u, .offline_scenarios = 1, .offline_scenario_probability = 1.0,
-         .ac_power_flow = 1},
+         .ac_power_flow = 1, .random_events = 1, .random_event_probability = 1.0},
     };
     for (unsigned int config = 0;
          config < sizeof(configurations) / sizeof(configurations[0]); config++)
@@ -408,6 +513,8 @@ int main(void)
     test_period_transition_failure_reward();
     test_topology_persists_across_periods();
     test_solvable_random_event_lifecycle();
+    test_immediate_random_event_failure();
+    test_random_event_applies_after_switching();
     test_randomized_environment_lifecycle();
     if (failures)
         return 1;

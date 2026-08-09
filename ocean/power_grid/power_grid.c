@@ -5,7 +5,10 @@
 int main(void) {
     PowerGrid env = {0};
     env.ac_power_flow = 1;
-    env.evaluation_scenarios = 1;
+    env.offline_scenarios = 1;
+    env.offline_scenario_validation = 1;
+    env.random_events = 1;
+    env.random_event_probability = 0.25;
     power_grid_allocate(&env);
     c_reset(&env);
     c_render(&env);

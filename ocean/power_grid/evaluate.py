@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless, apples-to-apples DC versus AC checkpoint replay."""
+"""Headless DC-versus-AC replay using security and behavior metrics only."""
 
 import argparse
 import copy
@@ -16,17 +16,19 @@ METRICS = (
     "score",
     "episode_return",
     "total_failure",
-    "topology_failure",
+    "connectivity_failure",
     "solver_failure",
+    "event_failure",
     "total_switches",
-    "ac_voltage_violation_steps",
-    "ac_generator_p_violation_steps",
-    "ac_q_limit_events",
-    "ac_mean_active_loss_mw",
-    "ac_nonconvergence",
-    "ac_thermal_trips",
-    "ac_peak_thermal_stress",
-    "maintenance_events",
+    "random_events",
+    "demand_fulfilled",
+    "outage_completion",
+    "all_outages_survived",
+    "thermal_trips",
+    "thermal_trip_episode",
+    "peak_thermal_stress",
+    "peak_line_loading",
+    "overloaded_line_fraction",
     "n",
 )
 
@@ -40,13 +42,21 @@ def resolve_checkpoint(path):
     return max(candidates, key=os.path.getctime)
 
 
-def replay(base_args, checkpoint, ac_power_flow, rollouts, agents):
+def replay(
+    base_args, checkpoint, ac_power_flow, rollouts, agents, horizon=48,
+    random_event_probability=None,
+):
     args = copy.deepcopy(base_args)
     args["env"]["ac_power_flow"] = ac_power_flow
-    args["env"]["evaluation_scenarios"] = True
+    args["env"]["offline_scenarios"] = True
+    args["env"]["offline_scenario_validation"] = True
+    args["env"]["single_episode_evaluation"] = True
+    if random_event_probability is not None:
+        args["env"]["random_events"] = random_event_probability > 0.0
+        args["env"]["random_event_probability"] = random_event_probability
     args["vec"]["total_agents"] = agents
     args["reset_state"] = False
-    args["train"]["horizon"] = 48
+    args["train"]["horizon"] = horizon
     evaluator = backend.create_pufferl(args)
     try:
         backend.load_weights(evaluator, checkpoint)

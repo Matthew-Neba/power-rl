@@ -37,7 +37,7 @@ generator-limit violations are logged as scenario-data faults rather than blamed
 AC 1-2 rating is 160 MVA instead of the 155 MW DC proxy so nominal reactive flow preserves the
 required safe initial state; all remaining synthetic rating numbers are shared.
 
-Evaluation-only inverse-time protection accumulates squared overload exposure. Sustained 200%
+AC-mode inverse-time protection accumulates squared overload exposure. Sustained 200%
 loading trips a line in one step, 150% in four, and 120% in about 25; loading at or below 100%
 cools it. A tripped line is locked out for the episode and AC power flow is recalculated. This is
 a thermal proxy, not a conductor-temperature or manufacturer relay model.
@@ -47,11 +47,13 @@ catastrophic failure. `score` is the fraction of actions that were no-ops, inclu
 episodes. Hyperparameter sweeps maximize `perf`.
 
 Episodes contain 12 six-step operating periods. By default, reset makes one reproducible RNG draw:
-75% of episodes use one complete day from the compile-time historical cache, while 25% retain the
+90% of episodes use one complete day from the compile-time historical cache, while 10% retain the
 deliberately congested synthetic curriculum. Set `offline_scenario_probability` anywhere from 0 to
-1 to control that mix. Synthetic episodes begin with safe nominal `P0`; the other 11 periods are
-independent samples from stress profiles `P1` through `P14`. Scenario identity is not observed
-because injections, flows, and weather-adjusted loading expose the actionable current condition.
+1 to control that mix. A synthetic episode uniformly selects one of stress profiles `P1` through
+`P14`, then smoothly ramps from nominal `P0` to that operating point and back down over its twelve
+periods. This keeps changes temporally related while retaining profile coverage across episodes.
+Scenario identity is not observed because injections, flows, and weather-adjusted loading expose
+the actionable current condition.
 
 ## Offline historical domain randomization
 
@@ -90,35 +92,35 @@ thermal stress, all 28 busbar voltage magnitudes, and generator reactive output.
 identical in DC and AC. This expansion is
 incompatible with checkpoints trained on the older 144-value contract.
 
-The held-out `evaluation_scenarios` mode replaces random profiles with a repeatable 24-hour load,
-synthetic bus-3 solar, and bus-6 wind trajectory. It also takes line 9-14 out for maintenance from
-08:00 through 16:00. The headless report enables this for both DC and AC so only the solver physics
-change between columns. These renewable injections are exogenous; curtailment remains out of scope.
-
 ## Random event layer
 
-Training can independently layer one persistent line outage onto a historical day or synthetic
-profile. `random_event_probability` controls the fraction of episodes that schedule an event. The
-event begins at a randomly selected period after the episode has started, and the failed line is
-locked open for the rest of the episode. Line availability is already part of each line's
-observation, so the policy sees the outage without changing the observation layout.
+An episode can independently layer one persistent line outage onto a historical day or synthetic
+profile. `random_event_probability` controls the fraction of episodes that schedule the event. Its
+line and later period are randomized, and the failed line remains locked open. Line availability is
+already part of each line's observation, so the policy sees the outage without changing the layout.
 
 Certification is intentionally minimal: from the normal topology, the outage must leave the DC
 power flow solvable. It does not need to cause an overload, and no recovery is required or supplied.
-If the agent has already changed the topology when the event is due, the event is skipped rather
-than applying that minimal solvability certificate to a state for which it was not checked. Random
-events are disabled in deterministic evaluation and AC modes. The environment excludes the radial
-7-8 branch; tests verify every other single-line outage against every cached period and synthetic
-profile.
+The outage is exogenous and still applies if the agent has already changed topology; that combined
+state may fail because only the normal topology is certified. Events use the same scheduling and
+line-selection logic in DC and AC modes. The environment excludes the radial 7-8 branch; tests
+verify every other single-line outage remains DC-solvable against every cached period and synthetic
+profile. AC mode models the outage directly, but the DC certificate does not promise AC convergence
+or voltage feasibility after it occurs.
 
-The hot training path only chooses a period and line from a precomputed bit mask. The compact event
-metrics report applied random events and terminal failures in episodes containing an event.
+The hot training path samples one period and line from a compact bit mask. Metrics report whether
+the outage was reached and survived, full-demand service, line overload exposure, peak loading,
+thermal stress, and trips.
 
 No historical period or synthetic profile is required to have a safe topology within a bounded
 number of actions. The six actions in each operating period are an agent response budget, not a
-promise that recovery exists. `event_failure` counts solver/topology failures after a random event
-was applied, and `topology_failure` continues to count disconnected, islanded, or otherwise invalid
-topologies.
+promise that recovery exists. Terminal failures are divided into mutually exclusive
+`connectivity_failure` and `solver_failure` counters. Invalid actions or scenario data are treated
+as solver failures because they should only indicate a bug or corrupted input during normal use.
+`total_failure` is the exact sum. `random_events` separately reports applied outages, while
+`event_failure` reports only an
+immediate terminal failure from applying and re-solving a scheduled outage. It is a diagnostic tag,
+not another category in the total.
 
 ## Tests
 
@@ -141,14 +143,33 @@ Train with fast DC power flow (the default), then replay a checkpoint under AC p
 ```sh
 puffer train power_grid
 puffer eval power_grid --load-model-path latest --env.ac-power-flow True \
-  --env.evaluation-scenarios True
+  --env.offline-scenario-validation True
 ```
 
-For a headless quantitative comparison of the same checkpoint under both solvers:
+AC voltage violations and thermal trips are reported as dedicated evaluation metrics; they do not
+add terms to the reward. The AC `perf` security metric still treats a voltage-violating step as
+unsafe. Replay never updates the policy.
+
+For a headless quantitative comparison on recorded 2020 validation days under both solvers:
 
 ```sh
 python ocean/power_grid/evaluate.py --checkpoint latest --rollouts 2
 ```
+
+The comparison reports security, return, failure, switching, and event metrics.
+
+Compare a trained checkpoint with six baselines spanning no-action, random, safe-random, and
+greedy policies on the same held-out seed range:
+
+```sh
+python ocean/power_grid/benchmark.py --checkpoint latest --episodes 1024 \
+  --physics ac --random-event-probability 1
+```
+
+The greedy policies score every immediately solvable candidate using the environment reward. One
+searches only no-op and branch toggles; the other searches all 91 actions. Safe-random uniformly
+samples from actions whose immediate topology remains solvable. These are diagnostic baselines,
+not recovery guarantees or multi-step planning oracles.
 
 The AC renderer shows voltage range, P/Q generation and demand, active/reactive losses, MVA line
 loading, Q-limit conversions, P-limit data faults, Newton convergence, thermal stress, and trips.

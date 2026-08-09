@@ -96,10 +96,6 @@ static inline double power_grid_weather_rating_scale(
 #define POWER_GRID_SWITCH_PENALTY 0.001f
 #define POWER_GRID_CONGESTION_COST_WEIGHT 1.0
 
-/* AC evaluation-only reward configuration. Ignored during DC training. */
-#define POWER_GRID_AC_VOLTAGE_VIOLATION_COST_WEIGHT 1.0
-#define POWER_GRID_AC_THERMAL_TRIP_PENALTY 1.0
-
 #define POWER_GRID_LINE_OBS_FEATURES 5
 #define POWER_GRID_LINE_OBS_OFFSET 0
 #define POWER_GRID_TERMINAL_OBS_OFFSET \
@@ -131,7 +127,7 @@ typedef struct
     float episode_return;
     float episode_length;
     float total_failure;
-    float topology_failure;
+    float connectivity_failure;
     float solver_failure;
     float event_failure;
     float total_switches;
@@ -139,15 +135,15 @@ typedef struct
     float busbar_switches;
     float coupler_switches;
     float overload_free_steps;
-    float ac_voltage_violation_steps;
-    float ac_generator_p_violation_steps;
-    float ac_q_limit_events;
-    float ac_mean_active_loss_mw;
-    float ac_nonconvergence;
-    float ac_thermal_trips;
-    float ac_peak_thermal_stress;
-    float maintenance_events;
     float random_events;
+    float demand_fulfilled;
+    float outage_completion;
+    float all_outages_survived;
+    float thermal_trips;
+    float thermal_trip_episode;
+    float peak_thermal_stress;
+    float peak_line_loading;
+    float overloaded_line_fraction;
     float n;
 } Log;
 
@@ -156,15 +152,12 @@ typedef struct
     int switches[4]; /* total, line, terminal/busbar, coupler */
     int no_op_actions;
     int safe_steps;
-    int voltage_violation_steps;
-    int generator_p_violation_steps;
-    int q_limit_events;
-    int ac_nonconvergence;
     int thermal_trips;
-    int maintenance_events;
     int random_events;
-    double active_loss_mw_sum;
+    int demand_served_steps;
+    int overloaded_line_steps;
     double peak_thermal_stress;
+    double peak_line_loading;
 } PowerGridEpisodeStats;
 
 typedef struct
@@ -191,14 +184,12 @@ typedef struct
     PowerGridSolveResult solution;
     PowerGridACSolveResult ac_solution;
     const PowerGridOfflineScenario *offline_scenario;
-    PowerGridProfile episode_profiles[POWER_GRID_NUM_PERIODS];
+    PowerGridProfile synthetic_profile;
     int episode_step;
     int current_period;
     PowerGridEpisodeStats episode;
     unsigned char line_available[POWER_GRID_NUM_BRANCHES];
     double line_thermal_stress[POWER_GRID_NUM_BRANCHES];
-    unsigned char line_maintenance[POWER_GRID_NUM_BRANCHES];
-    unsigned char maintenance_was_closed[POWER_GRID_NUM_BRANCHES];
     int scheduled_random_event_period;
     int scheduled_random_event_line;
     int active_random_event_line;
@@ -207,12 +198,12 @@ typedef struct
     int last_action;
     PowerGridActionType last_action_type;
     int ac_power_flow;
-    int evaluation_scenarios;
     int offline_scenarios;
     int offline_scenario_validation;
     double offline_scenario_probability;
     int random_events;
     double random_event_probability;
+    int single_episode_evaluation;
     double branch_rating_scale;
     double ambient_temperature_c;
     double wind_speed_mps;
@@ -221,85 +212,13 @@ typedef struct
 
 void c_reset(PowerGrid *env);
 
-static const char *const POWER_GRID_EVALUATION_TIMES[POWER_GRID_NUM_PERIODS] = {
-    "00:00",
-    "02:00",
-    "04:00",
-    "06:00",
-    "08:00",
-    "10:00",
-    "12:00",
-    "14:00",
-    "16:00",
-    "18:00",
-    "20:00",
-    "22:00",
-};
-
-static void power_grid_chronological_point(PowerGridOperatingPoint *point, int period)
-{
-    static const double load_scale[POWER_GRID_NUM_PERIODS] = {
-        .78,
-        .76,
-        .80,
-        .90,
-        1.00,
-        1.08,
-        1.10,
-        1.05,
-        1.12,
-        1.08,
-        .95,
-        .85,
-    };
-    static const double solar_mw[POWER_GRID_NUM_PERIODS] = {
-        0,
-        0,
-        0,
-        10,
-        35,
-        70,
-        90,
-        75,
-        35,
-        5,
-        0,
-        0,
-    };
-    static const double wind_mw[POWER_GRID_NUM_PERIODS] = {
-        35,
-        30,
-        28,
-        25,
-        20,
-        18,
-        22,
-        28,
-        35,
-        40,
-        42,
-        38,
-    };
-    power_grid_operating_point_nominal(point);
-    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
-    {
-        point->load_mw[load] *= load_scale[period];
-    }
-    point->generator_mw[2] = solar_mw[period]; /* Synthetic solar at generator bus 3. */
-    point->generator_mw[3] = wind_mw[period];  /* Synthetic wind at generator bus 6. */
-}
-
 static void power_grid_set_operating_period(PowerGrid *env, int period)
 {
     env->branch_rating_scale = 1.0;
     env->ambient_temperature_c = 3.6;
     env->wind_speed_mps = 3.13;
     env->solar_irradiance_wm2 = 7.0;
-    if (env->evaluation_scenarios)
-    {
-        power_grid_chronological_point(&env->operating_point, period);
-    }
-    else if (env->offline_scenarios && env->offline_scenario != NULL)
+    if (env->offline_scenarios && env->offline_scenario != NULL)
     {
         const PowerGridOfflineScenario *scenario = env->offline_scenario;
         power_grid_operating_point_nominal(&env->operating_point);
@@ -316,14 +235,31 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
     }
     else
     {
-        power_grid_operating_point_profile(&env->operating_point, env->episode_profiles[period]);
+        static const double stress_scale[POWER_GRID_NUM_PERIODS] = {
+            0.0, 0.20, 0.40, 0.60, 0.80, 1.00,
+            1.0, 0.80, 0.60, 0.40, 0.20, 0.00,
+        };
+        PowerGridOperatingPoint target;
+        power_grid_operating_point_nominal(&env->operating_point);
+        power_grid_operating_point_profile(&target, env->synthetic_profile);
+        double scale = stress_scale[period];
+        for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+        {
+            env->operating_point.load_mw[load] +=
+                scale * (target.load_mw[load] - env->operating_point.load_mw[load]);
+        }
+        for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        {
+            env->operating_point.generator_mw[generator] +=
+                scale * (target.generator_mw[generator] -
+                         env->operating_point.generator_mw[generator]);
+        }
     }
 }
 
 static void power_grid_apply_dynamic_ratings(PowerGrid *env)
 {
-    if (env->offline_scenario == NULL || env->evaluation_scenarios ||
-        env->solution.status != POWER_GRID_SOLVE_OK)
+    if (env->offline_scenario == NULL || env->solution.status != POWER_GRID_SOLVE_OK)
         return;
 
     env->solution.max_rho = 0.0;
@@ -389,7 +325,7 @@ static double power_grid_branch_rating(const PowerGrid *env, int line)
     return base_rating * env->branch_rating_scale;
 }
 
-/* Evaluation-only inverse-time protection. Stress is an intentionally simple
+/* AC-mode inverse-time protection. Stress is an intentionally simple
  * thermal proxy: 200% trips in one step, 150% in four, and 120% in about 25.
  * A tripped line is locked out for the rest of the episode. */
 static int power_grid_update_ac_protection(PowerGrid *env)
@@ -409,10 +345,8 @@ static int power_grid_update_ac_protection(PowerGrid *env)
         }
         env->line_thermal_stress[line] = power_grid_ac_thermal_step(
             env->line_thermal_stress[line], env->solution.branch_rho[line]);
-        if (env->line_thermal_stress[line] > env->episode.peak_thermal_stress)
-        {
-            env->episode.peak_thermal_stress = env->line_thermal_stress[line];
-        }
+        env->episode.peak_thermal_stress = fmax(
+            env->episode.peak_thermal_stress, env->line_thermal_stress[line]);
         if (env->line_thermal_stress[line] >= POWER_GRID_THERMAL_TRIP_THRESHOLD)
         {
             env->line_available[line] = 0;
@@ -509,7 +443,7 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     {
         int line = action.value - POWER_GRID_LINE_ACTION_OFFSET;
         int previous_state = env->topology.line_closed[line] ^ 1;
-        if (!env->line_available[line] || env->line_maintenance[line])
+        if (!env->line_available[line])
             env->topology.line_closed[line] = 0;
         action.switched = env->topology.line_closed[line] != previous_state;
     }
@@ -531,13 +465,6 @@ static float calculate_reward(PowerGridSolveStatus solve_status,
 
 static void power_grid_finish_episode(PowerGrid *env)
 {
-    if (env->ac_power_flow && env->solution.status != POWER_GRID_SOLVE_OK &&
-        (env->ac_solution.status == POWER_GRID_AC_DIVERGED ||
-         env->ac_solution.status == POWER_GRID_AC_SINGULAR ||
-         env->ac_solution.status == POWER_GRID_AC_NONFINITE))
-    {
-        env->episode.ac_nonconvergence++;
-    }
     int failed = env->solution.status != POWER_GRID_SOLVE_OK;
     float steps = env->episode_step > 0 ? (float)env->episode_step : 1.0f;
     float perf = failed ? 0.0f : (float)env->episode.safe_steps / steps;
@@ -545,30 +472,35 @@ static void power_grid_finish_episode(PowerGrid *env)
     /* perf measures grid security; score measures how often switching was avoided. */
     env->log.perf += perf;
     env->log.overload_free_steps += (float)env->episode.safe_steps;
-    if (env->ac_power_flow)
-    {
-        env->log.ac_voltage_violation_steps += (float)env->episode.voltage_violation_steps;
-        env->log.ac_generator_p_violation_steps +=
-            (float)env->episode.generator_p_violation_steps;
-        env->log.ac_q_limit_events += (float)env->episode.q_limit_events;
-        env->log.ac_mean_active_loss_mw += (float)(env->episode.active_loss_mw_sum / steps);
-        env->log.ac_nonconvergence += (float)env->episode.ac_nonconvergence;
-        env->log.ac_thermal_trips += (float)env->episode.thermal_trips;
-        env->log.ac_peak_thermal_stress += (float)env->episode.peak_thermal_stress;
-    }
-    env->log.maintenance_events += (float)env->episode.maintenance_events;
     env->log.random_events += (float)env->episode.random_events;
+    env->log.demand_fulfilled +=
+        (float)env->episode.demand_served_steps / POWER_GRID_EPISODE_STEPS;
+    if (env->scheduled_random_event_period > 0)
+    {
+        env->log.outage_completion += env->episode.random_events;
+        env->log.all_outages_survived +=
+            !failed && env->episode.random_events == 1;
+    }
+    env->log.thermal_trips += (float)env->episode.thermal_trips;
+    env->log.thermal_trip_episode += env->episode.thermal_trips > 0;
+    env->log.peak_thermal_stress += (float)env->episode.peak_thermal_stress;
+    env->log.peak_line_loading += (float)env->episode.peak_line_loading;
+    env->log.overloaded_line_fraction +=
+        (float)env->episode.overloaded_line_steps /
+        (POWER_GRID_EPISODE_STEPS * POWER_GRID_NUM_BRANCHES);
     env->log.score += score;
     env->log.episode_return += env->episode_return;
     env->log.episode_length += (float)env->episode_step;
-    env->log.total_failure += failed;
-    env->log.topology_failure += env->solution.status == POWER_GRID_INVALID_TOPOLOGY ||
-                                 env->solution.status == POWER_GRID_DISCONNECTED_LOAD ||
-                                 env->solution.status == POWER_GRID_DISCONNECTED_GENERATOR ||
-                                 env->solution.status == POWER_GRID_ISLANDED;
-    env->log.solver_failure += env->solution.status == POWER_GRID_SINGULAR ||
-                               env->solution.status == POWER_GRID_NONFINITE || env->solution.status == POWER_GRID_INVALID_INPUT;
-    env->log.event_failure += failed && env->episode.random_events > 0;
+    int connectivity_failure = env->solution.status == POWER_GRID_INVALID_TOPOLOGY ||
+                               env->solution.status == POWER_GRID_DISCONNECTED_LOAD ||
+                               env->solution.status == POWER_GRID_DISCONNECTED_GENERATOR ||
+                               env->solution.status == POWER_GRID_ISLANDED;
+    int solver_failure = env->solution.status == POWER_GRID_SINGULAR ||
+                         env->solution.status == POWER_GRID_NONFINITE ||
+                         env->solution.status == POWER_GRID_INVALID_INPUT;
+    env->log.connectivity_failure += connectivity_failure;
+    env->log.solver_failure += solver_failure;
+    env->log.total_failure += connectivity_failure + solver_failure;
     env->log.total_switches += (float)env->episode.switches[0];
     env->log.line_switches += (float)env->episode.switches[POWER_GRID_ACTION_LINE];
     env->log.busbar_switches += (float)env->episode.switches[POWER_GRID_ACTION_TERMINAL];
@@ -579,7 +511,7 @@ static void power_grid_finish_episode(PowerGrid *env)
         env->pending_reset = 1;
         power_grid_compute_observations(env);
     }
-    else
+    else if (!env->single_episode_evaluation)
     {
         c_reset(env);
     }
@@ -592,8 +524,6 @@ void c_reset(PowerGrid *env)
     memset(&env->episode, 0, sizeof(env->episode));
     memset(env->line_available, 1, sizeof(env->line_available));
     memset(env->line_thermal_stress, 0, sizeof(env->line_thermal_stress));
-    memset(env->line_maintenance, 0, sizeof(env->line_maintenance));
-    memset(env->maintenance_was_closed, 0, sizeof(env->maintenance_was_closed));
     env->pending_reset = 0;
     env->last_action = POWER_GRID_ACTION_NONE;
     env->last_action_type = POWER_GRID_ACTION_NONE;
@@ -601,7 +531,7 @@ void c_reset(PowerGrid *env)
     env->active_random_event_line = -1;
     env->offline_scenario = NULL;
     env->branch_rating_scale = 1.0;
-    if (env->offline_scenarios && !env->evaluation_scenarios)
+    if (env->offline_scenarios)
     {
         /* One draw chooses the curriculum branch and, when selected, a complete
          * correlated cached day. No file or network access occurs in the hot path. */
@@ -619,24 +549,16 @@ void c_reset(PowerGrid *env)
                 offset + sample % count];
         }
     }
-    env->episode_profiles[0] = POWER_GRID_PROFILE_P0_NOMINAL;
-    for (int period = 1; period < POWER_GRID_NUM_PERIODS; period++)
+    env->synthetic_profile = POWER_GRID_PROFILE_P0_NOMINAL;
+    if (env->offline_scenario == NULL)
     {
-        if (env->evaluation_scenarios || env->offline_scenario != NULL)
-        {
-            env->episode_profiles[period] = POWER_GRID_PROFILE_P0_NOMINAL;
-        }
-        else
-        {
-            /* Puffer initializes a separate rng per vector environment. Mix high and low LCG bits. */
-            unsigned int sample = next_random(env);
-            env->episode_profiles[period] = (PowerGridProfile)(1 +
-                                                               sample % (POWER_GRID_NUM_PROFILES - 1));
-        }
+        /* One stress family per episode produces a coherent daily ramp. */
+        env->synthetic_profile = (PowerGridProfile)(
+            1 + next_random(env) % (POWER_GRID_NUM_PROFILES - 1));
     }
     env->scheduled_random_event_period = -1;
     env->scheduled_random_event_line = -1;
-    if (env->random_events && !env->evaluation_scenarios && !env->ac_power_flow)
+    if (env->random_events)
     {
         double unit_sample = (double)(next_random(env) >> 8) / 16777216.0;
         if (unit_sample < env->random_event_probability)
@@ -665,6 +587,12 @@ void c_reset(PowerGrid *env)
 
 void c_step(PowerGrid *env)
 {
+    if (env->single_episode_evaluation && env->log.n > 0.0f)
+    {
+        env->rewards[0] = 0.0f;
+        env->terminals[0] = 1.0f;
+        return;
+    }
     if (env->rendering && env->pending_reset)
     {
         c_reset(env);
@@ -673,7 +601,6 @@ void c_step(PowerGrid *env)
     PowerGridAppliedAction action = apply_agent_action(env, env->actions[0]);
     env->terminals[0] = 0.0f;
 
-    int new_trips = 0;
     PowerGridSolveStatus status;
     if (action.type == POWER_GRID_ACTION_INVALID)
     {
@@ -683,38 +610,36 @@ void c_step(PowerGrid *env)
     {
         status = power_grid_solve_environment(env);
         if (status == POWER_GRID_SOLVE_OK)
-            new_trips = power_grid_update_ac_protection(env);
+        {
+            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            {
+                double rho = env->solution.branch_rho[line];
+                env->episode.peak_line_loading =
+                    fmax(env->episode.peak_line_loading, rho);
+                env->episode.overloaded_line_steps += rho > 1.0;
+            }
+            power_grid_update_ac_protection(env);
+        }
         status = env->solution.status;
     }
     env->episode_step++;
 
-    int safe = 0;
+    int metric_safe = 0;
+    int reward_safe = 0;
     double constraint_cost = 0.0;
     if (status == POWER_GRID_SOLVE_OK)
     {
         /* Scheduled generator-P violations are exogenous data faults, not agent actions. */
-        safe = env->solution.max_rho <= 1.0 &&
-               (!env->ac_power_flow || env->ac_solution.voltage_violation_count == 0);
+        reward_safe = env->solution.max_rho <= 1.0;
+        metric_safe = reward_safe &&
+                      (!env->ac_power_flow || env->ac_solution.voltage_violation_count == 0);
         constraint_cost = POWER_GRID_CONGESTION_COST_WEIGHT * env->solution.congestion_cost;
-        if (env->ac_power_flow)
-        {
-            constraint_cost += POWER_GRID_AC_VOLTAGE_VIOLATION_COST_WEIGHT *
-                               env->ac_solution.voltage_violation_cost;
-            constraint_cost += POWER_GRID_AC_THERMAL_TRIP_PENALTY * new_trips;
-        }
-        env->episode.safe_steps += safe;
-        if (env->ac_power_flow)
-        {
-            env->episode.voltage_violation_steps +=
-                env->ac_solution.voltage_violation_count > 0;
-            env->episode.generator_p_violation_steps +=
-                env->ac_solution.generator_p_violation_count > 0;
-            env->episode.q_limit_events += env->ac_solution.q_limit_count;
-            env->episode.active_loss_mw_sum += env->ac_solution.total_p_loss_mw;
-        }
+        env->episode.safe_steps += metric_safe;
+        env->episode.demand_served_steps++;
     }
 
-    env->rewards[0] = calculate_reward(status, constraint_cost, action.switched, safe);
+    env->rewards[0] = calculate_reward(
+        status, constraint_cost, action.switched, reward_safe);
     env->terminals[0] = status != POWER_GRID_SOLVE_OK ||
                         env->episode_step >= POWER_GRID_EPISODE_STEPS;
 
@@ -725,48 +650,27 @@ void c_step(PowerGrid *env)
         return;
     }
 
+    int random_event_applied = 0;
     int next_period = env->episode_step / POWER_GRID_STEPS_PER_PERIOD;
     if (next_period != env->current_period)
     {
         env->current_period = next_period;
-        if (env->evaluation_scenarios)
-        {
-            const int maintenance_line = 16; /* Connected 9-14 daytime outage. */
-            if (next_period == 4)
-            {
-                env->line_maintenance[maintenance_line] = 1;
-                env->maintenance_was_closed[maintenance_line] =
-                    env->topology.line_closed[maintenance_line];
-                env->topology.line_closed[maintenance_line] = 0;
-                env->episode.maintenance_events++;
-            }
-            else if (next_period == 8)
-            {
-                env->line_maintenance[maintenance_line] = 0;
-                if (env->line_available[maintenance_line])
-                    env->topology.line_closed[maintenance_line] =
-                        env->maintenance_was_closed[maintenance_line];
-            }
-        }
         power_grid_set_operating_period(env, next_period);
         if (next_period == env->scheduled_random_event_period)
         {
-            PowerGridTopology normal;
-            power_grid_topology_normal(&normal);
-            if (memcmp(&env->topology, &normal, sizeof(normal)) == 0)
-            {
-                int line = env->scheduled_random_event_line;
-                env->line_available[line] = 0;
-                env->topology.line_closed[line] = 0;
-                env->active_random_event_line = line;
-                env->episode.random_events++;
-            }
+            int line = env->scheduled_random_event_line;
+            env->line_available[line] = 0;
+            env->topology.line_closed[line] = 0;
+            env->active_random_event_line = line;
+            env->episode.random_events++;
+            random_event_applied = 1;
         }
         status = power_grid_solve_environment(env);
     }
     if (status != POWER_GRID_SOLVE_OK)
     {
         /* New injections can expose an infeasible state without another agent action. */
+        env->log.event_failure += random_event_applied;
         env->rewards[0] = calculate_reward(status, 0.0, 0, 0);
         env->terminals[0] = 1.0f;
         env->episode_return += env->rewards[0];
@@ -780,7 +684,6 @@ void c_step(PowerGrid *env)
 void power_grid_allocate(PowerGrid *env)
 {
     env->num_agents = 1;
-    env->rng = 0;
     env->observations = calloc(POWER_GRID_OBS_SIZE, sizeof(float));
     env->actions = calloc(1, sizeof(float));
     env->rewards = calloc(1, sizeof(float));
@@ -852,8 +755,6 @@ static Color power_grid_line_color(const PowerGrid *env, int line)
 {
     if (!env->line_available[line])
         return POWER_GRID_OVERLOAD;
-    if (env->line_maintenance[line])
-        return POWER_GRID_WARN;
     if (!env->topology.line_closed[line])
         return POWER_GRID_OPEN;
     double rho = env->solution.branch_rho[line];
@@ -1013,7 +914,7 @@ static void power_grid_draw_branches(const PowerGrid *env)
         else
         {
             snprintf(text, sizeof(text), "%s  %s", POWER_GRID_BRANCH_NAMES[line],
-                     env->ac_power_flow && !env->line_available[line] ? "TRIPPED" : (env->line_maintenance[line] ? "MAINTENANCE" : "OPEN"));
+                     env->ac_power_flow && !env->line_available[line] ? "TRIPPED" : "OPEN");
         }
         power_grid_draw_label(label, text, power_grid_line_color(env, line));
     }
@@ -1192,15 +1093,12 @@ static void power_grid_draw_sidebar(const PowerGrid *env)
              x + width - 125, 68, 18, POWER_GRID_TEXT);
 
     char period_label[16];
-    if (env->evaluation_scenarios)
-        snprintf(period_label, sizeof(period_label), "%s",
-                 POWER_GRID_EVALUATION_TIMES[env->current_period]);
-    else if (env->offline_scenarios && env->offline_scenario != NULL)
+    if (env->offline_scenarios && env->offline_scenario != NULL)
         snprintf(period_label, sizeof(period_label), "%u",
                  env->offline_scenario->date_yyyymmdd);
     else
         snprintf(period_label, sizeof(period_label), "P%d",
-                 (int)env->episode_profiles[env->current_period]);
+                 (int)env->synthetic_profile);
     DrawText(TextFormat("STEP %d/%d   PERIOD %d  %s", env->episode_step,
                         POWER_GRID_EPISODE_STEPS, env->current_period, period_label),
              x + 18, 104, 17, POWER_GRID_TEXT);
