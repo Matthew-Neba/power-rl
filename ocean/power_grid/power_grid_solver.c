@@ -407,12 +407,7 @@ PowerGridSolveStatus power_grid_solve(const PowerGridTopology* topology,
         return result->status;
     }
 
-    if (normal_topology) {
-        for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
-            active[2 * bus] = 1;
-    } else {
-        build_topology_graph(topology, active, NULL);
-    }
+    build_topology_graph(topology, active, NULL);
     for (int gen = 0; gen < POWER_GRID_NUM_GENERATORS; gen++) {
         int node = power_grid_terminal_node(topology, POWER_GRID_GENERATOR_TERMINAL(gen),
             POWER_GRID_GENERATOR_BUSES[gen]);
