@@ -1,9 +1,7 @@
-/* Training uses the refined float DC factorization for throughput. The public
- * solver and standalone benchmark builds remain double precision unless this
- * environment binding selects the optimized path. */
+/* Training uses the refined float DC factorization for throughput. Standalone
+ * tools select float explicitly when they need to match this training path. */
 #define POWER_GRID_DC_FLOAT
 #include "power_grid_solver.c"
-#include "power_grid_ac.c"
 #include "power_grid.h"
 
 #define OBS_SIZE POWER_GRID_OBS_SIZE
@@ -27,6 +25,11 @@ void my_init(Env* env, Dict* kwargs) {
     env->random_outage_count = (int)dict_get(kwargs, "random_outage_count")->value;
     env->single_episode_evaluation =
         (int)dict_get(kwargs, "single_episode_evaluation")->value;
+    env->failure_reward = (float)dict_get(kwargs, "failure_reward")->value;
+    env->safe_step_reward = (float)dict_get(kwargs, "safe_step_reward")->value;
+    env->switch_penalty = (float)dict_get(kwargs, "switch_penalty")->value;
+    env->congestion_cost_weight =
+        (float)dict_get(kwargs, "congestion_cost_weight")->value;
 }
 
 void my_log(Log* log, Dict* out) {

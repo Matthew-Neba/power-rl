@@ -37,9 +37,10 @@ WEATHER_FIELDS = (
     "shortwave_radiation",
 )
 PERIODS = 12
+# These reference values define the network-independent cached renewable trace.
+# At runtime the environment converts each series back to a capacity factor and
+# applies the active network's solar and wind nameplates.
 NOMINAL_TOTAL_LOAD_MW = 4242.0
-# Approximate always-online conventional output retained while the two selected
-# IEEE-118 generators follow Alberta renewable capacity factors.
 FIXED_GENERATION_MW = 1500.0
 SOLAR_NAMEPLATE_MW = 500.0
 WIND_NAMEPLATE_MW = 700.0
@@ -175,8 +176,8 @@ def build_scenarios(aeso_rows, weather_rows, train_year: int, validation_year: i
                    renewable_reference[date.year, "wind"]))
                    for value in aeso[date]["wind"]]
 
-        # Preserve the observed renewable mix while keeping the IEEE-118 slack
-        # generator non-negative under the scaled aggregate load.
+        # Preserve the observed renewable mix while keeping the reference
+        # cache's residual generation non-negative.
         for period in range(PERIODS):
             maximum_renewable = max(
                 0.0, NOMINAL_TOTAL_LOAD_MW * load_scale[period] - FIXED_GENERATION_MW - 5.0

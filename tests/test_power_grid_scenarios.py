@@ -80,17 +80,19 @@ def test_checked_in_cache_has_provenance_and_expected_size():
     assert not any(token in header for token in ("NaN", "nan", "inf", "Infinity"))
 
 
-def test_checked_in_ieee118_case_has_expected_contract_and_provenance():
+def test_checked_in_ieee14_case_has_expected_contract():
     header = (ROOT / "ocean" / "power_grid" /
-              "power_grid_ieee118_data.h").read_text()
-    assert "MATPOWER case118.m SHA256:" in header
-    assert "POWER_GRID_IEEE118_SLACK_BUS 68" in header
-    assert "POWER_GRID_IEEE118_BRIDGE_COUNT 9" in header
+              "power_grid_ieee14_data.h").read_text()
+    assert "Canonical MATPOWER case14 electrical data" in header
+    assert "POWER_GRID_IEEE14_SLACK_BUS POWER_GRID_SLACK_BUS" in header
+    assert "POWER_GRID_IEEE14_BRIDGE_COUNT 1" in header
     assert header.count("static const PowerGridBranch") == 1
     assert header.count("{", header.index("POWER_GRID_BRANCHES"),
-                        header.index("POWER_GRID_BRANCH_NAMES")) == 187
-    assert "POWER_GRID_SOLAR_NAMEPLATE_MW 500.0" in header
-    assert "POWER_GRID_WIND_NAMEPLATE_MW 700.0" in header
+                        header.index("POWER_GRID_BRANCH_NAMES")) == 21
+    assert "POWER_GRID_SOLAR_NAMEPLATE_MW 30.0" in header
+    assert "POWER_GRID_WIND_NAMEPLATE_MW 45.0" in header
+    assert "POWER_GRID_SCENARIO_SOLAR_SOURCE_NAMEPLATE_MW 500.0" in header
+    assert "POWER_GRID_SCENARIO_WIND_SOURCE_NAMEPLATE_MW 700.0" in header
 
 
 def test_weather_request_is_explicit_and_reproducible():

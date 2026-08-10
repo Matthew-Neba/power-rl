@@ -1,7 +1,6 @@
 #define POWER_GRID_NO_RENDER
 
 #include "power_grid_solver.c"
-#include "power_grid_ac.c"
 #include "power_grid.h"
 
 #include <stdint.h>
@@ -62,11 +61,15 @@ static double immediate_action_value(const PowerGrid *env, int action)
     }
 
     PowerGridSolveResult solution;
-    if (power_grid_solve(&topology, &env->operating_point, &solution) !=
-        POWER_GRID_SOLVE_OK)
+    PowerGridACSolveResult ac_solution;
+    if (env->ac_power_flow)
     {
-        return -INFINITY;
+        power_grid_ac_solve(&topology, &env->operating_point, &ac_solution);
+        power_grid_ac_to_compatible(&ac_solution, &solution);
     }
+    else if (power_grid_solve(&topology, &env->operating_point, &solution) !=
+             POWER_GRID_SOLVE_OK)
+        return -INFINITY;
     if (solution.status != POWER_GRID_SOLVE_OK)
         return -INFINITY;
 
@@ -74,18 +77,21 @@ static double immediate_action_value(const PowerGrid *env, int action)
     double max_rho = 0.0;
     for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
     {
-        double rating = POWER_GRID_BRANCHES[line].thermal_limit_mw *
+        double rating = (env->ac_power_flow ? power_grid_ac_branch_rating_mva(line) :
+                         POWER_GRID_BRANCHES[line].thermal_limit_mw) *
                         env->branch_rating_scale;
-        double loading = fabs(solution.branch_flow_mw[line]);
+        double loading = env->ac_power_flow ?
+            fmax(ac_solution.branch_from_mva[line], ac_solution.branch_to_mva[line]) :
+            fabs(solution.branch_flow_mw[line]);
         double rho = loading / rating;
         max_rho = fmax(max_rho, rho);
         if (rho > 1.0)
             congestion_cost += (rho - 1.0) * (rho - 1.0);
     }
     int switched = memcmp(&topology, &env->topology, sizeof(topology)) != 0;
-    return POWER_GRID_SAFE_STEP_REWARD * (max_rho <= 1.0) -
-           POWER_GRID_CONGESTION_COST_WEIGHT * congestion_cost -
-           POWER_GRID_SWITCH_PENALTY * switched;
+    return env->safe_step_reward * (max_rho <= 1.0) -
+           env->congestion_cost_weight * congestion_cost -
+           env->switch_penalty * switched;
 }
 
 static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t *rng)

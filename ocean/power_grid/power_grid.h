@@ -2,7 +2,6 @@
 #define POWER_GRID_H
 
 #include "power_grid_solver.h"
-#include "power_grid_ac.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -13,7 +12,7 @@
 #include "raylib.h"
 #endif
 
-#define POWER_GRID_OBS_SIZE 1985
+#define POWER_GRID_OBS_SIZE 221
 #define POWER_GRID_EPISODE_STEPS 72
 #define POWER_GRID_STEPS_PER_PERIOD 6
 #define POWER_GRID_NUM_PERIODS (POWER_GRID_EPISODE_STEPS / POWER_GRID_STEPS_PER_PERIOD)
@@ -32,7 +31,7 @@ typedef struct {
 #include "power_grid_scenarios_data.h"
 
 /* Steady-state IEEE 738 ampacity normalized to median 2019 ERA5 conditions.
- * IEEE-118 has no physical routes, so all lines use the published 26/7 Drake
+ * IEEE-14 has no physical routes, so all lines use the published 26/7 Drake
  * ACSR example parameters and perpendicular wind. Measured irradiance is
  * treated as effective incident flux. Synthetic ratings remain capped at
  * 0.90x-1.35x until real conductor and route data are available. */
@@ -88,19 +87,11 @@ static inline double power_grid_weather_rating_scale(
     return fmin(1.35, fmax(0.90, ampacity[0] / ampacity[1]));
 }
 
-/* Historical scenarios are immutable compile-time data. Cache their twelve
- * weather-rating scales per worker so the IEEE-738 pow/sqrt path runs once
- * per scenario rather than once per episode period. */
-static __thread unsigned char power_grid_weather_scale_ready[
-    POWER_GRID_OFFLINE_SCENARIO_COUNT];
-static __thread double power_grid_weather_scale_cache[
-    POWER_GRID_OFFLINE_SCENARIO_COUNT][POWER_GRID_NUM_PERIODS];
-
 /* Reward configuration. */
-#define POWER_GRID_FAILURE_REWARD (-5.0f)
-#define POWER_GRID_SAFE_STEP_REWARD 0.2f
-#define POWER_GRID_SWITCH_PENALTY 0.001f
-#define POWER_GRID_CONGESTION_COST_WEIGHT 1.0
+#define POWER_GRID_DEFAULT_FAILURE_REWARD (-1.0f)
+#define POWER_GRID_DEFAULT_SAFE_STEP_REWARD 0.01f
+#define POWER_GRID_DEFAULT_SWITCH_PENALTY 0.01f
+#define POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT 1.0f
 
 #define POWER_GRID_LINE_OBS_FEATURES 5
 #define POWER_GRID_LINE_OBS_OFFSET 0
@@ -119,7 +110,7 @@ static __thread double power_grid_weather_scale_cache[
 
 _Static_assert(POWER_GRID_GENERATOR_Q_OBS_OFFSET + POWER_GRID_NUM_GENERATORS ==
                    POWER_GRID_OBS_SIZE,
-               "power-grid observation layout must total 1985 floats");
+               "power-grid observation layout must total 221 floats");
 _Static_assert(POWER_GRID_EPISODE_STEPS % POWER_GRID_STEPS_PER_PERIOD == 0,
                "power-grid periods must divide the episode evenly");
 _Static_assert(POWER_GRID_ACTION_NONE == 0 && POWER_GRID_ACTION_LINE == 1 &&
@@ -214,6 +205,10 @@ typedef struct
     double random_event_probability;
     int random_outage_count;
     int single_episode_evaluation;
+    float failure_reward;
+    float safe_step_reward;
+    float switch_penalty;
+    float congestion_cost_weight;
     double branch_rating_scale;
     double ambient_temperature_c;
     double wind_speed_mps;
@@ -230,9 +225,10 @@ static int power_grid_generator_index_at_bus(int bus)
     return -1;
 }
 
-/* Preserve the canonical generator participation pattern while making the
- * slack carry roughly nine percent of demand. Alberta wind and solar remain
- * exogenous; dispatchable online generators absorb the remaining change. */
+/* Preserve IEEE-14's online conventional participation while treating the
+ * Alberta-derived wind and solar traces as exogenous. Dispatchable headroom
+ * attempts to cover 91% of demand; the slack balances any remaining shortfall
+ * once the much smaller IEEE-14 generator fleet reaches its limits. */
 static void power_grid_redispatch(PowerGridOperatingPoint *point)
 {
     int solar = power_grid_generator_index_at_bus(POWER_GRID_SOLAR_GENERATOR_BUS);
@@ -292,19 +288,6 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
     if (env->offline_scenarios && env->offline_scenario != NULL)
     {
         const PowerGridOfflineScenario *scenario = env->offline_scenario;
-        size_t scenario_index = (size_t)(scenario - POWER_GRID_OFFLINE_SCENARIOS);
-        if (scenario_index < POWER_GRID_OFFLINE_SCENARIO_COUNT &&
-            !power_grid_weather_scale_ready[scenario_index])
-        {
-            for (int cached_period = 0; cached_period < POWER_GRID_NUM_PERIODS;
-                 cached_period++)
-                power_grid_weather_scale_cache[scenario_index][cached_period] =
-                    power_grid_weather_rating_scale(
-                        scenario->ambient_temperature_c[cached_period],
-                        scenario->wind_speed_mps[cached_period],
-                        scenario->solar_irradiance_wm2[cached_period]);
-            power_grid_weather_scale_ready[scenario_index] = 1;
-        }
         power_grid_operating_point_nominal(&env->operating_point);
         for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
             env->operating_point.load_mw[load] *= scenario->load_scale[period];
@@ -312,16 +295,19 @@ static void power_grid_set_operating_period(PowerGrid *env, int period)
             env->operating_point.generator_mw[generator] *= scenario->load_scale[period];
         int solar = power_grid_generator_index_at_bus(POWER_GRID_SOLAR_GENERATOR_BUS);
         int wind = power_grid_generator_index_at_bus(POWER_GRID_WIND_GENERATOR_BUS);
-        env->operating_point.generator_mw[solar] = scenario->solar_mw[period];
-        env->operating_point.generator_mw[wind] = scenario->wind_mw[period];
+        env->operating_point.generator_mw[solar] = scenario->solar_mw[period] *
+            POWER_GRID_SOLAR_NAMEPLATE_MW /
+            POWER_GRID_SCENARIO_SOLAR_SOURCE_NAMEPLATE_MW;
+        env->operating_point.generator_mw[wind] = scenario->wind_mw[period] *
+            POWER_GRID_WIND_NAMEPLATE_MW /
+            POWER_GRID_SCENARIO_WIND_SOURCE_NAMEPLATE_MW;
         power_grid_redispatch(&env->operating_point);
         env->ambient_temperature_c = scenario->ambient_temperature_c[period];
         env->wind_speed_mps = scenario->wind_speed_mps[period];
         env->solar_irradiance_wm2 = scenario->solar_irradiance_wm2[period];
-        env->branch_rating_scale = scenario_index < POWER_GRID_OFFLINE_SCENARIO_COUNT ?
-            power_grid_weather_scale_cache[scenario_index][period] :
-            power_grid_weather_rating_scale(env->ambient_temperature_c,
-                env->wind_speed_mps, env->solar_irradiance_wm2);
+        env->branch_rating_scale = power_grid_weather_rating_scale(
+            env->ambient_temperature_c, env->wind_speed_mps,
+            env->solar_irradiance_wm2);
     }
     else
     {
@@ -355,6 +341,7 @@ static void power_grid_apply_dynamic_ratings(PowerGrid *env)
 
     env->solution.max_rho = 0.0;
     env->solution.congestion_cost = 0.0;
+    env->solution.overloaded_branch_count = 0;
     if (env->ac_power_flow)
     {
         env->ac_solution.max_rho = 0.0;
@@ -381,6 +368,7 @@ static void power_grid_apply_dynamic_ratings(PowerGrid *env)
         {
             double overload = rho - 1.0;
             env->solution.congestion_cost += overload * overload;
+            env->solution.overloaded_branch_count++;
             if (env->ac_power_flow)
                 env->ac_solution.congestion_cost += overload * overload;
         }
@@ -582,13 +570,14 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     return action;
 }
 
-static float calculate_reward(PowerGridSolveStatus solve_status,
+static float calculate_reward(const PowerGrid *env,
+                              PowerGridSolveStatus solve_status,
                               double constraint_cost, int switched, int safe)
 {
     if (solve_status != POWER_GRID_SOLVE_OK)
-        return POWER_GRID_FAILURE_REWARD;
-    return (float)(-constraint_cost - POWER_GRID_SWITCH_PENALTY * switched +
-                   POWER_GRID_SAFE_STEP_REWARD * safe);
+        return env->failure_reward;
+    return (float)(-constraint_cost - env->switch_penalty * switched +
+                   env->safe_step_reward * safe);
 }
 
 static void power_grid_finish_episode(PowerGrid *env)
@@ -761,7 +750,7 @@ void c_step(PowerGrid *env)
     env->terminals[0] = 0.0f;
     /* In DC mode, a no-op before a period transition leaves every value in the
      * observation vector unchanged. Track whether a later state mutation
-     * actually requires rebuilding the 1,985-float observation. */
+     * actually requires rebuilding the 221-float observation. */
     int observations_dirty = action.switched || env->ac_power_flow;
     int observation_only_terminal = action.observation_only_terminal;
 
@@ -779,7 +768,7 @@ void c_step(PowerGrid *env)
     else
     {
         status = power_grid_solve_environment(env);
-        if (status == POWER_GRID_SOLVE_OK)
+        if (status == POWER_GRID_SOLVE_OK && env->ac_power_flow)
         {
             for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
             {
@@ -799,17 +788,26 @@ void c_step(PowerGrid *env)
     double constraint_cost = 0.0;
     if (status == POWER_GRID_SOLVE_OK)
     {
+        /* DC may reuse an unchanged solution, but loading diagnostics describe
+         * every served step and must still be accumulated on cache/no-op paths. */
+        if (!env->ac_power_flow)
+        {
+            env->episode.peak_line_loading = fmax(
+                env->episode.peak_line_loading, env->solution.max_rho);
+            env->episode.overloaded_line_steps +=
+                env->solution.overloaded_branch_count;
+        }
         /* Scheduled generator-P violations are exogenous data faults, not agent actions. */
         reward_safe = env->solution.max_rho <= 1.0;
         metric_safe = reward_safe &&
                       (!env->ac_power_flow || env->ac_solution.voltage_violation_count == 0);
-        constraint_cost = POWER_GRID_CONGESTION_COST_WEIGHT * env->solution.congestion_cost;
+        constraint_cost = env->congestion_cost_weight * env->solution.congestion_cost;
         env->episode.safe_steps += metric_safe;
         env->episode.demand_served_steps++;
     }
 
     env->rewards[0] = calculate_reward(
-        status, constraint_cost, action.switched, reward_safe);
+        env, status, constraint_cost, action.switched, reward_safe);
     env->terminals[0] = status != POWER_GRID_SOLVE_OK ||
                         env->episode_step >= POWER_GRID_EPISODE_STEPS;
 
@@ -845,7 +843,7 @@ void c_step(PowerGrid *env)
     {
         /* New injections can expose an infeasible state without another agent action. */
         env->log.event_failure += random_event_applied;
-        env->rewards[0] = calculate_reward(status, 0.0, 0, 0);
+        env->rewards[0] = calculate_reward(env, status, 0.0, 0, 0);
         env->terminals[0] = 1.0f;
         env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);
@@ -871,6 +869,10 @@ void power_grid_allocate(PowerGrid *env)
     env->rewards = calloc(1, sizeof(float));
     env->terminals = calloc(1, sizeof(float));
     env->owns_buffers = 1;
+    env->failure_reward = POWER_GRID_DEFAULT_FAILURE_REWARD;
+    env->safe_step_reward = POWER_GRID_DEFAULT_SAFE_STEP_REWARD;
+    env->switch_penalty = POWER_GRID_DEFAULT_SWITCH_PENALTY;
+    env->congestion_cost_weight = POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT;
     env->branch_rating_scale = 1.0;
 }
 
@@ -893,21 +895,15 @@ static const Color POWER_GRID_BB2 = {190, 105, 255, 255};
 static const Color POWER_GRID_TEXT = {225, 232, 242, 255};
 static const Color POWER_GRID_MUTED = {145, 158, 178, 255};
 
-static Vector2 POWER_GRID_STATION_POSITIONS[POWER_GRID_NUM_SUBSTATIONS];
+static const Vector2 POWER_GRID_STATION_POSITIONS[POWER_GRID_NUM_SUBSTATIONS] = {
+    {100, 285}, {315, 205}, {570, 135}, {575, 355}, {305, 415},
+    {455, 620}, {785, 350}, {1020, 205}, {1020, 485}, {1250, 570},
+    {870, 635}, {530, 835}, {870, 845}, {1235, 810},
+};
 
 static void power_grid_prepare_layout(void)
 {
-    static int initialized;
-    if (initialized)
-        return;
-    for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
-    {
-        POWER_GRID_STATION_POSITIONS[bus] = (Vector2){
-            58.0f + 112.0f * (bus % 12),
-            108.0f + 83.0f * (bus / 12),
-        };
-    }
-    initialized = 1;
+    /* IEEE-14 uses the fixed single-line layout above. */
 }
 
 static Color power_grid_line_color(const PowerGrid *env, int line)
@@ -1211,7 +1207,7 @@ void c_render(PowerGrid *env)
     {
         env->rendering = 1;
         InitWindow(POWER_GRID_RENDER_WIDTH, POWER_GRID_RENDER_HEIGHT,
-                   "IEEE-118 Power Grid Topology Control");
+                   "IEEE-14 Power Grid Topology Control");
         SetTargetFPS(POWER_GRID_RENDER_FPS);
     }
     if (IsKeyDown(KEY_ESCAPE))
@@ -1219,7 +1215,7 @@ void c_render(PowerGrid *env)
     BeginDrawing();
     ClearBackground(POWER_GRID_BG);
     power_grid_prepare_layout();
-    DrawText(TextFormat("IEEE-118  |  %s TOPOLOGY OVERVIEW",
+    DrawText(TextFormat("IEEE-14  |  %s TOPOLOGY OVERVIEW",
                         env->ac_power_flow ? "AC VALIDATION" : "DC"),
              22, 14, 32, POWER_GRID_TEXT);
     DrawText(env->ac_power_flow ? "Compact 12-column layout; line color shows MVA loading, dotted lines are open." : "Compact 12-column layout; line color shows DC MW loading, dotted lines are open.",

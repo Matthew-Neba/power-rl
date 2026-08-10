@@ -1,5 +1,4 @@
 #include "power_grid_solver.c"
-#include "power_grid_ac.c"
 #include "power_grid.h"
 
 int main(void) {

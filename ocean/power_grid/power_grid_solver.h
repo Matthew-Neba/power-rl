@@ -3,12 +3,12 @@
 
 #include <stddef.h>
 
-#define POWER_GRID_NUM_SUBSTATIONS 118
+#define POWER_GRID_NUM_SUBSTATIONS 14
 #define POWER_GRID_NUM_BUSBARS 2
 #define POWER_GRID_NUM_NODES (POWER_GRID_NUM_SUBSTATIONS * POWER_GRID_NUM_BUSBARS)
-#define POWER_GRID_NUM_BRANCHES 186
-#define POWER_GRID_NUM_GENERATORS 54
-#define POWER_GRID_NUM_LOADS 99
+#define POWER_GRID_NUM_BRANCHES 20
+#define POWER_GRID_NUM_GENERATORS 5
+#define POWER_GRID_NUM_LOADS 11
 #define POWER_GRID_NUM_TERMINALS \
     (2 * POWER_GRID_NUM_BRANCHES + POWER_GRID_NUM_GENERATORS + POWER_GRID_NUM_LOADS)
 #define POWER_GRID_BASE_MVA 100.0
@@ -35,7 +35,7 @@ typedef struct {
     double thermal_limit_mw;
 } PowerGridBranch;
 
-#include "power_grid_ieee118_data.h"
+#include "power_grid_ieee14_data.h"
 
 typedef struct {
     unsigned char line_closed[POWER_GRID_NUM_BRANCHES];
@@ -70,6 +70,7 @@ typedef struct {
     double substation_injection_mw[POWER_GRID_NUM_SUBSTATIONS];
     double congestion_cost;
     double max_rho;
+    int overloaded_branch_count;
 } PowerGridSolveResult;
 
 typedef enum {
@@ -126,5 +127,69 @@ const char* power_grid_action_name(int action, char* buffer, size_t size);
 /* Shared pivoted dense solve used by the small DC and AC nodal systems. */
 int power_grid_solve_dense(double* matrix, double* rhs, double* solution,
     int dimensions, int stride);
+
+/* AC evaluation uses the same topology and operating-point model as DC. */
+#define POWER_GRID_AC_MAX_ITERATIONS 50
+#define POWER_GRID_AC_VOLTAGE_MIN 0.90
+#define POWER_GRID_AC_VOLTAGE_MAX 1.10
+#define POWER_GRID_THERMAL_TRIP_THRESHOLD 1.0
+#define POWER_GRID_THERMAL_COOLING_PER_STEP 0.02
+
+typedef enum {
+    POWER_GRID_AC_OK = 0,
+    POWER_GRID_AC_TOPOLOGY_FAILURE,
+    POWER_GRID_AC_INVALID_INPUT,
+    POWER_GRID_AC_SINGULAR,
+    POWER_GRID_AC_DIVERGED,
+    POWER_GRID_AC_NONFINITE,
+} PowerGridACStatus;
+
+typedef struct {
+    PowerGridACStatus status;
+    PowerGridSolveStatus topology_status;
+    int converged;
+    int iterations;
+    int component_count;
+    int active_node_count;
+    int q_limit_count;
+    int voltage_violation_count;
+    int generator_p_violation_count;
+
+    double node_voltage_pu[POWER_GRID_NUM_NODES];
+    double node_angle_rad[POWER_GRID_NUM_NODES];
+    double branch_from_p_mw[POWER_GRID_NUM_BRANCHES];
+    double branch_from_q_mvar[POWER_GRID_NUM_BRANCHES];
+    double branch_to_p_mw[POWER_GRID_NUM_BRANCHES];
+    double branch_to_q_mvar[POWER_GRID_NUM_BRANCHES];
+    double branch_from_mva[POWER_GRID_NUM_BRANCHES];
+    double branch_to_mva[POWER_GRID_NUM_BRANCHES];
+    double branch_rho[POWER_GRID_NUM_BRANCHES];
+    double generator_p_mw[POWER_GRID_NUM_GENERATORS];
+    double generator_q_mvar[POWER_GRID_NUM_GENERATORS];
+    double substation_injection_mw[POWER_GRID_NUM_SUBSTATIONS];
+
+    double congestion_cost;
+    double max_rho;
+    double min_voltage_pu;
+    double max_voltage_pu;
+    double voltage_violation_cost;
+    double generator_p_violation_mw;
+    double total_p_loss_mw;
+    double total_q_loss_mvar;
+} PowerGridACSolveResult;
+
+PowerGridACStatus power_grid_ac_solve(
+    const PowerGridTopology* topology,
+    const PowerGridOperatingPoint* point,
+    PowerGridACSolveResult* result
+);
+const char* power_grid_ac_status_name(PowerGridACStatus status);
+double power_grid_ac_load_q_mvar(const PowerGridOperatingPoint* point, int load);
+double power_grid_ac_branch_rating_mva(int branch);
+double power_grid_ac_thermal_step(double previous_stress, double rho);
+void power_grid_ac_to_compatible(
+    const PowerGridACSolveResult* ac,
+    PowerGridSolveResult* compatible
+);
 
 #endif
