@@ -1,11 +1,10 @@
-# IEEE-14 Power-Grid Topology Control Design
+# IEEE-14 Power-Grid RL Environment
 
 ## Status
 
-The environment is scaled back to canonical MATPOWER IEEE-14 while retaining the optimized
-IEEE-118-era solver, cached historical/synthetic scenario curriculum, randomized persistent line
-failures, dynamic ratings, AC validation, reward sweep controls, security metrics, renderer
-improvements, and deterministic baseline tooling.
+The IEEE-14 environment, solver audit, scenario randomization, outage recovery controls, and
+continuous interactive runtime are implemented. The checked-in policy is trained with DC physics;
+AC is retained as an explicit validation mode.
 
 ## Contract
 
@@ -14,18 +13,20 @@ improvements, and deterministic baseline tooling.
 | Substations / electrical nodes | 14 / 28 |
 | Branches / generators / loads | 20 / 5 / 11 |
 | Equipment terminals / couplers | 56 / 14 |
-| Discrete unmasked actions | 91 |
+| Environment actions | 91 |
+| PPO actions | 21 (no-op + 20 line switches) |
 | Float observations | 221 |
-| Episode length | 72 steps / 12 periods |
+| Training episode | 72 steps / 12 periods |
+| Interactive runtime | continuous; periods wrap without reset |
 
-The action space remains no-op plus line, terminal-busbar, and coupler toggles. No safety mask is
-applied; unsafe topology must be learned through consequence. Connectivity failure and numerical
-solver failure remain distinct.
+The general environment retains line, terminal-busbar, and coupler actions. PPO is intentionally
+restricted to no-op and line switching. Invalid or non-improving recovery commands are rejected
+transactionally, so a bad command does not turn a recoverable contingency into a blackout.
 
 ## Physics and performance
 
-DC training retains topology validation and factorization caches, branch-constant precomputation,
-minimum-degree sparse Cholesky, float factorization with residual refinement, and no-op reuse.
+DC training retains topology validation, branch-constant precomputation, minimum-degree sparse
+Cholesky, float factorization with residual refinement, and no-op reuse.
 AC evaluation retains Newton-Raphson, PV/PQ switching, voltage and reactive limits, branch-end MVA,
 losses, and inverse-time thermal trips.
 
@@ -34,7 +35,7 @@ single-line contingencies, randomized topology and injection changes, canonical 
 agreement, complex-power balance, scenario selection, multi-outage scheduling, reward controls,
 and incremental/full observation parity.
 
-Measured throughput on the current system:
+Previously measured throughput on this system:
 
 - C environment only: 7.43M no-op, 1.17M mixed, 652K all-random SPS.
 - Full CUDA PPO, 256x3 network, 1,024 agents, 16 threads: approximately 308K-328K SPS,
@@ -42,12 +43,22 @@ Measured throughput on the current system:
 
 ## Scenario and evaluation policy
 
-The read-only cache keeps 2019 training and disjoint 2020 validation days. AESO/ERA5 traces retain
-their chronological correlation. Demand scales the 259 MW IEEE-14 case; source renewable traces are
-converted to capacity factors and mapped to 30 MW solar and 45 MW wind. Synthetic profiles and
-weather-adjusted ratings remain mixed into training.
+The read-only cache keeps 2019 training and disjoint 2020 validation days. Training samples 65%
+recorded days and 35% synthetic stress profiles. AESO/ERA5 demand, renewable, temperature, wind,
+and solar traces retain their daily correlation and drive injections and IEEE-738-style ratings.
 
-Event episodes use three distinct non-bridge outages at distinct later periods, and the combined
-set must preserve normal-topology DC connectivity. AC security is evaluated rather than assumed.
-Baseline tooling compares PPO with no-op, random, safe-random, and greedy policies under identical
-seeds and held-out scenarios.
+Training now guarantees two distinct non-islanding outages per episode to match the live N-2 limit.
+The interactive controller in `power_grid_user.h` accepts at most two user-selected outages,
+rejects invalid combinations, and restores the pre-contingency topology when the final outage is
+cleared. This state and mouse input are separate from the training environment. The app selects an
+unbounded episode limit so time and operating conditions continue indefinitely.
+
+Held-out 2020 evaluation of the deployed checkpoint (4,096 episodes):
+
+- N-1: PPO perf 0.9186 vs greedy 0.9184; zero failures and 100% demand served.
+- N-2: PPO perf 0.8137 vs greedy 0.8172; zero failures and 100% demand served.
+- Repeated exhaustive DC outage windows: PPO safe-step fraction 0.5591 vs greedy 0.5531,
+  with no terminal failures across 2,184 steps for either policy.
+
+The remaining limitation is N-2 efficiency: PPO survives but is still slightly below greedy on the
+independent held-out N-2 perf metric. Do not present that case as a PPO win.

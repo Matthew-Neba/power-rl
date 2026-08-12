@@ -79,3 +79,12 @@ def test_power_grid_float_environment(tmp_path):
         optimized=True,
         dc_float=True,
     )
+
+
+def test_power_grid_user_controller(tmp_path):
+    compile_and_run(
+        tmp_path,
+        "test_power_grid_user",
+        [ROOT / "tests/test_power_grid_user.c"],
+        optimized=True,
+    )
