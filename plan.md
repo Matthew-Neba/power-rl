@@ -3,8 +3,8 @@
 ## Status
 
 The IEEE-14 environment, solver audit, scenario randomization, outage recovery controls, and
-continuous interactive runtime are implemented. The checked-in policy is trained with DC physics;
-AC is retained as an explicit validation mode.
+interactive web runtime are implemented. The checked-in policy is trained with DC physics; AC is
+retained as an explicit validation mode.
 
 ## Contract
 
@@ -17,7 +17,7 @@ AC is retained as an explicit validation mode.
 | PPO actions | 91 (all environment actions) |
 | Float observations | 221 |
 | Training episode | 72 steps / 12 periods |
-| Interactive runtime | continuous; periods wrap without reset |
+| Interactive runtime | 72-step episodes; fresh environment and policy after terminal |
 
 PPO can select every line, terminal-busbar, and coupler action. Invalid topology commands and
 outage-sensitive topology choices have their real episode-ending consequences; the environment
@@ -47,40 +47,50 @@ The read-only cache keeps 2019 training and disjoint 2020 validation days. Train
 recorded days and 35% synthetic stress profiles. AESO/ERA5 demand, renewable, temperature, wind,
 and solar traces retain their daily correlation and drive injections and IEEE-738-style ratings.
 
-Training now guarantees two distinct non-islanding outages per episode to match the live N-2 limit.
+Training now guarantees one or two non-islanding outages per episode, covering N-1 and N-2 while
+matching the live N-2 limit.
 The interactive controller in `power_grid_user.h` accepts at most two user-selected outages,
 rejects invalid combinations, and restores the pre-contingency topology when the final outage is
 cleared. This state and mouse input are separate from the training environment. The app retains
 automatic outages and uses ordinary 72-step episodes. A terminal state starts a fresh environment
 episode and a newly initialized policy instance.
 
-Held-out 2020 evaluation of the deployed checkpoint (4,096 episodes):
-
-- N-1: PPO perf 0.9186 vs greedy 0.9184; zero failures and 100% demand served.
-- N-2: PPO perf 0.8137 vs greedy 0.8172; zero failures and 100% demand served.
-- Repeated exhaustive DC outage windows: PPO safe-step fraction 0.5591 vs greedy 0.5531,
-  with no terminal failures across 2,184 steps for either policy.
-
-These results belong to the superseded 21-action phase-1 checkpoint. Phase 2 restores all 91
-actions and must be re-trained and re-evaluated before new performance claims are made. The web app
-offers both stochastic Puffer-style sampling and deterministic argmax inference.
+The web app offers both stochastic Puffer-style sampling and deterministic argmax inference. It
+keeps automatic N-2 outages enabled, reports an automatic outage that immediately invalidates the
+topology, and starts a new policy instance only when the episode terminates. Training likewise
+preserves memory across rollout boundaries and clears only a vector slot whose episode terminated.
 
 ## Phase-2 training audit
 
-The unrestricted 91-action PPO was trained and screened with direct N-1/N-2, staged N-1 then N-2,
-recorded-day adaptation, congestion shaping, and an early-outage recovery curriculum. The strongest
-checkpoints were specialists rather than one policy that achieved both results:
+The deployed phase-2 checkpoint is one 256x3 recurrent PPO policy with all 91 actions. It was
+selected after unrestricted PPO curricula, reward-scale experiments, standard on-policy
+fine-tuning, logit-temperature tests, and full-action imitation probes. Selection used 2019 data;
+the fixed 2020 gate was reserved for finalists.
 
-- fixed 256-episode N-1 gate: specialist PPO `0.9098` perf with zero failures, greedy `0.9153`,
-  and lookahead `0.9171`; this checkpoint scored `0.7525` on N-2 with `6.64%` failures;
-- fixed 256-episode N-2 gate: specialist PPO `0.7918` perf with `0.78%` failures, greedy `0.8026`,
-  and lookahead `0.8049`, both with `1.95%` failures; this checkpoint scored `0.9039` on N-1
-  with zero failures.
+After recurrent-state handling was corrected, an additional mixed N-1/N-2 continuation and an
+overloaded recovery curriculum were screened. Both were rejected because they improved neither
+held-out performance nor the overall N-1/N-2 tradeoff, so the deployed checkpoint was not replaced.
 
-These are deterministic-argmax results. No action masking, rollback, fallback, forced no-op, or
-line-only restriction was used. PPO was more reliable on N-2 but remained behind both baselines on
-safe-step performance, so no phase-2 checkpoint was deployed as a baseline-beating policy.
+Fixed 256-episode held-out 2020 results (seed offset 50,000):
 
-The old phase-1 checkpoint was also retested under the current honest transition rules. Its N-1
-perf fell to `0.5908` with `30.9%` failures, confirming that it must not be reused as a phase-2
-result. Temporary checkpoints and benchmark binaries were removed after the audit.
+| Scenario / inference | PPO perf | PPO failures | Greedy perf | Lookahead perf |
+|---|---:|---:|---:|---:|
+| N-1 argmax | 0.9065 | 0.00% | 0.9153 | 0.9171 |
+| N-1 stochastic | 0.9063 | 0.00% | 0.9153 | 0.9171 |
+| N-2 argmax | 0.7978 | 0.78% | 0.8026 | 0.8049 |
+| N-2 stochastic | 0.7898 | 1.56% | 0.8026 | 0.8049 |
+
+The N-2 greedy and lookahead baselines each failed in 1.95% of episodes, so deterministic PPO was
+more reliable but did not beat their safe-step performance. No masking, rollback, fallback,
+forced no-op, or line-only restriction is used. The deployed model is therefore an honest strong
+unrestricted result, not a baseline-beating claim.
+
+## Final validation
+
+The incumbent checkpoint is `resources/power_grid/policy.bin` (256 hidden units, three MinGRU
+layers, SHA-256 `e12e265b68308bb6547419f4e121769de99bf79f7563240eb961f1c38e045fcd`).
+The final gate reran all four inference/baseline rows above on the fixed held-out set. The complete
+power-grid Python/C suite passed (16 tests), and both the native CUDA float build and Emscripten web
+build completed successfully. Temporary training, benchmark, web-build, and downloaded dependency
+artifacts were removed after validation; unrelated user-owned sweep and tool directories were not
+modified.

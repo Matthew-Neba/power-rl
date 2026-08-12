@@ -151,6 +151,23 @@ void rollouts(pybind11::object pufferl_obj) {
         }
     }
 
+    // Preserve the exact recurrent state used for the first observation in
+    // this rollout. A terminal marks that observation as a new episode, so its
+    // initial state is zero even though the inference kernel has not cleared
+    // the live state yet.
+    int agents_per_buffer = pufferl.vec->total_agents / pufferl.hypers.num_buffers;
+    int layers = pufferl.hypers.num_layers;
+    int hidden = pufferl.hypers.hidden_size;
+    int state_values = agents_per_buffer * layers * hidden;
+    for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+        snapshot_rollout_states<<<grid_size(state_values), BLOCK_SIZE, 0,
+            pufferl.default_stream>>>(
+                pufferl.rollout_states.data, pufferl.buffer_states[i].data,
+                pufferl.env.terminals.data + i * agents_per_buffer,
+                i * agents_per_buffer, agents_per_buffer, layers, hidden);
+    }
+    cudaStreamSynchronize(pufferl.default_stream);
+
     static_vec_omp_step(pufferl.vec);
     float sec = (float)(wall_clock() - t0);
     pufferl.profile.accum[PROF_ROLLOUT] += sec * 1000.0f;  // store as ms

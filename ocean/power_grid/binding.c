@@ -24,6 +24,8 @@ void my_init(Env* env, Dict* kwargs) {
     env->random_events = (int)dict_get(kwargs, "random_events")->value;
     env->random_event_probability = dict_get(kwargs, "random_event_probability")->value;
     env->random_outage_count = (int)dict_get(kwargs, "random_outage_count")->value;
+    env->random_outage_count_min =
+        (int)dict_get(kwargs, "random_outage_count_min")->value;
     env->random_outages_at_reset =
         (int)dict_get(kwargs, "random_outages_at_reset")->value;
     env->reset_outage_probability =

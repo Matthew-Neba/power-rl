@@ -211,6 +211,11 @@ static BenchmarkMetrics run_baseline(
         learned = make_puffernet(weights, 1, POWER_GRID_OBS_SIZE,
                                  POWER_GRID_POLICY_HIDDEN_SIZE,
                                  POWER_GRID_POLICY_NUM_LAYERS, action_sizes, 1);
+        if (learned == NULL)
+        {
+            free(weights);
+            exit(1);
+        }
     }
     for (int episode_index = 0; episode_index < episodes; episode_index++)
     {

@@ -224,6 +224,10 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
+    load_path = args.get('load_model_path')
+    if load_path is not None:
+        backend.load_weights(pufferl, load_path)
+
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
@@ -582,6 +586,20 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     backend.close(pufferl)
     return logs
 
+def _parse_config_override(value, dtype):
+    if value == 'auto':
+        return value
+    if dtype is bool:
+        normalized = value.lower()
+        if normalized in ('true', '1', 'yes', 'on'):
+            return True
+        if normalized in ('false', '0', 'no', 'off'):
+            return False
+        raise argparse.ArgumentTypeError(
+            f"expected a boolean (true/false), received {value!r}")
+    return dtype(value)
+
+
 def load_config(env_name):
     parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
     parser.add_argument('--load-model-path', type=str, default=None,
@@ -636,7 +654,7 @@ def load_config(env_name):
             dtype = type(value)
             parser.add_argument(
                 fmt.replace('_', '-'), default=value,
-                type=lambda v, t=dtype: v if v == 'auto' else t(v),
+                type=lambda v, t=dtype: _parse_config_override(v, t),
             )
 
     parser.add_argument('-h', '--help', default=argparse.SUPPRESS,

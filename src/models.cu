@@ -142,12 +142,80 @@ struct PrefixScan {
     precision_t* combined_ptr = nullptr;
     precision_t* state_ptr = nullptr;
     precision_t* input_ptr = nullptr;  // (B, T, H) original input before projection (for highway gate)
+    const precision_t* reset_ptr = nullptr;  // (B, T), reset before current observation
     int B = 0, T = 0, H = 0;
     FloatTensor a_star, s_vals, log_values_buf;
     PrecisionTensor out, next_state;
     PrecisionTensor grad_combined, grad_state;
     PrecisionTensor grad_input;        // (B, T, H) highway gate gradient w.r.t. input
 };
+
+/* Early failures can put multiple episodes in one training sequence. Use a
+ * direct, numerically stable recurrence when reset boundaries are present;
+ * hidden elements and batch rows remain fully parallel. */
+__global__ void mingru_reset_forward(PrefixScan scan) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= scan.B * scan.H) return;
+    int b = idx / scan.H, h = idx % scan.H;
+    int H = scan.H, H3 = 3 * H;
+    int base = b * scan.T * H + h;
+    int combined_base = 3 * b * scan.T * H + h;
+    float state = to_float(scan.state_ptr[b * H + h]);
+    scan.a_star.data[(b * (scan.T + 1)) * H + h] = state;
+    for (int t = 0; t < scan.T; t++) {
+        if (to_float(scan.reset_ptr[b * scan.T + t]) != 0.0f) state = 0.0f;
+        int c = combined_base + t * H3;
+        float hidden = to_float(scan.combined_ptr[c]);
+        float gate = sigmoid(to_float(scan.combined_ptr[c + H]));
+        float projection = sigmoid(to_float(scan.combined_ptr[c + 2 * H]));
+        float candidate = hidden >= 0.0f ? hidden + 0.5f : sigmoid(hidden);
+        state = (1.0f - gate) * state + gate * candidate;
+        int out_idx = base + t * H;
+        float input = to_float(scan.input_ptr[out_idx]);
+        scan.out.data[out_idx] =
+            from_float(projection * state + (1.0f - projection) * input);
+        scan.a_star.data[(b * (scan.T + 1) + t + 1) * H + h] = state;
+    }
+    scan.next_state.data[b * H + h] = from_float(state);
+}
+
+__global__ void mingru_reset_backward(PrefixScan scan,
+        const precision_t* __restrict__ grad_out,
+        const precision_t* __restrict__ grad_next_state) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= scan.B * scan.H) return;
+    int b = idx / scan.H, h = idx % scan.H;
+    int H = scan.H, H3 = 3 * H;
+    int base = b * scan.T * H + h;
+    int combined_base = 3 * b * scan.T * H + h;
+    float carry = to_float(grad_next_state[b * H + h]);
+    for (int t = scan.T - 1; t >= 0; t--) {
+        int c = combined_base + t * H3;
+        int out_idx = base + t * H;
+        float hidden = to_float(scan.combined_ptr[c]);
+        float gate = sigmoid(to_float(scan.combined_ptr[c + H]));
+        float projection = sigmoid(to_float(scan.combined_ptr[c + 2 * H]));
+        float candidate = hidden >= 0.0f ? hidden + 0.5f : sigmoid(hidden);
+        float previous = scan.a_star.data[(b * (scan.T + 1) + t) * H + h];
+        if (to_float(scan.reset_ptr[b * scan.T + t]) != 0.0f) previous = 0.0f;
+        float state = scan.a_star.data[(b * (scan.T + 1) + t + 1) * H + h];
+        float input = to_float(scan.input_ptr[out_idx]);
+        float output_grad = to_float(grad_out[out_idx]);
+        float state_grad = carry + output_grad * projection;
+        float hidden_derivative = hidden >= 0.0f ? 1.0f :
+            candidate * (1.0f - candidate);
+        scan.grad_combined.data[c] =
+            from_float(state_grad * gate * hidden_derivative);
+        scan.grad_combined.data[c + H] = from_float(
+            state_grad * (candidate - previous) * gate * (1.0f - gate));
+        scan.grad_combined.data[c + 2 * H] = from_float(
+            output_grad * (state - input) * projection * (1.0f - projection));
+        scan.grad_input.data[out_idx] = from_float(output_grad * (1.0f - projection));
+        carry = state_grad * (1.0f - gate);
+        if (to_float(scan.reset_ptr[b * scan.T + t]) != 0.0f) carry = 0.0f;
+    }
+    scan.grad_state.data[b * H + h] = from_float(carry);
+}
 
 // Checkpointing trades off partial recomputation for memory bandwidth.
 #define CHECKPOINT_INTERVAL 4
@@ -731,7 +799,12 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].data;
         a->scan_bufs[i].state_ptr = state_i.data;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].data;
-        mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
+        if (a->scan_bufs[i].reset_ptr != nullptr)
+            mingru_reset_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(
+                a->scan_bufs[i]);
+        else
+            mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(
+                a->scan_bufs[i]);
         x = a->scan_bufs[i].out;
     }
     return x;
@@ -742,8 +815,12 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     MinGRUActivations* a = (MinGRUActivations*)activations;
     for (int i = m->num_layers - 1; i >= 0; i--) {
         PrefixScan& scan = a->scan_bufs[i];
-        mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
-            scan, grad.data, a->grad_next_state.data);
+        if (scan.reset_ptr != nullptr)
+            mingru_reset_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
+                scan, grad.data, a->grad_next_state.data);
+        else
+            mingru_scan_backward<<<grid_size(scan.B*scan.H), BLOCK_SIZE, 0, stream>>>(
+                scan, grad.data, a->grad_next_state.data);
         puf_mm_tn(&scan.grad_combined, &a->saved_inputs[i], &a->wgrad_scratch[i], stream);
         puf_mm_nn(&scan.grad_combined, &m->weights[i], &a->grad_input_buf, stream);
         int n = numel(scan.grad_input.shape);
@@ -752,6 +829,11 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
         grad = a->grad_input_buf;
     }
     return grad;
+}
+
+static void mingru_set_resets(void* activations, const PrecisionTensor resets) {
+    MinGRUActivations* a = (MinGRUActivations*)activations;
+    for (int i = 0; i < a->num_layers; i++) a->scan_bufs[i].reset_ptr = resets.data;
 }
 
 struct Policy {

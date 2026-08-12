@@ -192,6 +192,7 @@ typedef struct
     int episode_step;
     int current_period;
     int operating_period;
+    int operating_period_offset;
     PowerGridEpisodeStats episode;
     unsigned char line_available[POWER_GRID_NUM_BRANCHES];
     double line_thermal_stress[POWER_GRID_NUM_BRANCHES];
@@ -211,6 +212,7 @@ typedef struct
     int random_events;
     double random_event_probability;
     int random_outage_count;
+    int random_outage_count_min;
     int random_outages_at_reset;
     double reset_outage_probability;
     int randomize_reset_operating_period;
@@ -835,6 +837,7 @@ void c_reset(PowerGrid *env)
     int reset_operating_period = env->random_outages_at_reset &&
         env->randomize_reset_operating_period ?
         (int)(next_random(env) % POWER_GRID_NUM_PERIODS) : 0;
+    env->operating_period_offset = reset_operating_period;
     power_grid_set_operating_period(env, reset_operating_period);
     env->scheduled_random_event_count = 0;
     for (int event = 0; event < POWER_GRID_MAX_RANDOM_OUTAGES; event++)
@@ -848,6 +851,11 @@ void c_reset(PowerGrid *env)
         if (unit_sample < env->random_event_probability)
         {
             int requested = env->random_outage_count > 0 ? env->random_outage_count : 1;
+            int minimum = env->random_outage_count_min > 0 ?
+                          env->random_outage_count_min : requested;
+            if (minimum < requested)
+                requested = minimum + (int)(next_random(env) %
+                    (unsigned int)(requested - minimum + 1));
             env->scheduled_random_event_count =
                 requested < POWER_GRID_MAX_RANDOM_OUTAGES ? requested :
                                                             POWER_GRID_MAX_RANDOM_OUTAGES;
@@ -1053,7 +1061,10 @@ void c_step(PowerGrid *env)
         env->episode.recoveries_rewarded++;
     }
     int recovery_completed = env->end_episode_on_recovery &&
-                             env->episode.random_events > 0 && reward_safe;
+                             env->episode.random_events > 0 &&
+                             env->episode.random_events ==
+                                 env->scheduled_random_event_count &&
+                             reward_safe;
     env->terminals[0] = status != POWER_GRID_SOLVE_OK || recovery_completed ||
                         (env->max_episode_steps > 0 &&
                          env->episode_step >= env->max_episode_steps);
@@ -1074,7 +1085,9 @@ void c_step(PowerGrid *env)
         observations_dirty = 1;
         observation_only_terminal = -1;
         env->current_period = next_period;
-        power_grid_set_operating_period(env, next_period);
+        power_grid_set_operating_period(
+            env, (env->operating_period_offset + next_period) %
+                     POWER_GRID_NUM_PERIODS);
         for (int event = 0; event < env->scheduled_random_event_count; event++)
         {
             if (next_period != env->scheduled_random_event_period[event])
@@ -1093,7 +1106,8 @@ void c_step(PowerGrid *env)
         /* New injections can expose an infeasible state without another agent action. */
         env->log.event_failure += random_event_applied;
         env->last_failure_was_event = random_event_applied;
-        env->rewards[0] = calculate_reward(env, status, 0.0, 0.0, 0, 0, 0, 0);
+        env->rewards[0] = calculate_reward(
+            env, status, 0.0, 0.0, 0, 0, 0, 0);
         env->terminals[0] = 1.0f;
         env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);

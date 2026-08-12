@@ -33,6 +33,7 @@ typedef struct Weights Weights;
 struct Weights {
     float* data;
     int size;
+    int num_weights;
     int idx;
 };
 
@@ -58,6 +59,7 @@ Weights* load_weights(const char* filename) {
         perror("Error reading file");
     }
     weights->size = num_weights + 7;
+    weights->num_weights = num_weights;
     weights->idx = 0;
     return weights;
 }
@@ -1033,15 +1035,28 @@ struct PufferNet {
 
 PufferNet* make_puffernet(Weights* weights, int num_agents, int input_dim,
         int hidden_dim, int num_layers, int logit_sizes[], int num_actions) {
-    PufferNet* net = (PufferNet*)calloc(1, sizeof(PufferNet));
-    net->num_agents = num_agents;
-    net->obs = (float*)calloc(num_agents * input_dim, sizeof(float));
     int atn_sum = 0;
     int is_continuous = 1;
     for (int i = 0; i < num_actions; i++) {
         atn_sum += logit_sizes[i];
         if (logit_sizes[i] != 1) is_continuous = 0;
     }
+    int expected = (hidden_dim * input_dim + 7) & ~7;
+    expected = (expected + (atn_sum + 1) * hidden_dim + 7) & ~7;
+    if (is_continuous)
+        expected = (expected + num_actions + 7) & ~7;
+    for (int layer = 0; layer < num_layers; layer++)
+        expected = (expected + 3 * hidden_dim * hidden_dim + 7) & ~7;
+    if (weights->num_weights != expected) {
+        fprintf(stderr,
+            "Checkpoint architecture mismatch: expected %d floats, found %d\n",
+            expected, weights->num_weights);
+        return NULL;
+    }
+
+    PufferNet* net = (PufferNet*)calloc(1, sizeof(PufferNet));
+    net->num_agents = num_agents;
+    net->obs = (float*)calloc(num_agents * input_dim, sizeof(float));
     net->is_continuous = is_continuous;
     net->num_actions = num_actions;
 

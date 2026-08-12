@@ -3,7 +3,10 @@
 
 #include "power_grid_solver.c"
 #include "power_grid.h"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
 #include "power_grid_policy.h"
+#pragma clang diagnostic pop
 #include "power_grid_user.h"
 
 typedef struct
@@ -23,6 +26,11 @@ static PowerGridRuntimePolicy power_grid_load_policy(void)
                                     POWER_GRID_POLICY_HIDDEN_SIZE,
                                     POWER_GRID_POLICY_NUM_LAYERS,
                                     action_sizes, 1);
+    if (policy.network == NULL)
+    {
+        free(policy.weights);
+        policy.weights = NULL;
+    }
     return policy;
 }
 

@@ -88,3 +88,12 @@ def test_power_grid_user_controller(tmp_path):
         [ROOT / "tests/test_power_grid_user.c"],
         optimized=True,
     )
+
+
+def test_power_grid_deployed_policy_architecture(tmp_path):
+    compile_and_run(
+        tmp_path,
+        "test_power_grid_policy",
+        [ROOT / "tests/test_power_grid_policy.c"],
+        optimized=True,
+    )

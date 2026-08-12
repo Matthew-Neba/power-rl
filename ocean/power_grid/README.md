@@ -39,9 +39,10 @@ Weather scales every synthetic line rating from 0.90x to 1.35x using the retaine
 IEEE 738 approximation. No files, parsing, allocation, Python, or network calls occur in the
 environment hot path.
 
-Training mixes 75% historical days with 25% synthetic global, regional-transfer, and renewable
-stress ramps. Half of episodes schedule three distinct persistent outages at distinct later periods.
-The radial 7-8 line is excluded, and each sampled multi-line set is validated together before use.
+Training mixes 65% historical days with 35% synthetic global, regional-transfer, and renewable
+stress ramps. Every standard training episode schedules one or two persistent outages at distinct
+later periods. The radial 7-8 line is excluded, and each sampled multi-line set is validated
+together before use.
 
 ## Reward and metrics
 
@@ -49,14 +50,16 @@ The DC training reward is:
 
 ```text
 -congestion_cost * congestion_cost_weight
++signed congestion-progress reward
 -switch_penalty when a physical switch occurs
 +safe_step_reward when all lines are within their limits
++recovery_reward on a physical action that restores security after an outage
 ```
 
-Invalid topology or solver failure terminates with `failure_reward`. The defaults are failure
-`-1.0`, congestion weight `1.0`, switch penalty `0.01`, and safe-step reward `0.01`. Thus a fully
-safe 72-step episode is worth at most `+0.72`, less than one catastrophic failure. All four
-coefficients remain sweepable, but the failure and safe-reward ranges preserve this ordering.
+Invalid topology or solver failure terminates with `failure_reward`. The current defaults are
+failure `-1.0`, safe step `1.0`, recovery `0.5`, congestion weight `0.01`, switch penalty `0.002`,
+secure-state switch penalty `0.1`, and congestion progress `1.0`. These coefficients remain
+configurable; Puffer clips individual training rewards to `[-1, 1]`.
 AC voltage violations and thermal trips remain evaluation metrics because AC
 power flow is disabled during high-throughput training.
 
@@ -79,8 +82,24 @@ Compare a checkpoint against deterministic baselines on held-out 2020 scenarios:
 ```sh
 PATH="$PWD/.venv/bin:$PATH" python ocean/power_grid/benchmark.py \
   --checkpoint latest --episodes 1024 --physics dc \
-  --random-event-probability 0.5 --random-outages 3
+  --random-event-probability 1.0 --random-outages 2
 ```
+
+The checked-in 256x3 MinGRU PPO checkpoint was frozen after model selection on 2019 training data.
+On the fixed 256-episode held-out 2020 set (seed offset 50,000), its final results are:
+
+| Scenario / inference | PPO perf | PPO failures | Greedy perf | Lookahead perf |
+|---|---:|---:|---:|---:|
+| N-1 argmax | 0.9065 | 0.00% | 0.9153 | 0.9171 |
+| N-1 stochastic | 0.9063 | 0.00% | 0.9153 | 0.9171 |
+| N-2 argmax | 0.7978 | 0.78% | 0.8026 | 0.8049 |
+| N-2 stochastic | 0.7898 | 1.56% | 0.8026 | 0.8049 |
+
+These are unrestricted 91-action results: no action mask, rollback, fallback, forced no-op, or
+line-only policy is used. The PPO policy did not beat greedy or two-step lookahead on secure-step
+performance. Its useful result is lower deterministic N-2 failure (0.78% versus 1.95% for both
+baselines), not a performance-baseline win. Argmax is the stronger deployment mode on this gate;
+stochastic sampling remains available in the interactive app for direct comparison.
 
 For environment-only throughput:
 
@@ -103,3 +122,7 @@ weather exposure, two-busbar layouts, dispatch, and outage distributions are ass
 deployment requires authenticated network cases and facility ratings, route/conductor geometry,
 dispatch and remedial-action rules, protection/interlocks, N-1/N-k and transient/frequency studies,
 operator review, and deployment monitoring.
+
+The policy also remains below simple planning baselines in held-out secure-step performance and was
+trained with the DC solver. AC validation checks feasibility but is not evidence that the policy is
+ready for real-grid control. N-2 generalization is the principal learned-policy limitation.

@@ -27,13 +27,19 @@ static void test_contract_and_reward(void)
         .congestion_cost_weight = POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT,
         .congestion_progress_weight = POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT,
     };
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY, 0.0, 0.0, 0, 0, 0, 0),
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY, 0.0, 0.0,
+                                 0, 0, 0, 0),
                 POWER_GRID_DEFAULT_FAILURE_REWARD);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0, 0, 0, 1, 1), 1.0);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0, 1, 1, 1, 1), 0.9);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.0, 0, 0, 0, 0), -0.2);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3, 1, 1, 0, 0), 0.098);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3, 1, 0, 0, 0), 0.0);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0,
+                                 0, 0, 1, 1), 1.0);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0,
+                                 1, 1, 1, 1), 0.9);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.0,
+                                 0, 0, 0, 0), -0.2);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3,
+                                 1, 1, 0, 0), 0.098);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3,
+                                 1, 0, 0, 0), 0.0);
 
     power_grid_topology_normal(&env.topology);
     memset(env.line_available, 1, sizeof(env.line_available));
@@ -240,6 +246,29 @@ static void test_scaled_random_outages(void)
     }
 }
 
+static void test_random_outage_count_range(void)
+{
+    PowerGrid env = {
+        .rng = 23u,
+        .random_events = 1,
+        .random_event_probability = 1.0,
+        .random_outage_count = 2,
+        .random_outage_count_min = 1,
+    };
+    int seen[3] = {0};
+    power_grid_allocate(&env);
+    for (int episode = 0; episode < 32; episode++)
+    {
+        c_reset(&env);
+        CHECK(env.scheduled_random_event_count >= 1);
+        CHECK(env.scheduled_random_event_count <= 2);
+        seen[env.scheduled_random_event_count] = 1;
+    }
+    CHECK(seen[1]);
+    CHECK(seen[2]);
+    c_close(&env);
+}
+
 static void test_random_outages_at_reset(void)
 {
     PowerGrid env = {
@@ -266,6 +295,48 @@ static void test_random_outages_at_reset(void)
         CHECK_CLOSE(env.observations[POWER_GRID_LINE_OBS_OFFSET +
                                      POWER_GRID_LINE_OBS_FEATURES * line + 3], 0.0);
     }
+    c_close(&env);
+}
+
+static void test_reset_period_advances_relative_to_start(void)
+{
+    PowerGrid env = {
+        .rng = 47u,
+        .offline_scenarios = 1,
+        .offline_scenario_probability = 1.0,
+        .random_outages_at_reset = 1,
+        .randomize_reset_operating_period = 1,
+        .reset_outage_probability = 0.0,
+    };
+    power_grid_allocate(&env);
+    c_reset(&env);
+    int start = env.operating_period;
+    CHECK(start == env.operating_period_offset);
+    for (int step = 0; step < POWER_GRID_STEPS_PER_PERIOD; step++)
+    {
+        env.actions[0] = POWER_GRID_ACTION_NONE;
+        c_step(&env);
+    }
+    CHECK(env.current_period == 1);
+    CHECK(env.operating_period == (start + 1) % POWER_GRID_NUM_PERIODS);
+    c_close(&env);
+}
+
+static void test_recovery_waits_for_all_scheduled_outages(void)
+{
+    PowerGrid env = {.end_episode_on_recovery = 1};
+    power_grid_allocate(&env);
+    c_reset(&env);
+    env.scheduled_random_event_count = 2;
+    env.episode.random_events = 1;
+    env.actions[0] = POWER_GRID_ACTION_NONE;
+    c_step(&env);
+    CHECK(!env.terminals[0]);
+
+    env.episode.random_events = 2;
+    env.actions[0] = POWER_GRID_ACTION_NONE;
+    c_step(&env);
+    CHECK(env.terminals[0]);
     c_close(&env);
 }
 
@@ -507,7 +578,10 @@ int main(void)
     test_invalid_agent_switch_fails_episode();
     test_secure_grid_applies_switch_commands();
     test_scaled_random_outages();
+    test_random_outage_count_range();
     test_random_outages_at_reset();
+    test_reset_period_advances_relative_to_start();
+    test_recovery_waits_for_all_scheduled_outages();
     test_congestion_progress_is_potential_based();
     test_recovery_curriculum_terminal();
     test_one_step_recovery_curriculum();

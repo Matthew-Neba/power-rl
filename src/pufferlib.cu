@@ -97,6 +97,7 @@ struct TrainGraph {
     PrecisionTensor mb_obs;         // (B, T, input_size)
     PrecisionTensor mb_actions;     // (B, T, num_atns)
     PrecisionTensor mb_logprobs;    // (B, T)
+    PrecisionTensor mb_terminals;   // (B, T), recurrent reset boundaries
     PrecisionTensor mb_advantages;  // ...
     PrecisionTensor mb_values;
     PrecisionTensor mb_returns;
@@ -113,6 +114,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
         .mb_obs =           {.shape = {B, T, input_size}},
         .mb_actions =       {.shape = {B, T, num_atns}},
         .mb_logprobs =      {.shape = {B, T}},
+        .mb_terminals =     {.shape = {B, T}},
         .mb_advantages =    {.shape = {B, T}},
         .mb_values =        {.shape = {B, T}},
         .mb_returns =       {.shape = {B, T}},
@@ -125,6 +127,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
     alloc_register(alloc, &bufs.mb_state);
     alloc_register(alloc, &bufs.mb_actions);
     alloc_register(alloc, &bufs.mb_logprobs);
+    alloc_register(alloc, &bufs.mb_terminals);
     alloc_register(alloc, &bufs.mb_advantages);
     alloc_register(alloc, &bufs.mb_prio);
     alloc_register(alloc, &bufs.mb_values);
@@ -349,6 +352,7 @@ typedef struct {
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     PrecisionTensor* buffer_states;  // Per-buffer states for contiguous access
     PolicyActivations* buffer_activations;  // Per-buffer inference activations
+    PrecisionTensor rollout_states;  // Recurrent state at rollout start, (agents, layers, hidden)
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
@@ -420,6 +424,31 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
     if (idx < n) {
         curand_init(seed, idx, 0, &states[idx]);
     }
+}
+
+__global__ void reset_terminal_states(precision_t* states, const float* terminals,
+        int layers, int agents, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = layers * agents * hidden;
+    if (idx >= n) return;
+    int agent = (idx / hidden) % agents;
+    if (terminals[agent] != 0.0f) states[idx] = from_float(0.0f);
+}
+
+// Rollout inference stores state as (layers, agents, hidden), while replay
+// selects complete agent sequences. Snapshot it in agent-major order so each
+// selected sequence starts training from the same state used during collection.
+__global__ void snapshot_rollout_states(precision_t* dst, const precision_t* src,
+        const float* terminals, int dst_agent_start, int agents, int layers, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = agents * layers * hidden;
+    if (idx >= n) return;
+    int h = idx % hidden;
+    int layer = (idx / hidden) % layers;
+    int agent = idx / (layers * hidden);
+    int dst_idx = ((dst_agent_start + agent) * layers + layer) * hidden + h;
+    int src_idx = (layer * agents + agent) * hidden + h;
+    dst[dst_idx] = terminals[agent] == 0.0f ? src[src_idx] : from_float(0.0f);
 }
 
 __device__ __forceinline__ float safe_logit(const precision_t* logits,
@@ -652,7 +681,8 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     int start = buf * block_size;
     cudaStream_t stream = current_stream;
 
-    // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
+    // Rewards and terminals describe the transition into this observation.
+    // puff_advantage uses slot t+1 as the outcome of action t.
     OBS_TENSOR_T& obs_env = env.obs;
     int n = block_size * obs_env.shape[1];
     PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
@@ -722,6 +752,12 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             mask_stride_b = mask_stride;
         }
 
+        int state_agents = s_bank->shape[1];
+        int state_hidden = s_bank->shape[2];
+        int state_layers = s_bank->shape[0];
+        reset_terminal_states<<<grid_size(state_layers * state_agents * state_hidden),
+            BLOCK_SIZE, 0, stream>>>(s_bank->data, env.terminals.data + sub_start,
+                                    state_layers, state_agents, state_hidden);
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
 
         PrecisionTensor p_logstd = {};
@@ -755,7 +791,6 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     }
     profile_end(hypers.profile);
 }
-
 
 __device__ __forceinline__ float load_logit_masked(
         const precision_t* __restrict__ logits, int logits_base,
@@ -1312,6 +1347,8 @@ void prio_replay_cuda(PrecisionTensor& advantages, float prio_alpha,
 
 // Experience the puffer advantage! Generalized advantage estimation + V-Trace
 // importance sampling correction in a single streamlined operation
+// Slot t stores observation/action/value t and the transition into observation
+// t. Therefore action t receives reward/done from slot t+1.
 __device__ void puff_advantage_row_scalar(
         const precision_t* values, const precision_t* rewards, const precision_t* dones,
         const precision_t* importance, precision_t* advantages, float gamma, float lambda,
@@ -1494,7 +1531,8 @@ __device__ __forceinline__ void copy_values_adv_returns(
     }
 }
 
-__global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
+__global__ void select_copy(RolloutBuf rollouts, PrecisionTensor rollout_states,
+        TrainGraph graph,
         const int* __restrict__ idx, const precision_t* __restrict__ advantages,
         const float* __restrict__ mb_prio) {
     int mb = blockIdx.x;
@@ -1535,6 +1573,24 @@ __global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
                        (char*)graph.mb_action_mask.data, src_row, mb, mask_row_bytes);
         }
         break;
+    case 6:
+        copy_bytes((const char*)rollouts.terminals.data,
+                   (char*)graph.mb_terminals.data, src_row, mb,
+                   horizon * sizeof(precision_t));
+        break;
+    case 7: {
+        int layers = graph.mb_state.shape[0];
+        int minibatch_agents = graph.mb_state.shape[1];
+        int hidden = graph.mb_state.shape[2];
+        int n = layers * hidden;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            int layer = i / hidden;
+            int h = i % hidden;
+            graph.mb_state.data[(layer * minibatch_agents + mb) * hidden + h] =
+                rollout_states.data[(src_row * layers + layer) * hidden + h];
+        }
+        break;
+    }
     }
 }
 
@@ -1650,14 +1706,13 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        if (hypers.reset_state) puf_zero(&graph.mb_state, train_stream);
         {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
-            int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+            int channels = 8;
             select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, train_stream>>>(
-                sel_src, graph, pufferl.prio_bufs.idx.data,
+                sel_src, pufferl.rollout_states, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
         }
         profile_end(hypers.profile);
@@ -1676,6 +1731,7 @@ void train_impl(PuffeRL& pufferl) {
             cudaStream_t stream = train_stream;
             PrecisionTensor obs_puf = graph.mb_obs;
             PrecisionTensor state_puf = graph.mb_state;
+            mingru_set_resets(pufferl.train_activations.network, graph.mb_terminals);
             PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
             DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
             PrecisionTensor p_logstd;
@@ -2080,6 +2136,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         };
         alloc_register(acts, &pufferl->buffer_states[i]);
     }
+    pufferl->rollout_states = {.shape = {total_agents, num_layers, hidden_size}};
+    alloc_register(acts, &pufferl->rollout_states);
     int mask_size = pufferl->vec->action_mask_size;
     register_rollout_buffers(pufferl->rollouts,
         acts, horizon, total_agents, input_size, num_action_heads, mask_size);
@@ -2258,6 +2316,18 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
             vec->streams[i] = pufferl->streams[i];
         }
     }
+
+    // Cudagraph warmup runs real forwards and therefore advances recurrent
+    // state. A newly created trainer/evaluator must still begin with a fresh
+    // policy instance, regardless of whether rollout-level resets are enabled.
+    for (int i = 0; i < num_buffers; i++)
+        puf_zero(&pufferl->buffer_states[i], pufferl->default_stream);
+    for (int b = 0; b < pufferl->num_frozen_banks; b++)
+        for (int i = 0; i < num_buffers; i++)
+            puf_zero(&pufferl->frozen_banks[b].buffer_states[i],
+                     pufferl->default_stream);
+    puf_zero(&pufferl->rollout_states, pufferl->default_stream);
+    cudaStreamSynchronize(pufferl->default_stream);
 
     create_static_threads(vec, hypers.num_threads, horizon, pufferl.get(),
         net_callback_wrapper, thread_init_wrapper);
