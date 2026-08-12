@@ -14,14 +14,14 @@ AC is retained as an explicit validation mode.
 | Branches / generators / loads | 20 / 5 / 11 |
 | Equipment terminals / couplers | 56 / 14 |
 | Environment actions | 91 |
-| PPO actions | 21 (no-op + 20 line switches) |
+| PPO actions | 91 (all environment actions) |
 | Float observations | 221 |
 | Training episode | 72 steps / 12 periods |
 | Interactive runtime | continuous; periods wrap without reset |
 
-The general environment retains line, terminal-busbar, and coupler actions. PPO is intentionally
-restricted to no-op and line switching. Invalid or non-improving recovery commands are rejected
-transactionally, so a bad command does not turn a recoverable contingency into a blackout.
+PPO can select every line, terminal-busbar, and coupler action. Invalid topology commands and
+outage-sensitive topology choices have their real episode-ending consequences; the environment
+does not silently replace them with no-op or roll them back for the agent.
 
 ## Physics and performance
 
@@ -50,8 +50,9 @@ and solar traces retain their daily correlation and drive injections and IEEE-73
 Training now guarantees two distinct non-islanding outages per episode to match the live N-2 limit.
 The interactive controller in `power_grid_user.h` accepts at most two user-selected outages,
 rejects invalid combinations, and restores the pre-contingency topology when the final outage is
-cleared. This state and mouse input are separate from the training environment. The app selects an
-unbounded episode limit so time and operating conditions continue indefinitely.
+cleared. This state and mouse input are separate from the training environment. The app retains
+automatic outages and uses ordinary 72-step episodes. A terminal state starts a fresh environment
+episode and a newly initialized policy instance.
 
 Held-out 2020 evaluation of the deployed checkpoint (4,096 episodes):
 
@@ -60,5 +61,26 @@ Held-out 2020 evaluation of the deployed checkpoint (4,096 episodes):
 - Repeated exhaustive DC outage windows: PPO safe-step fraction 0.5591 vs greedy 0.5531,
   with no terminal failures across 2,184 steps for either policy.
 
-The remaining limitation is N-2 efficiency: PPO survives but is still slightly below greedy on the
-independent held-out N-2 perf metric. Do not present that case as a PPO win.
+These results belong to the superseded 21-action phase-1 checkpoint. Phase 2 restores all 91
+actions and must be re-trained and re-evaluated before new performance claims are made. The web app
+offers both stochastic Puffer-style sampling and deterministic argmax inference.
+
+## Phase-2 training audit
+
+The unrestricted 91-action PPO was trained and screened with direct N-1/N-2, staged N-1 then N-2,
+recorded-day adaptation, congestion shaping, and an early-outage recovery curriculum. The strongest
+checkpoints were specialists rather than one policy that achieved both results:
+
+- fixed 256-episode N-1 gate: specialist PPO `0.9098` perf with zero failures, greedy `0.9153`,
+  and lookahead `0.9171`; this checkpoint scored `0.7525` on N-2 with `6.64%` failures;
+- fixed 256-episode N-2 gate: specialist PPO `0.7918` perf with `0.78%` failures, greedy `0.8026`,
+  and lookahead `0.8049`, both with `1.95%` failures; this checkpoint scored `0.9039` on N-1
+  with zero failures.
+
+These are deterministic-argmax results. No action masking, rollback, fallback, forced no-op, or
+line-only restriction was used. PPO was more reliable on N-2 but remained behind both baselines on
+safe-step performance, so no phase-2 checkpoint was deployed as a baseline-beating policy.
+
+The old phase-1 checkpoint was also retested under the current honest transition rules. Its N-1
+perf fell to `0.5908` with `30.9%` failures, confirming that it must not be reused as a phase-2
+result. Temporary checkpoints and benchmark binaries were removed after the audit.

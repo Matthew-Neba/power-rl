@@ -10,19 +10,24 @@ typedef struct
     PowerGridTopology topology_before_outage;
     int topology_before_outage_valid;
     int max_outages;
+    unsigned char line_outage[POWER_GRID_NUM_BRANCHES];
+    int last_line;
+    PowerGridSolveStatus last_status;
 } PowerGridUserSession;
 
 static inline void power_grid_user_init(PowerGridUserSession *user, int max_outages)
 {
     memset(user, 0, sizeof(*user));
     user->max_outages = max_outages;
+    user->last_line = -1;
+    user->last_status = POWER_GRID_SOLVE_OK;
 }
 
-static inline int power_grid_user_outage_count(const PowerGrid *env)
+static inline int power_grid_user_outage_count(const PowerGridUserSession *user)
 {
     int count = 0;
     for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-        count += !env->line_available[line];
+        count += user->line_outage[line];
     return count;
 }
 
@@ -35,17 +40,23 @@ static inline PowerGridSolveStatus power_grid_user_set_line_outage(
         return POWER_GRID_INVALID_INPUT;
 
     unavailable = unavailable != 0;
-    if (unavailable == !env->line_available[line])
+    user->last_line = line;
+    if (unavailable == user->line_outage[line])
         return env->solution.status;
 
-    int outage_count = power_grid_user_outage_count(env);
+    int outage_count = power_grid_user_outage_count(user);
     if (unavailable && outage_count >= user->max_outages)
-        return POWER_GRID_INVALID_INPUT;
+        return user->last_status = POWER_GRID_INVALID_INPUT;
+    /* An automatic outage is owned by the environment and cannot be restored
+     * or reclassified by clicking it in the user controller. */
+    if (unavailable && !env->line_available[line])
+        return user->last_status = POWER_GRID_INVALID_INPUT;
 
     PowerGridTopology previous_topology = env->topology;
     PowerGridSolveResult previous_solution = env->solution;
     PowerGridACSolveResult previous_ac_solution = env->ac_solution;
     unsigned char previous_available = env->line_available[line];
+    unsigned char previous_user_line = user->line_outage[line];
     PowerGridTopology previous_base = user->topology_before_outage;
     int previous_base_valid = user->topology_before_outage_valid;
 
@@ -56,6 +67,7 @@ static inline PowerGridSolveStatus power_grid_user_set_line_outage(
     }
 
     env->line_available[line] = !unavailable;
+    user->line_outage[line] = unavailable;
     if (!unavailable && outage_count == 1 && user->topology_before_outage_valid)
         env->topology = user->topology_before_outage;
     else
@@ -73,18 +85,19 @@ static inline PowerGridSolveStatus power_grid_user_set_line_outage(
     if (status != POWER_GRID_SOLVE_OK)
     {
         env->line_available[line] = previous_available;
+        user->line_outage[line] = previous_user_line;
         env->topology = previous_topology;
         env->solution = previous_solution;
         env->ac_solution = previous_ac_solution;
         user->topology_before_outage = previous_base;
         user->topology_before_outage_valid = previous_base_valid;
-        return status;
+        return user->last_status = status;
     }
 
     if (!unavailable && outage_count == 1)
         user->topology_before_outage_valid = 0;
     power_grid_compute_observations(env);
-    return POWER_GRID_SOLVE_OK;
+    return user->last_status = POWER_GRID_SOLVE_OK;
 }
 
 #ifndef POWER_GRID_NO_RENDER
@@ -123,7 +136,7 @@ static inline void power_grid_user_handle_input(PowerGridUserSession *user, Powe
     }
     if (selected >= 0)
         power_grid_user_set_line_outage(
-            user, env, selected, env->line_available[selected]);
+            user, env, selected, !user->line_outage[selected]);
 }
 #endif
 

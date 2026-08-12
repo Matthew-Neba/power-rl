@@ -6,7 +6,7 @@
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
-#include "../../src/puffernet.h"
+#include "power_grid_policy.h"
 #pragma clang diagnostic pop
 #include "power_grid_solver.c"
 #include "power_grid.h"
@@ -21,6 +21,7 @@ typedef enum {
     BASELINE_LOOKAHEAD_LINES,
     BASELINE_COUNT,
     POLICY_PPO = BASELINE_COUNT,
+    POLICY_PPO_STOCHASTIC,
     POLICY_COUNT,
 } BaselinePolicy;
 
@@ -30,6 +31,9 @@ typedef struct {
     double total_failure;
     double event_failure;
     double total_switches;
+    double line_switches;
+    double busbar_switches;
+    double coupler_switches;
     double random_events;
     double demand_fulfilled;
     double outage_completion;
@@ -50,15 +54,15 @@ static const char *const BASELINE_NAMES[POLICY_COUNT] = {
     "Greedy all",
     "Lookahead lines",
     "PPO deterministic",
+    "PPO stochastic",
 };
 
-static int deterministic_ppo_action(PufferNet *policy, const float *observations)
+static int ppo_action(PufferNet *policy, const float *observations, int deterministic)
 {
     float action = 0.0f;
-    linear(policy->encoder, (float *)observations);
-    mingru(policy->mingru, policy->encoder->output);
-    linear(policy->decoder, policy->mingru->output);
-    argmax_multidiscrete(policy->multidiscrete, policy->decoder->output, &action);
+    power_grid_policy_action(policy, observations, &action,
+        deterministic ? POWER_GRID_INFERENCE_ARGMAX :
+                        POWER_GRID_INFERENCE_STOCHASTIC);
     return (int)action;
 }
 
@@ -110,7 +114,10 @@ static double immediate_action_value(const PowerGrid *env, int action)
     int switched = memcmp(&topology, &env->topology, sizeof(topology)) != 0;
     return env->safe_step_reward * (max_rho <= 1.0) -
            env->congestion_cost_weight * congestion_cost -
-           env->switch_penalty * switched;
+           env->congestion_progress_weight *
+               (congestion_cost - env->solution.congestion_cost) -
+           (env->solution.max_rho <= 1.0 ? env->secure_switch_penalty :
+                                          env->switch_penalty) * switched;
 }
 
 static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t *rng)
@@ -195,14 +202,15 @@ static BenchmarkMetrics run_baseline(
     BenchmarkMetrics total = {0};
     Weights *weights = NULL;
     PufferNet *learned = NULL;
-    if (policy == POLICY_PPO)
+    if (policy == POLICY_PPO || policy == POLICY_PPO_STOCHASTIC)
     {
         weights = load_weights(checkpoint);
         if (weights == NULL)
             exit(1);
-        int action_sizes[1] = {POWER_GRID_TERMINAL_ACTION_OFFSET};
-        learned = make_puffernet(weights, 1, POWER_GRID_OBS_SIZE, 512, 1,
-                                 action_sizes, 1);
+        int action_sizes[1] = {POWER_GRID_NUM_ACTIONS};
+        learned = make_puffernet(weights, 1, POWER_GRID_OBS_SIZE,
+                                 POWER_GRID_POLICY_HIDDEN_SIZE,
+                                 POWER_GRID_POLICY_NUM_LAYERS, action_sizes, 1);
     }
     for (int episode_index = 0; episode_index < episodes; episode_index++)
     {
@@ -219,8 +227,8 @@ static BenchmarkMetrics run_baseline(
         };
         uint32_t action_rng = UINT32_C(0x9e3779b9) ^ (uint32_t)episode;
         power_grid_allocate(&env);
-        env.lookahead_action_reward = 0.0f;
         c_reset(&env);
+        srand((unsigned int)episode);
         if (learned != NULL)
             memset(learned->mingru->state, 0,
                    (size_t)learned->mingru->num_layers * learned->mingru->hidden_size *
@@ -229,7 +237,8 @@ static BenchmarkMetrics run_baseline(
         {
             env.actions[0] = learned == NULL ?
                 (float)baseline_action(&env, policy, &action_rng) :
-                (float)deterministic_ppo_action(learned, env.observations);
+                (float)ppo_action(learned, env.observations,
+                                  policy == POLICY_PPO);
             c_step(&env);
         }
         total.perf += env.log.perf;
@@ -237,6 +246,9 @@ static BenchmarkMetrics run_baseline(
         total.total_failure += env.log.total_failure;
         total.event_failure += env.log.event_failure;
         total.total_switches += env.log.total_switches;
+        total.line_switches += env.log.line_switches;
+        total.busbar_switches += env.log.busbar_switches;
+        total.coupler_switches += env.log.coupler_switches;
         total.random_events += env.log.random_events;
         total.demand_fulfilled += env.log.demand_fulfilled;
         total.outage_completion += env.log.outage_completion;
@@ -259,6 +271,9 @@ static BenchmarkMetrics run_baseline(
     total.total_failure *= scale;
     total.event_failure *= scale;
     total.total_switches *= scale;
+    total.line_switches *= scale;
+    total.busbar_switches *= scale;
+    total.coupler_switches *= scale;
     total.random_events *= scale;
     total.demand_fulfilled *= scale;
     total.outage_completion *= scale;
@@ -290,7 +305,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "policy must be -1 or between 0 and %d\n", POLICY_COUNT - 1);
         return 1;
     }
-    if (selected_policy == POLICY_PPO && checkpoint == NULL)
+    if ((selected_policy == POLICY_PPO || selected_policy == POLICY_PPO_STOCHASTIC) &&
+        checkpoint == NULL)
     {
         fprintf(stderr, "deterministic PPO policy requires a checkpoint path\n");
         return 1;
@@ -302,7 +318,8 @@ int main(int argc, char **argv)
     }
 
     printf("policy,episodes,perf,score,total_failure,event_failure,"
-           "total_switches,random_events,demand_fulfilled,outage_completion,"
+           "total_switches,line_switches,busbar_switches,coupler_switches,"
+           "random_events,demand_fulfilled,outage_completion,"
            "all_outages_survived,thermal_trips,thermal_trip_episode,"
            "peak_thermal_stress,peak_line_loading,overloaded_line_fraction\n");
     int first_policy = selected_policy < 0 ? 0 : selected_policy;
@@ -313,10 +330,12 @@ int main(int argc, char **argv)
             (BaselinePolicy)policy, episodes, ac_power_flow,
             random_event_probability, random_outage_count, seed_offset, checkpoint);
         printf("%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-               "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+               "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                BASELINE_NAMES[policy], episodes, metrics.perf, metrics.score,
                metrics.total_failure, metrics.event_failure,
-               metrics.total_switches, metrics.random_events,
+               metrics.total_switches, metrics.line_switches,
+               metrics.busbar_switches, metrics.coupler_switches,
+               metrics.random_events,
                metrics.demand_fulfilled, metrics.outage_completion,
                metrics.all_outages_survived, metrics.thermal_trips,
                metrics.thermal_trip_episode, metrics.peak_thermal_stress,

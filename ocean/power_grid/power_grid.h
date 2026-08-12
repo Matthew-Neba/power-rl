@@ -4,6 +4,8 @@
 #include "power_grid_solver.h"
 
 #include <math.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,11 +91,12 @@ static inline double power_grid_weather_rating_scale(
 
 /* Reward configuration. */
 #define POWER_GRID_DEFAULT_FAILURE_REWARD (-1.0f)
-#define POWER_GRID_DEFAULT_SAFE_STEP_REWARD 0.01f
-#define POWER_GRID_DEFAULT_RECOVERY_REWARD 0.10f
-#define POWER_GRID_DEFAULT_LOOKAHEAD_ACTION_REWARD 1.0f
-#define POWER_GRID_DEFAULT_SWITCH_PENALTY 0.01f
-#define POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT 1.0f
+#define POWER_GRID_DEFAULT_SAFE_STEP_REWARD 1.0f
+#define POWER_GRID_DEFAULT_RECOVERY_REWARD 0.50f
+#define POWER_GRID_DEFAULT_SWITCH_PENALTY 0.002f
+#define POWER_GRID_DEFAULT_SECURE_SWITCH_PENALTY 0.10f
+#define POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT 0.01f
+#define POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT 1.0f
 
 #define POWER_GRID_LINE_OBS_FEATURES 5
 #define POWER_GRID_LINE_OBS_OFFSET 0
@@ -109,7 +112,6 @@ static inline double power_grid_weather_rating_scale(
 #define POWER_GRID_VOLTAGE_OBS_OFFSET (POWER_GRID_WEATHER_OBS_OFFSET + 3)
 #define POWER_GRID_GENERATOR_Q_OBS_OFFSET \
     (POWER_GRID_VOLTAGE_OBS_OFFSET + POWER_GRID_NUM_NODES)
-
 _Static_assert(POWER_GRID_GENERATOR_Q_OBS_OFFSET + POWER_GRID_NUM_GENERATORS ==
                    POWER_GRID_OBS_SIZE,
                "power-grid observation layout must total 221 floats");
@@ -189,6 +191,7 @@ typedef struct
     PowerGridProfile synthetic_profile;
     int episode_step;
     int current_period;
+    int operating_period;
     PowerGridEpisodeStats episode;
     unsigned char line_available[POWER_GRID_NUM_BRANCHES];
     double line_thermal_stress[POWER_GRID_NUM_BRANCHES];
@@ -196,6 +199,7 @@ typedef struct
     int scheduled_random_event_period[POWER_GRID_MAX_RANDOM_OUTAGES];
     int scheduled_random_event_line[POWER_GRID_MAX_RANDOM_OUTAGES];
     int active_random_event_line;
+    int last_failure_was_event;
     float episode_return;
     int pending_reset;
     int last_action;
@@ -207,15 +211,22 @@ typedef struct
     int random_events;
     double random_event_probability;
     int random_outage_count;
+    int random_outages_at_reset;
+    double reset_outage_probability;
+    int randomize_reset_operating_period;
+    int initial_outage_requires_overload;
+    int initial_outage_requires_one_step_recovery;
+    int end_episode_on_recovery;
     int single_episode_evaluation;
     /* Zero means unbounded operation. Training uses the default 72-step limit. */
     int max_episode_steps;
     float failure_reward;
     float safe_step_reward;
     float recovery_reward;
-    float lookahead_action_reward;
     float switch_penalty;
+    float secure_switch_penalty;
     float congestion_cost_weight;
+    float congestion_progress_weight;
     double branch_rating_scale;
     double ambient_temperature_c;
     double wind_speed_mps;
@@ -288,6 +299,7 @@ static void power_grid_redispatch(PowerGridOperatingPoint *point)
 
 static void power_grid_set_operating_period(PowerGrid *env, int period)
 {
+    env->operating_period = period;
     env->branch_rating_scale = 1.0;
     env->ambient_temperature_c = 3.6;
     env->wind_speed_mps = 3.13;
@@ -580,81 +592,20 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
 
 static float calculate_reward(const PowerGrid *env,
                               PowerGridSolveStatus solve_status,
-                              double constraint_cost, int switched, int safe)
+                              double constraint_cost, double congestion_progress,
+                              int switched, int electrical_change,
+                              int previously_safe, int safe)
 {
     if (solve_status != POWER_GRID_SOLVE_OK)
         return env->failure_reward;
-    return (float)(-constraint_cost - env->switch_penalty * switched +
-                   env->safe_step_reward * safe);
+    /* The main term is exactly the evaluation target: one unit for a secure
+     * valid step and zero for an overloaded valid step. Failure remains worse
+     * than continuing to seek recovery. */
+    return (float)(env->safe_step_reward * safe - constraint_cost +
+                   env->congestion_progress_weight * congestion_progress -
+                   ((!electrical_change || previously_safe) ?
+                        env->secure_switch_penalty : env->switch_penalty) * switched);
 }
-
-static int power_grid_has_active_outage(const PowerGrid *env)
-{
-    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-        if (!env->line_available[line])
-            return 1;
-    return 0;
-}
-
-static double power_grid_line_action_value(const PowerGrid *env, int action,
-                                           PowerGridSolveResult *result_out,
-                                           PowerGridTopology *topology_out)
-{
-    PowerGridTopology topology = env->topology;
-    PowerGridActionType type = power_grid_apply_action(&topology, action);
-    if (type == POWER_GRID_ACTION_LINE)
-    {
-        int line = action - POWER_GRID_LINE_ACTION_OFFSET;
-        if (!env->line_available[line])
-            topology.line_closed[line] = 0;
-    }
-    PowerGridSolveResult result;
-    if (power_grid_solve_scaled(&topology, &env->operating_point, &result,
-                                env->branch_rating_scale) != POWER_GRID_SOLVE_OK)
-        return -INFINITY;
-    if (result_out != NULL)
-        *result_out = result;
-    if (topology_out != NULL)
-        *topology_out = topology;
-    int switched = memcmp(&topology, &env->topology, sizeof(topology)) != 0;
-    return env->safe_step_reward * (result.max_rho <= 1.0) -
-           env->congestion_cost_weight * result.congestion_cost -
-           env->switch_penalty * switched;
-}
-
-static int power_grid_best_lookahead_line_action(const PowerGrid *env)
-{
-    if (env->solution.status != POWER_GRID_SOLVE_OK || env->solution.max_rho <= 1.0)
-        return POWER_GRID_ACTION_NONE;
-    double no_op = power_grid_line_action_value(
-        env, POWER_GRID_ACTION_NONE, NULL, NULL);
-    double best_value = 2.0 * no_op;
-    int best_action = POWER_GRID_ACTION_NONE;
-    for (int first = POWER_GRID_LINE_ACTION_OFFSET;
-         first < POWER_GRID_TERMINAL_ACTION_OFFSET; first++)
-    {
-        PowerGrid candidate = *env;
-        double first_value = power_grid_line_action_value(
-            env, first, &candidate.solution, &candidate.topology);
-        if (!isfinite(first_value) ||
-            candidate.solution.congestion_cost >= env->solution.congestion_cost - 1e-12)
-            continue;
-        double second_value = power_grid_line_action_value(
-            &candidate, POWER_GRID_ACTION_NONE, NULL, NULL);
-        for (int second = POWER_GRID_LINE_ACTION_OFFSET;
-             second < POWER_GRID_TERMINAL_ACTION_OFFSET; second++)
-            second_value = fmax(second_value,
-                power_grid_line_action_value(&candidate, second, NULL, NULL));
-        double value = first_value + second_value;
-        if (value > best_value + 1e-12)
-        {
-            best_value = value;
-            best_action = first;
-        }
-    }
-    return best_action;
-}
-
 
 static void power_grid_finish_episode(PowerGrid *env)
 {
@@ -711,6 +662,129 @@ static void power_grid_finish_episode(PowerGrid *env)
     }
 }
 
+static uint32_t power_grid_one_step_recovery_lines
+    [POWER_GRID_OFFLINE_TRAIN_COUNT][POWER_GRID_NUM_PERIODS];
+static int power_grid_one_step_recovery_cache_ready;
+
+static int power_grid_has_one_step_recovery(
+    const PowerGrid *env, const PowerGridTopology *outage_topology)
+{
+    if (power_grid_one_step_recovery_cache_ready &&
+        env->offline_scenario >= POWER_GRID_OFFLINE_SCENARIOS &&
+        env->offline_scenario < POWER_GRID_OFFLINE_SCENARIOS +
+                                POWER_GRID_OFFLINE_TRAIN_COUNT)
+    {
+        int outage_line = -1;
+        int outage_count = 0;
+        for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            if (!outage_topology->line_closed[line])
+            {
+                outage_line = line;
+                outage_count++;
+            }
+        if (outage_count == 1)
+        {
+            ptrdiff_t scenario =
+                env->offline_scenario - POWER_GRID_OFFLINE_SCENARIOS;
+            return (power_grid_one_step_recovery_lines
+                        [scenario][env->operating_period] &
+                    (UINT32_C(1) << outage_line)) != 0;
+        }
+    }
+    for (int action = 1; action < POWER_GRID_NUM_ACTIONS; action++)
+    {
+        PowerGridTopology topology = *outage_topology;
+        power_grid_apply_action(&topology, action);
+        for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            if (!env->line_available[line])
+                topology.line_closed[line] = 0;
+        if (memcmp(&topology, outage_topology, sizeof(topology)) == 0)
+            continue;
+        PowerGridSolveResult solution;
+        if (power_grid_solve_scaled(&topology, &env->operating_point, &solution,
+                                    env->branch_rating_scale) == POWER_GRID_SOLVE_OK &&
+            solution.max_rho <= 1.0)
+            return 1;
+    }
+    return 0;
+}
+
+static inline void power_grid_prepare_one_step_recovery_cache(void)
+{
+    if (power_grid_one_step_recovery_cache_ready)
+        return;
+    PowerGrid probe = {.offline_scenarios = 1};
+    memset(probe.line_available, 1, sizeof(probe.line_available));
+    for (int scenario = 0; scenario < POWER_GRID_OFFLINE_TRAIN_COUNT; scenario++)
+    {
+        probe.offline_scenario = &POWER_GRID_OFFLINE_SCENARIOS[scenario];
+        for (int period = 0; period < POWER_GRID_NUM_PERIODS; period++)
+        {
+            power_grid_set_operating_period(&probe, period);
+            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+            {
+                if (!power_grid_random_event_eligible(line))
+                    continue;
+                PowerGridTopology topology;
+                PowerGridSolveResult solution;
+                power_grid_topology_normal(&topology);
+                topology.line_closed[line] = 0;
+                if (power_grid_solve_scaled(
+                        &topology, &probe.operating_point, &solution,
+                        probe.branch_rating_scale) != POWER_GRID_SOLVE_OK ||
+                    solution.max_rho <= 1.0)
+                    continue;
+                probe.line_available[line] = 0;
+                int recoverable = 0;
+                for (int action = 1; action < POWER_GRID_NUM_ACTIONS; action++)
+                {
+                    PowerGridTopology recovered = topology;
+                    power_grid_apply_action(&recovered, action);
+                    recovered.line_closed[line] = 0;
+                    if (memcmp(&recovered, &topology, sizeof(topology)) == 0)
+                        continue;
+                    if (power_grid_solve_scaled(
+                            &recovered, &probe.operating_point, &solution,
+                            probe.branch_rating_scale) == POWER_GRID_SOLVE_OK &&
+                        solution.max_rho <= 1.0)
+                    {
+                        recoverable = 1;
+                        break;
+                    }
+                }
+                if (recoverable)
+                    power_grid_one_step_recovery_lines[scenario][period] |=
+                        UINT32_C(1) << line;
+                probe.line_available[line] = 1;
+            }
+        }
+    }
+    power_grid_one_step_recovery_cache_ready = 1;
+}
+
+static int power_grid_sample_one_step_outage(PowerGrid *env)
+{
+    if (!power_grid_one_step_recovery_cache_ready ||
+        env->offline_scenario < POWER_GRID_OFFLINE_SCENARIOS ||
+        env->offline_scenario >= POWER_GRID_OFFLINE_SCENARIOS +
+                                 POWER_GRID_OFFLINE_TRAIN_COUNT)
+        return -1;
+    ptrdiff_t scenario = env->offline_scenario - POWER_GRID_OFFLINE_SCENARIOS;
+    uint32_t recoverable = power_grid_one_step_recovery_lines
+        [scenario][env->operating_period];
+    int line_count = 0;
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+        line_count += (recoverable >> line) & 1u;
+    if (line_count == 0)
+        return -1;
+    int selected = (int)(next_random(env) % (unsigned int)line_count);
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+        if ((recoverable >> line) & 1u)
+            if (selected-- == 0)
+                return line;
+    return -1;
+}
+
 void c_reset(PowerGrid *env)
 {
     power_grid_topology_normal(&env->topology);
@@ -723,6 +797,13 @@ void c_reset(PowerGrid *env)
     env->last_action_type = POWER_GRID_ACTION_NONE;
     env->episode_return = 0.0f;
     env->active_random_event_line = -1;
+    env->last_failure_was_event = 0;
+    int reset_outages_now = env->random_outages_at_reset;
+    if (reset_outages_now && env->reset_outage_probability < 1.0)
+    {
+        double reset_sample = (double)(next_random(env) >> 8) / 16777216.0;
+        reset_outages_now = reset_sample < env->reset_outage_probability;
+    }
     env->offline_scenario = NULL;
     env->branch_rating_scale = 1.0;
     if (env->offline_scenarios)
@@ -750,6 +831,11 @@ void c_reset(PowerGrid *env)
         env->synthetic_profile = (PowerGridProfile)(
             1 + next_random(env) % (POWER_GRID_NUM_PROFILES - 1));
     }
+    env->current_period = 0;
+    int reset_operating_period = env->random_outages_at_reset &&
+        env->randomize_reset_operating_period ?
+        (int)(next_random(env) % POWER_GRID_NUM_PERIODS) : 0;
+    power_grid_set_operating_period(env, reset_operating_period);
     env->scheduled_random_event_count = 0;
     for (int event = 0; event < POWER_GRID_MAX_RANDOM_OUTAGES; event++)
     {
@@ -765,46 +851,110 @@ void c_reset(PowerGrid *env)
             env->scheduled_random_event_count =
                 requested < POWER_GRID_MAX_RANDOM_OUTAGES ? requested :
                                                             POWER_GRID_MAX_RANDOM_OUTAGES;
-            for (int event = 0; event < env->scheduled_random_event_count; event++)
+            if (env->random_outages_at_reset && !reset_outages_now)
+                env->scheduled_random_event_count = 0;
+            int schedule_accepted;
+            int schedule_attempts = 0;
+            do
             {
-                int period;
-                int unique_period;
-                do
+                for (int event = 0; event < env->scheduled_random_event_count; event++)
                 {
-                    period = 1 + (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
-                    unique_period = 1;
-                    for (int prior = 0; prior < event; prior++)
-                        unique_period &= env->scheduled_random_event_period[prior] != period;
-                }
-                while (!unique_period);
-                env->scheduled_random_event_period[event] = period;
-
-                int line;
-                int unique_line;
-                do
-                {
-                    line = (int)(next_random(env) % POWER_GRID_NUM_BRANCHES);
-                    unique_line = power_grid_random_event_eligible(line);
-                    for (int prior = 0; prior < event; prior++)
-                        unique_line &= env->scheduled_random_event_line[prior] != line;
-                    if (unique_line)
+                    int period = 0;
+                    if (!reset_outages_now)
                     {
-                        PowerGridTopology candidate;
-                        power_grid_topology_normal(&candidate);
-                        candidate.line_closed[line] = 0;
-                        for (int prior = 0; prior < event; prior++)
-                            candidate.line_closed[env->scheduled_random_event_line[prior]] = 0;
-                        unique_line = power_grid_validate_topology(
-                            &candidate, NULL, NULL) == POWER_GRID_SOLVE_OK;
+                        int unique_period;
+                        do
+                        {
+                            period = 1 +
+                                (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
+                            unique_period = 1;
+                            for (int prior = 0; prior < event; prior++)
+                                unique_period &=
+                                    env->scheduled_random_event_period[prior] != period;
+                        }
+                        while (!unique_period);
+                    }
+                    env->scheduled_random_event_period[event] = period;
+
+                    int line = -1;
+                    int unique_line = 0;
+                    if (reset_outages_now &&
+                        env->initial_outage_requires_one_step_recovery &&
+                        env->scheduled_random_event_count == 1)
+                    {
+                        line = power_grid_sample_one_step_outage(env);
+                        unique_line = line >= 0;
+                    }
+                    if (!unique_line)
+                    {
+                        do
+                        {
+                            line = (int)(next_random(env) % POWER_GRID_NUM_BRANCHES);
+                            unique_line = power_grid_random_event_eligible(line);
+                            for (int prior = 0; prior < event; prior++)
+                                unique_line &=
+                                    env->scheduled_random_event_line[prior] != line;
+                            if (unique_line)
+                            {
+                                PowerGridTopology candidate;
+                                power_grid_topology_normal(&candidate);
+                                candidate.line_closed[line] = 0;
+                                for (int prior = 0; prior < event; prior++)
+                                    candidate.line_closed[
+                                        env->scheduled_random_event_line[prior]] = 0;
+                                unique_line = power_grid_validate_topology(
+                                    &candidate, NULL, NULL) == POWER_GRID_SOLVE_OK;
+                            }
+                        }
+                        while (!unique_line);
+                    }
+                    env->scheduled_random_event_line[event] = line;
+                }
+
+                schedule_accepted = 1;
+                if (reset_outages_now &&
+                    env->initial_outage_requires_overload)
+                {
+                    PowerGridTopology candidate;
+                    PowerGridSolveResult candidate_solution;
+                    power_grid_topology_normal(&candidate);
+                    for (int event = 0; event < env->scheduled_random_event_count; event++)
+                        candidate.line_closed[env->scheduled_random_event_line[event]] = 0;
+                    schedule_accepted = power_grid_solve_scaled(
+                        &candidate, &env->operating_point, &candidate_solution,
+                        env->branch_rating_scale) == POWER_GRID_SOLVE_OK &&
+                        candidate_solution.max_rho > 1.0;
+                    if (schedule_accepted &&
+                        env->initial_outage_requires_one_step_recovery)
+                    {
+                        unsigned char availability[POWER_GRID_NUM_BRANCHES];
+                        memcpy(availability, env->line_available,
+                               sizeof(availability));
+                        for (int event = 0;
+                             event < env->scheduled_random_event_count; event++)
+                            env->line_available[
+                                env->scheduled_random_event_line[event]] = 0;
+                        schedule_accepted =
+                            power_grid_has_one_step_recovery(env, &candidate);
+                        memcpy(env->line_available, availability,
+                               sizeof(availability));
                     }
                 }
-                while (!unique_line);
-                env->scheduled_random_event_line[event] = line;
+                schedule_attempts++;
             }
+            while (!schedule_accepted && schedule_attempts < 256);
         }
     }
-    env->current_period = 0;
-    power_grid_set_operating_period(env, 0);
+    for (int event = 0; event < env->scheduled_random_event_count; event++)
+    {
+        if (!reset_outages_now || env->scheduled_random_event_period[event] != 0)
+            continue;
+        int line = env->scheduled_random_event_line[event];
+        env->line_available[line] = 0;
+        env->topology.line_closed[line] = 0;
+        env->active_random_event_line = line;
+        env->episode.random_events++;
+    }
     power_grid_solve_environment(env);
     power_grid_compute_observations(env);
 }
@@ -824,22 +974,13 @@ void c_step(PowerGrid *env)
     }
     int previously_safe = env->solution.status == POWER_GRID_SOLVE_OK &&
                           env->solution.max_rho <= 1.0;
-    int recovery_active = power_grid_has_active_outage(env);
-    int lookahead_action = recovery_active && env->lookahead_action_reward > 0.0f ?
-        power_grid_best_lookahead_line_action(env) : POWER_GRID_ACTION_NONE;
-    PowerGridTopology previous_topology = env->topology;
-    PowerGridSolveResult previous_solution = env->solution;
-    PowerGridACSolveResult previous_ac_solution = env->ac_solution;
-    /* This is a recovery controller, not a preventive switching policy. Grid
-     * operators leave a secure topology alone; PPO is consulted only when the
-     * solved state is overloaded. */
-    float requested_action = (!recovery_active || previously_safe) ?
-        POWER_GRID_ACTION_NONE : env->actions[0];
-    PowerGridAppliedAction action = apply_agent_action(env, requested_action);
+    double previous_overload = env->solution.status == POWER_GRID_SOLVE_OK ?
+        fmax(env->solution.max_rho - 1.0, 0.0) : 0.0;
+    PowerGridAppliedAction action = apply_agent_action(env, env->actions[0]);
     env->terminals[0] = 0.0f;
     /* In DC mode, a no-op before a period transition leaves every value in the
      * observation vector unchanged. Track whether a later state mutation
-     * actually requires rebuilding the 221-float observation. */
+     * actually requires rebuilding the complete observation. */
     int observations_dirty = action.switched || env->ac_power_flow;
     int observation_only_terminal = action.observation_only_terminal;
 
@@ -871,30 +1012,12 @@ void c_step(PowerGrid *env)
         status = env->solution.status;
     }
 
-    /* Real grid controls reject switching commands that would disconnect
-     * equipment or leave the power flow unsolvable. Keep the last valid state
-     * and penalize the attempted command, allowing PPO to continue exploring
-     * the recovery sequence instead of learning only from very short episodes. */
-    int rejected_action = action.switched &&
-        (status != POWER_GRID_SOLVE_OK ||
-         env->solution.congestion_cost >= previous_solution.congestion_cost - 1e-12);
-    if (rejected_action)
-    {
-        env->topology = previous_topology;
-        env->solution = previous_solution;
-        env->ac_solution = previous_ac_solution;
-        env->episode.switches[0]--;
-        env->episode.switches[action.type]--;
-        action.switched = 0;
-        action.electrical_change = 0;
-        observations_dirty = 0;
-        status = env->solution.status;
-    }
     env->episode_step++;
 
     int metric_safe = 0;
     int reward_safe = 0;
     double constraint_cost = 0.0;
+    double congestion_progress = 0.0;
     if (status == POWER_GRID_SOLVE_OK)
     {
         /* DC may reuse an unchanged solution, but loading diagnostics describe
@@ -911,13 +1034,17 @@ void c_step(PowerGrid *env)
         metric_safe = reward_safe &&
                       (!env->ac_power_flow || env->ac_solution.voltage_violation_count == 0);
         constraint_cost = env->congestion_cost_weight * env->solution.congestion_cost;
+        double overload = fmax(env->solution.max_rho - 1.0, 0.0);
+        /* Signed potential shaping: undoing and repeating a topology change
+         * has zero net progress, so oscillations cannot farm reward. */
+        congestion_progress = previous_overload - overload;
         env->episode.safe_steps += metric_safe;
         env->episode.demand_served_steps++;
     }
 
-    /* A rejected command is an operational inconvenience, not a blackout. */
-    env->rewards[0] = rejected_action ? -env->switch_penalty : calculate_reward(
-        env, status, constraint_cost, action.type != POWER_GRID_ACTION_NONE, reward_safe);
+    env->rewards[0] = calculate_reward(
+        env, status, constraint_cost, congestion_progress,
+        action.switched, action.electrical_change, previously_safe, reward_safe);
     if (action.electrical_change && env->episode.random_events > 0 &&
         env->episode.recoveries_rewarded < env->episode.random_events &&
         !previously_safe && reward_safe)
@@ -925,14 +1052,15 @@ void c_step(PowerGrid *env)
         env->rewards[0] += env->recovery_reward;
         env->episode.recoveries_rewarded++;
     }
-    if (lookahead_action != POWER_GRID_ACTION_NONE && action.value == lookahead_action)
-        env->rewards[0] += env->lookahead_action_reward;
-    env->terminals[0] = (!rejected_action && status != POWER_GRID_SOLVE_OK) ||
+    int recovery_completed = env->end_episode_on_recovery &&
+                             env->episode.random_events > 0 && reward_safe;
+    env->terminals[0] = status != POWER_GRID_SOLVE_OK || recovery_completed ||
                         (env->max_episode_steps > 0 &&
                          env->episode_step >= env->max_episode_steps);
 
     if (env->terminals[0])
     {
+        env->last_failure_was_event = 0;
         env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);
         return;
@@ -959,23 +1087,13 @@ void c_step(PowerGrid *env)
             random_event_applied = 1;
         }
         status = power_grid_solve_environment(env);
-        if (status != POWER_GRID_SOLVE_OK && random_event_applied)
-        {
-            /* A prior recovery switch can make the next otherwise-valid forced
-             * outage disconnect the modified topology. Retry from the normal
-             * controllable line state while preserving every forced outage. */
-            power_grid_topology_normal(&env->topology);
-            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-                if (!env->line_available[line])
-                    env->topology.line_closed[line] = 0;
-            status = power_grid_solve_environment(env);
-        }
     }
     if (status != POWER_GRID_SOLVE_OK)
     {
         /* New injections can expose an infeasible state without another agent action. */
         env->log.event_failure += random_event_applied;
-        env->rewards[0] = calculate_reward(env, status, 0.0, 0, 0);
+        env->last_failure_was_event = random_event_applied;
+        env->rewards[0] = calculate_reward(env, status, 0.0, 0.0, 0, 0, 0, 0);
         env->terminals[0] = 1.0f;
         env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);
@@ -1005,9 +1123,12 @@ void power_grid_allocate(PowerGrid *env)
     env->failure_reward = POWER_GRID_DEFAULT_FAILURE_REWARD;
     env->safe_step_reward = POWER_GRID_DEFAULT_SAFE_STEP_REWARD;
     env->recovery_reward = POWER_GRID_DEFAULT_RECOVERY_REWARD;
-    env->lookahead_action_reward = POWER_GRID_DEFAULT_LOOKAHEAD_ACTION_REWARD;
     env->switch_penalty = POWER_GRID_DEFAULT_SWITCH_PENALTY;
+    env->secure_switch_penalty = POWER_GRID_DEFAULT_SECURE_SWITCH_PENALTY;
     env->congestion_cost_weight = POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT;
+    env->congestion_progress_weight = POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT;
+    if (env->reset_outage_probability == 0.0)
+        env->reset_outage_probability = 1.0;
     env->branch_rating_scale = 1.0;
 }
 

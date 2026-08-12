@@ -1,18 +1,43 @@
 #include <stdlib.h>
-#include <string.h>
+#include <time.h>
 
-#include "../../src/puffernet.h"
 #include "power_grid_solver.c"
 #include "power_grid.h"
+#include "power_grid_policy.h"
 #include "power_grid_user.h"
 
-static void power_grid_policy_action(PufferNet *policy, PowerGrid *env)
+typedef struct
 {
-    linear(policy->encoder, env->observations);
-    mingru(policy->mingru, policy->encoder->output);
-    linear(policy->decoder, policy->mingru->output);
-    argmax_multidiscrete(policy->multidiscrete, policy->decoder->output,
-                         env->actions);
+    Weights *weights;
+    PufferNet *network;
+} PowerGridRuntimePolicy;
+
+static PowerGridRuntimePolicy power_grid_load_policy(void)
+{
+    PowerGridRuntimePolicy policy = {0};
+    policy.weights = load_weights("resources/power_grid/policy.bin");
+    if (policy.weights == NULL)
+        return policy;
+    int action_sizes[1] = {POWER_GRID_NUM_ACTIONS};
+    policy.network = make_puffernet(policy.weights, 1, POWER_GRID_OBS_SIZE,
+                                    POWER_GRID_POLICY_HIDDEN_SIZE,
+                                    POWER_GRID_POLICY_NUM_LAYERS,
+                                    action_sizes, 1);
+    return policy;
+}
+
+static void power_grid_free_policy(PowerGridRuntimePolicy *policy)
+{
+    if (policy->network == NULL)
+        return;
+    free_puffernet(policy->network);
+    free(policy->weights);
+    *policy = (PowerGridRuntimePolicy){0};
+}
+
+static const char *power_grid_inference_name(PowerGridInferenceMode mode)
+{
+    return mode == POWER_GRID_INFERENCE_ARGMAX ? "ARGMAX" : "STOCHASTIC";
 }
 
 int main(void) {
@@ -22,34 +47,66 @@ int main(void) {
     env.ac_power_flow = 0;
     env.offline_scenarios = 1;
     env.offline_scenario_validation = 1;
-    /* The live app is user-driven. Random outages remain a training option,
-     * but must not compete with the one or two lines selected in the UI. */
-    env.random_events = 0;
+    env.random_events = 1;
+    env.random_event_probability = 1.0;
+    env.random_outage_count = 2;
     power_grid_allocate(&env);
-    env.max_episode_steps = 0;
     c_reset(&env);
     PowerGridUserSession user;
     power_grid_user_init(&user, 2);
-    Weights *weights = load_weights("resources/power_grid/policy.bin");
-    if (weights == NULL)
+    PowerGridRuntimePolicy policy = power_grid_load_policy();
+    if (policy.network == NULL)
         return 1;
-    int action_sizes[1] = {POWER_GRID_TERMINAL_ACTION_OFFSET};
-    PufferNet *policy = make_puffernet(weights, 1, POWER_GRID_OBS_SIZE,
-                                       512, 1, action_sizes, 1);
+    PowerGridInferenceMode mode = POWER_GRID_INFERENCE_STOCHASTIC;
+    int terminal_frames = 0;
+    int terminal_failed = 0;
+    int terminal_event_failure = 0;
+    srand((unsigned int)time(NULL));
     c_render(&env);
     while (!WindowShouldClose()) {
+        if (IsKeyPressed(KEY_ONE))
+            mode = POWER_GRID_INFERENCE_STOCHASTIC;
+        if (IsKeyPressed(KEY_TWO))
+            mode = POWER_GRID_INFERENCE_ARGMAX;
+        const char *episode_status = terminal_frames == 0 ? "" :
+            (terminal_event_failure ? " | AUTOMATIC OUTAGE CAUSED INSTANT FAILURE" :
+             terminal_failed ? " | EPISODE FAILED - restarting" :
+                               " | EPISODE COMPLETE - restarting");
+        const char *user_status = user.last_status == POWER_GRID_SOLVE_OK ? "" :
+            TextFormat(" | user request rejected: %s",
+                       power_grid_solve_status_name(user.last_status));
+        SetWindowTitle(TextFormat(
+            "IEEE-14 | %s (1 stochastic, 2 argmax) | user outages %d/2%s%s",
+            power_grid_inference_name(mode), power_grid_user_outage_count(&user),
+            episode_status, user_status));
+
+        if (terminal_frames > 0)
+        {
+            terminal_frames--;
+            c_render(&env);
+            if (terminal_frames == 0)
+            {
+                power_grid_free_policy(&policy);
+                c_reset(&env);
+                power_grid_user_init(&user, 2);
+                policy = power_grid_load_policy();
+                if (policy.network == NULL)
+                    break;
+            }
+            continue;
+        }
         power_grid_user_handle_input(&user, &env);
-        power_grid_policy_action(policy, &env);
+        power_grid_policy_action(policy.network, env.observations, env.actions, mode);
         c_step(&env);
-        if (env.episode_step > 0 &&
-            env.episode_step % POWER_GRID_EPISODE_STEPS == 0)
-            memset(policy->mingru->state, 0,
-                   (size_t)policy->mingru->num_layers *
-                   policy->mingru->hidden_size * sizeof(float));
+        if (env.terminals[0] > 0.5f)
+        {
+            terminal_frames = 90;
+            terminal_failed = env.solution.status != POWER_GRID_SOLVE_OK;
+            terminal_event_failure = env.last_failure_was_event;
+        }
         c_render(&env);
     }
-    free_puffernet(policy);
-    free(weights);
+    power_grid_free_policy(&policy);
     c_close(&env);
     return 0;
 }

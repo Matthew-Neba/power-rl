@@ -6,11 +6,7 @@
 
 #define OBS_SIZE POWER_GRID_OBS_SIZE
 #define NUM_ATNS 1
-/* The learned recovery controller chooses no-op or a line switch. The full
- * simulator and renderer still support terminal and coupler operations, but
- * those controls enlarged PPO's head from 21 to 91 choices without improving
- * either greedy baseline on the outage benchmark. */
-#define ACT_SIZES {POWER_GRID_TERMINAL_ACTION_OFFSET}
+#define ACT_SIZES {POWER_GRID_NUM_ACTIONS}
 #define OBS_TENSOR_T FloatTensor
 
 #define Env PowerGrid
@@ -19,7 +15,7 @@
 void my_init(Env* env, Dict* kwargs) {
     env->num_agents = 1;
     env->owns_buffers = 0;
-    env->max_episode_steps = POWER_GRID_EPISODE_STEPS;
+    env->max_episode_steps = (int)dict_get(kwargs, "max_episode_steps")->value;
     env->ac_power_flow = (int)dict_get(kwargs, "ac_power_flow")->value;
     env->offline_scenarios = (int)dict_get(kwargs, "offline_scenarios")->value;
     env->offline_scenario_validation =
@@ -28,16 +24,34 @@ void my_init(Env* env, Dict* kwargs) {
     env->random_events = (int)dict_get(kwargs, "random_events")->value;
     env->random_event_probability = dict_get(kwargs, "random_event_probability")->value;
     env->random_outage_count = (int)dict_get(kwargs, "random_outage_count")->value;
+    env->random_outages_at_reset =
+        (int)dict_get(kwargs, "random_outages_at_reset")->value;
+    env->reset_outage_probability =
+        dict_get(kwargs, "reset_outage_probability")->value;
+    env->randomize_reset_operating_period =
+        (int)dict_get(kwargs, "randomize_reset_operating_period")->value;
+    env->initial_outage_requires_overload =
+        (int)dict_get(kwargs, "initial_outage_requires_overload")->value;
+    env->initial_outage_requires_one_step_recovery =
+        (int)dict_get(kwargs,
+                      "initial_outage_requires_one_step_recovery")->value;
+    env->end_episode_on_recovery =
+        (int)dict_get(kwargs, "end_episode_on_recovery")->value;
     env->single_episode_evaluation =
         (int)dict_get(kwargs, "single_episode_evaluation")->value;
     env->failure_reward = (float)dict_get(kwargs, "failure_reward")->value;
     env->safe_step_reward = (float)dict_get(kwargs, "safe_step_reward")->value;
     env->recovery_reward = (float)dict_get(kwargs, "recovery_reward")->value;
-    env->lookahead_action_reward =
-        (float)dict_get(kwargs, "lookahead_action_reward")->value;
     env->switch_penalty = (float)dict_get(kwargs, "switch_penalty")->value;
+    env->secure_switch_penalty =
+        (float)dict_get(kwargs, "secure_switch_penalty")->value;
     env->congestion_cost_weight =
         (float)dict_get(kwargs, "congestion_cost_weight")->value;
+    env->congestion_progress_weight =
+        (float)dict_get(kwargs, "congestion_progress_weight")->value;
+    if (env->initial_outage_requires_one_step_recovery &&
+        env->offline_scenario_probability >= 1.0)
+        power_grid_prepare_one_step_recovery_cache();
 }
 
 void my_log(Log* log, Dict* out) {
