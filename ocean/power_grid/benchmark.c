@@ -1,11 +1,15 @@
 #define POWER_GRID_NO_RENDER
 
-#include "power_grid_solver.c"
-#include "power_grid.h"
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#include "../../src/puffernet.h"
+#pragma clang diagnostic pop
+#include "power_grid_solver.c"
+#include "power_grid.h"
 
 typedef enum {
     BASELINE_NO_ACTION,
@@ -14,7 +18,10 @@ typedef enum {
     BASELINE_SAFE_RANDOM,
     BASELINE_GREEDY_LINES,
     BASELINE_GREEDY_ALL,
+    BASELINE_LOOKAHEAD_LINES,
     BASELINE_COUNT,
+    POLICY_PPO = BASELINE_COUNT,
+    POLICY_COUNT,
 } BaselinePolicy;
 
 typedef struct {
@@ -34,14 +41,26 @@ typedef struct {
     double overloaded_line_fraction;
 } BenchmarkMetrics;
 
-static const char *const BASELINE_NAMES[BASELINE_COUNT] = {
+static const char *const BASELINE_NAMES[POLICY_COUNT] = {
     "No action",
     "Uniform random",
     "Random lines",
     "Safe random",
     "Greedy lines",
     "Greedy all",
+    "Lookahead lines",
+    "PPO deterministic",
 };
+
+static int deterministic_ppo_action(PufferNet *policy, const float *observations)
+{
+    float action = 0.0f;
+    linear(policy->encoder, (float *)observations);
+    mingru(policy->mingru, policy->encoder->output);
+    linear(policy->decoder, policy->mingru->output);
+    argmax_multidiscrete(policy->multidiscrete, policy->decoder->output, &action);
+    return (int)action;
+}
 
 static uint32_t baseline_random(uint32_t *state)
 {
@@ -103,12 +122,45 @@ static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t
     if (policy == BASELINE_RANDOM_LINES)
         return (int)(baseline_random(rng) % POWER_GRID_TERMINAL_ACTION_OFFSET);
 
-    if ((policy == BASELINE_GREEDY_LINES || policy == BASELINE_GREEDY_ALL) &&
+    if ((policy == BASELINE_GREEDY_LINES || policy == BASELINE_GREEDY_ALL ||
+         policy == BASELINE_LOOKAHEAD_LINES) &&
         env->solution.max_rho <= 1.0)
         return POWER_GRID_ACTION_NONE;
 
     int action_limit = policy == BASELINE_GREEDY_LINES ?
                        POWER_GRID_TERMINAL_ACTION_OFFSET : POWER_GRID_NUM_ACTIONS;
+    if (policy == BASELINE_LOOKAHEAD_LINES)
+    {
+        int best_action = POWER_GRID_ACTION_NONE;
+        double best_value = 2.0 * immediate_action_value(env, best_action);
+        for (int first = POWER_GRID_LINE_ACTION_OFFSET;
+             first < POWER_GRID_TERMINAL_ACTION_OFFSET; first++)
+        {
+            PowerGrid candidate = *env;
+            power_grid_apply_action(&candidate.topology, first);
+            int line = first - POWER_GRID_LINE_ACTION_OFFSET;
+            if (!candidate.line_available[line])
+                candidate.topology.line_closed[line] = 0;
+            if (power_grid_solve_scaled(&candidate.topology, &candidate.operating_point,
+                                        &candidate.solution,
+                                        candidate.branch_rating_scale) != POWER_GRID_SOLVE_OK ||
+                candidate.solution.congestion_cost >= env->solution.congestion_cost - 1e-12)
+                continue;
+            double first_value = immediate_action_value(env, first);
+            double second_value = immediate_action_value(&candidate, POWER_GRID_ACTION_NONE);
+            for (int second = POWER_GRID_LINE_ACTION_OFFSET;
+                 second < POWER_GRID_TERMINAL_ACTION_OFFSET; second++)
+                second_value = fmax(second_value,
+                                    immediate_action_value(&candidate, second));
+            double value = first_value + second_value;
+            if (value > best_value + 1e-12)
+            {
+                best_value = value;
+                best_action = first;
+            }
+        }
+        return best_action;
+    }
     if (policy == BASELINE_SAFE_RANDOM)
     {
         int valid[POWER_GRID_NUM_ACTIONS];
@@ -137,9 +189,21 @@ static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t
 
 static BenchmarkMetrics run_baseline(
     BaselinePolicy policy, int episodes, int ac_power_flow,
-    double random_event_probability, int random_outage_count, int seed_offset)
+    double random_event_probability, int random_outage_count, int seed_offset,
+    const char *checkpoint)
 {
     BenchmarkMetrics total = {0};
+    Weights *weights = NULL;
+    PufferNet *learned = NULL;
+    if (policy == POLICY_PPO)
+    {
+        weights = load_weights(checkpoint);
+        if (weights == NULL)
+            exit(1);
+        int action_sizes[1] = {POWER_GRID_TERMINAL_ACTION_OFFSET};
+        learned = make_puffernet(weights, 1, POWER_GRID_OBS_SIZE, 512, 1,
+                                 action_sizes, 1);
+    }
     for (int episode_index = 0; episode_index < episodes; episode_index++)
     {
         int episode = seed_offset + episode_index;
@@ -155,10 +219,17 @@ static BenchmarkMetrics run_baseline(
         };
         uint32_t action_rng = UINT32_C(0x9e3779b9) ^ (uint32_t)episode;
         power_grid_allocate(&env);
+        env.lookahead_action_reward = 0.0f;
         c_reset(&env);
+        if (learned != NULL)
+            memset(learned->mingru->state, 0,
+                   (size_t)learned->mingru->num_layers * learned->mingru->hidden_size *
+                       sizeof(float));
         while (env.log.n == 0.0f)
         {
-            env.actions[0] = (float)baseline_action(&env, policy, &action_rng);
+            env.actions[0] = learned == NULL ?
+                (float)baseline_action(&env, policy, &action_rng) :
+                (float)deterministic_ppo_action(learned, env.observations);
             c_step(&env);
         }
         total.perf += env.log.perf;
@@ -176,6 +247,11 @@ static BenchmarkMetrics run_baseline(
         total.peak_line_loading += env.log.peak_line_loading;
         total.overloaded_line_fraction += env.log.overloaded_line_fraction;
         c_close(&env);
+    }
+    if (learned != NULL)
+    {
+        free_puffernet(learned);
+        free(weights);
     }
     double scale = 1.0 / episodes;
     total.perf *= scale;
@@ -203,14 +279,20 @@ int main(int argc, char **argv)
     int random_outage_count = argc > 4 ? atoi(argv[4]) : 3;
     int selected_policy = argc > 5 ? atoi(argv[5]) : -1;
     int seed_offset = argc > 6 ? atoi(argv[6]) : 0;
+    const char *checkpoint = argc > 7 ? argv[7] : NULL;
     if (episodes <= 0)
     {
         fprintf(stderr, "episodes must be positive\n");
         return 1;
     }
-    if (selected_policy < -1 || selected_policy >= BASELINE_COUNT)
+    if (selected_policy < -1 || selected_policy >= POLICY_COUNT)
     {
-        fprintf(stderr, "policy must be -1 or between 0 and %d\n", BASELINE_COUNT - 1);
+        fprintf(stderr, "policy must be -1 or between 0 and %d\n", POLICY_COUNT - 1);
+        return 1;
+    }
+    if (selected_policy == POLICY_PPO && checkpoint == NULL)
+    {
+        fprintf(stderr, "deterministic PPO policy requires a checkpoint path\n");
         return 1;
     }
     if (seed_offset < 0)
@@ -229,7 +311,7 @@ int main(int argc, char **argv)
     {
         BenchmarkMetrics metrics = run_baseline(
             (BaselinePolicy)policy, episodes, ac_power_flow,
-            random_event_probability, random_outage_count, seed_offset);
+            random_event_probability, random_outage_count, seed_offset, checkpoint);
         printf("%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                BASELINE_NAMES[policy], episodes, metrics.perf, metrics.score,

@@ -90,6 +90,8 @@ static inline double power_grid_weather_rating_scale(
 /* Reward configuration. */
 #define POWER_GRID_DEFAULT_FAILURE_REWARD (-1.0f)
 #define POWER_GRID_DEFAULT_SAFE_STEP_REWARD 0.01f
+#define POWER_GRID_DEFAULT_RECOVERY_REWARD 0.10f
+#define POWER_GRID_DEFAULT_LOOKAHEAD_ACTION_REWARD 1.0f
 #define POWER_GRID_DEFAULT_SWITCH_PENALTY 0.01f
 #define POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT 1.0f
 
@@ -151,6 +153,7 @@ typedef struct
     int safe_steps;
     int thermal_trips;
     int random_events;
+    int recoveries_rewarded;
     int demand_served_steps;
     int overloaded_line_steps;
     double peak_thermal_stress;
@@ -205,8 +208,12 @@ typedef struct
     double random_event_probability;
     int random_outage_count;
     int single_episode_evaluation;
+    /* Zero means unbounded operation. Training uses the default 72-step limit. */
+    int max_episode_steps;
     float failure_reward;
     float safe_step_reward;
+    float recovery_reward;
+    float lookahead_action_reward;
     float switch_penalty;
     float congestion_cost_weight;
     double branch_rating_scale;
@@ -570,6 +577,7 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     return action;
 }
 
+
 static float calculate_reward(const PowerGrid *env,
                               PowerGridSolveStatus solve_status,
                               double constraint_cost, int switched, int safe)
@@ -579,6 +587,74 @@ static float calculate_reward(const PowerGrid *env,
     return (float)(-constraint_cost - env->switch_penalty * switched +
                    env->safe_step_reward * safe);
 }
+
+static int power_grid_has_active_outage(const PowerGrid *env)
+{
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+        if (!env->line_available[line])
+            return 1;
+    return 0;
+}
+
+static double power_grid_line_action_value(const PowerGrid *env, int action,
+                                           PowerGridSolveResult *result_out,
+                                           PowerGridTopology *topology_out)
+{
+    PowerGridTopology topology = env->topology;
+    PowerGridActionType type = power_grid_apply_action(&topology, action);
+    if (type == POWER_GRID_ACTION_LINE)
+    {
+        int line = action - POWER_GRID_LINE_ACTION_OFFSET;
+        if (!env->line_available[line])
+            topology.line_closed[line] = 0;
+    }
+    PowerGridSolveResult result;
+    if (power_grid_solve_scaled(&topology, &env->operating_point, &result,
+                                env->branch_rating_scale) != POWER_GRID_SOLVE_OK)
+        return -INFINITY;
+    if (result_out != NULL)
+        *result_out = result;
+    if (topology_out != NULL)
+        *topology_out = topology;
+    int switched = memcmp(&topology, &env->topology, sizeof(topology)) != 0;
+    return env->safe_step_reward * (result.max_rho <= 1.0) -
+           env->congestion_cost_weight * result.congestion_cost -
+           env->switch_penalty * switched;
+}
+
+static int power_grid_best_lookahead_line_action(const PowerGrid *env)
+{
+    if (env->solution.status != POWER_GRID_SOLVE_OK || env->solution.max_rho <= 1.0)
+        return POWER_GRID_ACTION_NONE;
+    double no_op = power_grid_line_action_value(
+        env, POWER_GRID_ACTION_NONE, NULL, NULL);
+    double best_value = 2.0 * no_op;
+    int best_action = POWER_GRID_ACTION_NONE;
+    for (int first = POWER_GRID_LINE_ACTION_OFFSET;
+         first < POWER_GRID_TERMINAL_ACTION_OFFSET; first++)
+    {
+        PowerGrid candidate = *env;
+        double first_value = power_grid_line_action_value(
+            env, first, &candidate.solution, &candidate.topology);
+        if (!isfinite(first_value) ||
+            candidate.solution.congestion_cost >= env->solution.congestion_cost - 1e-12)
+            continue;
+        double second_value = power_grid_line_action_value(
+            &candidate, POWER_GRID_ACTION_NONE, NULL, NULL);
+        for (int second = POWER_GRID_LINE_ACTION_OFFSET;
+             second < POWER_GRID_TERMINAL_ACTION_OFFSET; second++)
+            second_value = fmax(second_value,
+                power_grid_line_action_value(&candidate, second, NULL, NULL));
+        double value = first_value + second_value;
+        if (value > best_value + 1e-12)
+        {
+            best_value = value;
+            best_action = first;
+        }
+    }
+    return best_action;
+}
+
 
 static void power_grid_finish_episode(PowerGrid *env)
 {
@@ -746,7 +822,20 @@ void c_step(PowerGrid *env)
         c_reset(env);
         return;
     }
-    PowerGridAppliedAction action = apply_agent_action(env, env->actions[0]);
+    int previously_safe = env->solution.status == POWER_GRID_SOLVE_OK &&
+                          env->solution.max_rho <= 1.0;
+    int recovery_active = power_grid_has_active_outage(env);
+    int lookahead_action = recovery_active && env->lookahead_action_reward > 0.0f ?
+        power_grid_best_lookahead_line_action(env) : POWER_GRID_ACTION_NONE;
+    PowerGridTopology previous_topology = env->topology;
+    PowerGridSolveResult previous_solution = env->solution;
+    PowerGridACSolveResult previous_ac_solution = env->ac_solution;
+    /* This is a recovery controller, not a preventive switching policy. Grid
+     * operators leave a secure topology alone; PPO is consulted only when the
+     * solved state is overloaded. */
+    float requested_action = (!recovery_active || previously_safe) ?
+        POWER_GRID_ACTION_NONE : env->actions[0];
+    PowerGridAppliedAction action = apply_agent_action(env, requested_action);
     env->terminals[0] = 0.0f;
     /* In DC mode, a no-op before a period transition leaves every value in the
      * observation vector unchanged. Track whether a later state mutation
@@ -781,6 +870,26 @@ void c_step(PowerGrid *env)
         }
         status = env->solution.status;
     }
+
+    /* Real grid controls reject switching commands that would disconnect
+     * equipment or leave the power flow unsolvable. Keep the last valid state
+     * and penalize the attempted command, allowing PPO to continue exploring
+     * the recovery sequence instead of learning only from very short episodes. */
+    int rejected_action = action.switched &&
+        (status != POWER_GRID_SOLVE_OK ||
+         env->solution.congestion_cost >= previous_solution.congestion_cost - 1e-12);
+    if (rejected_action)
+    {
+        env->topology = previous_topology;
+        env->solution = previous_solution;
+        env->ac_solution = previous_ac_solution;
+        env->episode.switches[0]--;
+        env->episode.switches[action.type]--;
+        action.switched = 0;
+        action.electrical_change = 0;
+        observations_dirty = 0;
+        status = env->solution.status;
+    }
     env->episode_step++;
 
     int metric_safe = 0;
@@ -806,10 +915,21 @@ void c_step(PowerGrid *env)
         env->episode.demand_served_steps++;
     }
 
-    env->rewards[0] = calculate_reward(
-        env, status, constraint_cost, action.switched, reward_safe);
-    env->terminals[0] = status != POWER_GRID_SOLVE_OK ||
-                        env->episode_step >= POWER_GRID_EPISODE_STEPS;
+    /* A rejected command is an operational inconvenience, not a blackout. */
+    env->rewards[0] = rejected_action ? -env->switch_penalty : calculate_reward(
+        env, status, constraint_cost, action.type != POWER_GRID_ACTION_NONE, reward_safe);
+    if (action.electrical_change && env->episode.random_events > 0 &&
+        env->episode.recoveries_rewarded < env->episode.random_events &&
+        !previously_safe && reward_safe)
+    {
+        env->rewards[0] += env->recovery_reward;
+        env->episode.recoveries_rewarded++;
+    }
+    if (lookahead_action != POWER_GRID_ACTION_NONE && action.value == lookahead_action)
+        env->rewards[0] += env->lookahead_action_reward;
+    env->terminals[0] = (!rejected_action && status != POWER_GRID_SOLVE_OK) ||
+                        (env->max_episode_steps > 0 &&
+                         env->episode_step >= env->max_episode_steps);
 
     if (env->terminals[0])
     {
@@ -819,7 +939,8 @@ void c_step(PowerGrid *env)
     }
 
     int random_event_applied = 0;
-    int next_period = env->episode_step / POWER_GRID_STEPS_PER_PERIOD;
+    int next_period = (env->episode_step / POWER_GRID_STEPS_PER_PERIOD) %
+                      POWER_GRID_NUM_PERIODS;
     if (next_period != env->current_period)
     {
         observations_dirty = 1;
@@ -838,6 +959,17 @@ void c_step(PowerGrid *env)
             random_event_applied = 1;
         }
         status = power_grid_solve_environment(env);
+        if (status != POWER_GRID_SOLVE_OK && random_event_applied)
+        {
+            /* A prior recovery switch can make the next otherwise-valid forced
+             * outage disconnect the modified topology. Retry from the normal
+             * controllable line state while preserving every forced outage. */
+            power_grid_topology_normal(&env->topology);
+            for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+                if (!env->line_available[line])
+                    env->topology.line_closed[line] = 0;
+            status = power_grid_solve_environment(env);
+        }
     }
     if (status != POWER_GRID_SOLVE_OK)
     {
@@ -869,8 +1001,11 @@ void power_grid_allocate(PowerGrid *env)
     env->rewards = calloc(1, sizeof(float));
     env->terminals = calloc(1, sizeof(float));
     env->owns_buffers = 1;
+    env->max_episode_steps = POWER_GRID_EPISODE_STEPS;
     env->failure_reward = POWER_GRID_DEFAULT_FAILURE_REWARD;
     env->safe_step_reward = POWER_GRID_DEFAULT_SAFE_STEP_REWARD;
+    env->recovery_reward = POWER_GRID_DEFAULT_RECOVERY_REWARD;
+    env->lookahead_action_reward = POWER_GRID_DEFAULT_LOOKAHEAD_ACTION_REWARD;
     env->switch_penalty = POWER_GRID_DEFAULT_SWITCH_PENALTY;
     env->congestion_cost_weight = POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT;
     env->branch_rating_scale = 1.0;
@@ -901,10 +1036,12 @@ static const Vector2 POWER_GRID_STATION_POSITIONS[POWER_GRID_NUM_SUBSTATIONS] = 
     {870, 635}, {530, 835}, {870, 845}, {1235, 810},
 };
 
-static void power_grid_prepare_layout(void)
-{
-    /* IEEE-14 uses the fixed single-line layout above. */
-}
+static const Vector2 POWER_GRID_LABEL_OFFSETS[POWER_GRID_NUM_BRANCHES] = {
+    {30, 25}, {-34, 18}, {30, 0}, {-5, 30}, {-30, 22},
+    {24, 0}, {0, 24}, {-24, -27}, {25, 10}, {-28, 5},
+    {-34, -22}, {-32, 14}, {25, 16}, {0, -25}, {24, 10},
+    {18, -23}, {30, 18}, {-27, 16}, {0, -23}, {20, 11},
+};
 
 static Color power_grid_line_color(const PowerGrid *env, int line)
 {
@@ -924,9 +1061,9 @@ static Vector2 power_grid_branch_endpoint(Vector2 station, Vector2 other, int bu
 {
     float dx = other.x - station.x;
     float x = station.x;
-    if (fabsf(dx) > 4.0f)
-        x += dx > 0.0f ? 17.0f : -17.0f;
-    return (Vector2){x, station.y + (busbar ? 3.0f : -3.0f)};
+    if (fabsf(dx) > 12.0f)
+        x += dx > 0.0f ? 54.0f : -54.0f;
+    return (Vector2){x, station.y + (busbar ? 8.0f : -8.0f)};
 }
 
 static void power_grid_draw_dashed_line(Vector2 from, Vector2 to, float dash, float gap,
@@ -947,6 +1084,57 @@ static void power_grid_draw_dashed_line(Vector2 from, Vector2 to, float dash, fl
     }
 }
 
+static void power_grid_draw_flow_arrow(Vector2 from, Vector2 to, double flow, float phase,
+                                       Color color)
+{
+    float dx = to.x - from.x;
+    float dy = to.y - from.y;
+    float length = sqrtf(dx * dx + dy * dy);
+    if (length < 1.0f || fabs(flow) < 0.05)
+        return;
+
+    dx /= length;
+    dy /= length;
+    if (flow < 0.0)
+    {
+        Vector2 tmp = from;
+        from = to;
+        to = tmp;
+        dx = (to.x - from.x) / length;
+        dy = (to.y - from.y) / length;
+    }
+
+    float progress = fmodf((float)(GetTime() * 0.40) + phase, 1.0f);
+    float head = fminf(7.0f, length * 0.12f);
+    float tail = fminf(6.0f, length * 0.10f);
+    for (int marker = 0; marker < 2; marker++)
+    {
+        float fraction = marker == 0 ? 0.10f + 0.22f * progress :
+                                       0.68f + 0.22f * progress;
+        float distance = fminf(fmaxf(length * fraction, tail), length - head);
+        Vector2 tip = {from.x + dx * (distance + head),
+                       from.y + dy * (distance + head)};
+        Vector2 left = {from.x + dx * (distance - tail) - dy * tail,
+                        from.y + dy * (distance - tail) + dx * tail};
+        Vector2 right = {from.x + dx * (distance - tail) + dy * tail,
+                         from.y + dy * (distance - tail) - dx * tail};
+        DrawLineEx(left, tip, 5.0f, Fade(BLACK, 0.75f));
+        DrawLineEx(right, tip, 5.0f, Fade(BLACK, 0.75f));
+        DrawLineEx(left, tip, 2.5f, color);
+        DrawLineEx(right, tip, 2.5f, color);
+    }
+}
+
+static void power_grid_draw_label(Vector2 position, const char *text, Color border)
+{
+    int width = MeasureText(text, 16) + 8;
+    Rectangle box = {position.x - width * 0.5f, position.y - 12.0f,
+                     (float)width, 24.0f};
+    DrawRectangleRounded(box, 0.3f, 4, Fade(POWER_GRID_BG, 0.94f));
+    DrawRectangleRoundedLinesEx(box, 0.3f, 4, 1.0f, Fade(border, 0.75f));
+    DrawText(text, (int)(box.x + 4), (int)(box.y + 4), 16, POWER_GRID_TEXT);
+}
+
 static void power_grid_draw_branches(const PowerGrid *env)
 {
     for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
@@ -959,16 +1147,72 @@ static void power_grid_draw_branches(const PowerGrid *env)
         Vector2 from = power_grid_branch_endpoint(from_station, to_station, from_bar);
         Vector2 to = power_grid_branch_endpoint(to_station, from_station, to_bar);
         Color color = power_grid_line_color(env, line);
-        DrawLineEx(from, to, 3.5f, Fade(BLACK, 0.65f));
+        DrawLineEx(from, to, 7.0f, Fade(BLACK, 0.65f));
         if (env->topology.line_closed[line])
         {
-            float width = 1.0f + 1.5f * fminf((float)env->solution.branch_rho[line], 1.2f);
+            float width = 2.5f + 2.5f * fminf((float)env->solution.branch_rho[line], 1.2f);
             DrawLineEx(from, to, width, color);
         }
         else
         {
-            power_grid_draw_dashed_line(from, to, 5.0f, 4.0f, 1.5f, color);
+            power_grid_draw_dashed_line(from, to, 9.0f, 7.0f, 2.5f, POWER_GRID_OPEN);
+            DrawCircleLines((int)from.x, (int)from.y, 5.0f, POWER_GRID_OPEN);
+            DrawCircleLines((int)to.x, (int)to.y, 5.0f, POWER_GRID_OPEN);
         }
+    }
+
+    /* Labels are drawn over the conductors so crossings cannot hide them. */
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        const PowerGridBranch *branch = &POWER_GRID_BRANCHES[line];
+        Vector2 from = POWER_GRID_STATION_POSITIONS[branch->from_bus];
+        Vector2 to = POWER_GRID_STATION_POSITIONS[branch->to_bus];
+        Vector2 label = {(from.x + to.x) * 0.5f + POWER_GRID_LABEL_OFFSETS[line].x,
+                         (from.y + to.y) * 0.5f + POWER_GRID_LABEL_OFFSETS[line].y};
+        char text[80];
+        if (env->topology.line_closed[line])
+        {
+            if (env->ac_power_flow)
+            {
+                double active_power_mw = env->ac_solution.branch_from_p_mw[line];
+                snprintf(text, sizeof(text), "%s%s  %+.0fMW %.0f/%.0fMVA %.0f%%",
+                         branch->tap_ratio != 1.0 ? "T " : "", POWER_GRID_BRANCH_NAMES[line],
+                         active_power_mw,
+                         fmax(env->ac_solution.branch_from_mva[line],
+                              env->ac_solution.branch_to_mva[line]),
+                         power_grid_branch_rating(env, line),
+                         100.0 * env->solution.branch_rho[line]);
+            }
+            else
+            {
+                snprintf(text, sizeof(text), "%s%s  %+.0f/%.0fMW %.0f%%",
+                         branch->tap_ratio != 1.0 ? "T " : "", POWER_GRID_BRANCH_NAMES[line],
+                         env->solution.branch_flow_mw[line],
+                         power_grid_branch_rating(env, line),
+                         100.0 * env->solution.branch_rho[line]);
+            }
+        }
+        else
+        {
+            snprintf(text, sizeof(text), "%s  %s", POWER_GRID_BRANCH_NAMES[line],
+                     !env->line_available[line] ? "OUTAGE" : "OPEN");
+        }
+        power_grid_draw_label(label, text, power_grid_line_color(env, line));
+    }
+
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        if (!env->topology.line_closed[line])
+            continue;
+        const PowerGridBranch *branch = &POWER_GRID_BRANCHES[line];
+        Vector2 from_station = POWER_GRID_STATION_POSITIONS[branch->from_bus];
+        Vector2 to_station = POWER_GRID_STATION_POSITIONS[branch->to_bus];
+        int from_bar = env->topology.terminal_busbar[POWER_GRID_LINE_TERMINAL(line, 0)];
+        int to_bar = env->topology.terminal_busbar[POWER_GRID_LINE_TERMINAL(line, 1)];
+        Vector2 from = power_grid_branch_endpoint(from_station, to_station, from_bar);
+        Vector2 to = power_grid_branch_endpoint(to_station, from_station, to_bar);
+        power_grid_draw_flow_arrow(from, to, env->solution.branch_flow_mw[line],
+                                   0.13f * line, RAYWHITE);
     }
 }
 
@@ -978,8 +1222,25 @@ static void power_grid_draw_generator(const PowerGrid *env, int generator)
     int terminal = POWER_GRID_GENERATOR_TERMINAL(generator);
     int bar = env->topology.terminal_busbar[terminal];
     Vector2 station = POWER_GRID_STATION_POSITIONS[bus];
-    Vector2 symbol = {station.x - 10.0f + 4.0f * (generator % 4), station.y - 13.0f};
-    DrawCircleV(symbol, 2.5f, bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
+    Vector2 busbar = {station.x - 19.0f, station.y + (bar ? 8.0f : -8.0f)};
+    Vector2 symbol = {station.x - 19.0f, station.y - 49.0f};
+    DrawLineEx(busbar, (Vector2){symbol.x, symbol.y + 13.0f}, 2.0f,
+               bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
+    DrawCircleV(symbol, 17.0f, (Color){34, 78, 100, 255});
+    DrawCircleLines((int)symbol.x, (int)symbol.y, 17.0f, POWER_GRID_BB1);
+    DrawText("G", (int)symbol.x - 7, (int)symbol.y - 11, 21, RAYWHITE);
+    double output = generator == 0 ? env->solution.slack_generation_mw :
+                                     env->operating_point.generator_mw[generator];
+    const char *label = env->ac_power_flow ?
+        TextFormat("%.0f MW  %+.0f MVAr", output,
+                   env->ac_solution.generator_q_mvar[generator]) :
+        TextFormat("%.1f MW", output);
+    int font_size = env->ac_power_flow ? 16 : 18;
+    int label_x = (int)symbol.x + 22;
+    int label_width = MeasureText(label, font_size);
+    if (label_x + label_width > POWER_GRID_MAP_WIDTH - 8)
+        label_x = (int)symbol.x - 22 - label_width;
+    DrawText(label, label_x, (int)symbol.y - 10, font_size, POWER_GRID_TEXT);
 }
 
 static void power_grid_draw_load(const PowerGrid *env, int load)
@@ -988,8 +1249,25 @@ static void power_grid_draw_load(const PowerGrid *env, int load)
     int terminal = POWER_GRID_LOAD_TERMINAL(load);
     int bar = env->topology.terminal_busbar[terminal];
     Vector2 station = POWER_GRID_STATION_POSITIONS[bus];
-    Vector2 symbol = {station.x - 10.0f + 4.0f * (load % 6), station.y + 14.0f};
-    DrawCircleV(symbol, 2.0f, bar ? POWER_GRID_BB2 : (Color){255, 154, 105, 255});
+    Vector2 busbar = {station.x + 19.0f, station.y + (bar ? 8.0f : -8.0f)};
+    Vector2 symbol = {station.x + 19.0f, station.y + 49.0f};
+    DrawLineEx(busbar, (Vector2){symbol.x, symbol.y - 12.0f}, 2.0f,
+               bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
+    Rectangle load_box = {symbol.x - 15.0f, symbol.y - 13.0f, 30.0f, 26.0f};
+    DrawRectangleRounded(load_box, 0.25f, 4, (Color){178, 77, 50, 255});
+    DrawRectangleRoundedLinesEx(load_box, 0.25f, 4, 1.0f,
+                                (Color){255, 154, 105, 255});
+    DrawText("L", (int)symbol.x - 6, (int)symbol.y - 10, 20, RAYWHITE);
+    const char *label = env->ac_power_flow ?
+        TextFormat("%.1f MW  %+.1f MVAr", env->operating_point.load_mw[load],
+                   power_grid_ac_load_q_mvar(&env->operating_point, load)) :
+        TextFormat("%.1f MW", env->operating_point.load_mw[load]);
+    int font_size = env->ac_power_flow ? 16 : 18;
+    int label_x = (int)symbol.x + 20;
+    int label_width = MeasureText(label, font_size);
+    if (label_x + label_width > POWER_GRID_MAP_WIDTH - 8)
+        label_x = (int)symbol.x - 20 - label_width;
+    DrawText(label, label_x, (int)symbol.y - 10, font_size, POWER_GRID_TEXT);
 }
 
 static void power_grid_draw_stations(const PowerGrid *env)
@@ -997,25 +1275,31 @@ static void power_grid_draw_stations(const PowerGrid *env)
     for (int bus = 0; bus < POWER_GRID_NUM_SUBSTATIONS; bus++)
     {
         Vector2 position = POWER_GRID_STATION_POSITIONS[bus];
-        Rectangle panel = {position.x - 18.0f, position.y - 9.0f, 36.0f, 18.0f};
+        Rectangle panel = {position.x - 60.0f, position.y - 29.0f, 120.0f, 58.0f};
         DrawRectangleRounded(panel, 0.18f, 4, POWER_GRID_PANEL);
         DrawRectangleRoundedLinesEx(panel, 0.18f, 4, 1.0f, POWER_GRID_PANEL_EDGE);
-        DrawText(TextFormat("%d", bus + 1), (int)position.x - 7, (int)position.y - 7,
-                 11, POWER_GRID_TEXT);
-        DrawLineEx((Vector2){position.x - 15, position.y - 3},
-                   (Vector2){position.x + 15, position.y - 3}, 2.0f, POWER_GRID_BB1);
-        DrawLineEx((Vector2){position.x - 15, position.y + 3},
-                   (Vector2){position.x + 15, position.y + 3}, 2.0f, POWER_GRID_BB2);
+        DrawText(TextFormat("SUB %d", bus + 1), (int)position.x - 54,
+                 (int)position.y - 27, 14, POWER_GRID_MUTED);
+        DrawLineEx((Vector2){position.x - 51, position.y - 8},
+                   (Vector2){position.x + 51, position.y - 8}, 6.0f, POWER_GRID_BB1);
+        DrawLineEx((Vector2){position.x - 51, position.y + 8},
+                   (Vector2){position.x + 51, position.y + 8}, 6.0f, POWER_GRID_BB2);
         if (env->topology.coupler_closed[bus])
         {
-            DrawLineEx((Vector2){position.x, position.y - 3},
-                       (Vector2){position.x, position.y + 3}, 2.0f, POWER_GRID_SAFE);
+            DrawLineEx((Vector2){position.x, position.y - 8},
+                       (Vector2){position.x, position.y + 8}, 5.0f, POWER_GRID_SAFE);
         }
         else
         {
-            DrawCircleLines((int)position.x, (int)position.y - 2, 1.0f, POWER_GRID_OPEN);
-            DrawCircleLines((int)position.x, (int)position.y + 2, 1.0f, POWER_GRID_OPEN);
+            DrawCircleLines((int)position.x, (int)position.y - 5, 3.0f, POWER_GRID_OPEN);
+            DrawCircleLines((int)position.x, (int)position.y + 5, 3.0f, POWER_GRID_OPEN);
         }
+        DrawText("1", (int)position.x - 58, (int)position.y - 16, 12, POWER_GRID_BB1);
+        DrawText("2", (int)position.x - 58, (int)position.y + 1, 12, POWER_GRID_BB2);
+        double injection = env->solution.substation_injection_mw[bus];
+        DrawText(TextFormat("NET %+.0f", injection), (int)position.x + 2,
+                 (int)position.y - 27, 14,
+                 injection >= 0.0 ? POWER_GRID_SAFE : POWER_GRID_MUTED);
     }
     for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
     {
@@ -1101,16 +1385,16 @@ static void power_grid_draw_sidebar(const PowerGrid *env)
     else
         snprintf(period_label, sizeof(period_label), "P%d",
                  (int)env->synthetic_profile);
-    DrawText(TextFormat("STEP %d/%d   PERIOD %d  %s", env->episode_step,
-                        POWER_GRID_EPISODE_STEPS, env->current_period, period_label),
-             x + 18, 104, 17, POWER_GRID_TEXT);
-    float steps = env->episode_step > 0 ? (float)env->episode_step : 1.0f;
-    float current_perf = env->solution.status == POWER_GRID_SOLVE_OK
-                             ? env->episode.safe_steps / steps
-                             : 0.0f;
-    float current_score = env->episode.no_op_actions / steps;
-    DrawText(TextFormat("score %.3f   perf %.3f", current_score, current_perf),
-             x + 18, 130, 17, POWER_GRID_TEXT);
+    if (env->max_episode_steps == 0)
+        DrawText(TextFormat("DAY %d  STEP %d/%d  PERIOD %d  %s",
+                            env->episode_step / POWER_GRID_EPISODE_STEPS + 1,
+                            env->episode_step % POWER_GRID_EPISODE_STEPS,
+                            POWER_GRID_EPISODE_STEPS, env->current_period, period_label),
+                 x + 18, 104, 17, POWER_GRID_TEXT);
+    else
+        DrawText(TextFormat("STEP %d/%d   PERIOD %d  %s", env->episode_step,
+                            POWER_GRID_EPISODE_STEPS, env->current_period, period_label),
+                 x + 18, 104, 17, POWER_GRID_TEXT);
     if (env->offline_scenarios && env->offline_scenario != NULL)
     {
         int period = env->current_period;
@@ -1118,7 +1402,7 @@ static void power_grid_draw_sidebar(const PowerGrid *env)
                             env->offline_scenario->ambient_temperature_c[period],
                             env->offline_scenario->wind_speed_mps[period],
                             100.0 * env->branch_rating_scale),
-                 x + 18, 149, 14, POWER_GRID_MUTED);
+                 x + 18, 132, 14, POWER_GRID_MUTED);
     }
 
     DrawRectangleRounded((Rectangle){x + 14.0f, 166.0f, width - 28.0f, 104.0f},
@@ -1214,11 +1498,12 @@ void c_render(PowerGrid *env)
         exit(0);
     BeginDrawing();
     ClearBackground(POWER_GRID_BG);
-    power_grid_prepare_layout();
-    DrawText(TextFormat("IEEE-14  |  %s TOPOLOGY OVERVIEW",
+    DrawText(TextFormat("IEEE-14  |  %s SINGLE-LINE DIAGRAM",
                         env->ac_power_flow ? "AC VALIDATION" : "DC"),
              22, 14, 32, POWER_GRID_TEXT);
-    DrawText(env->ac_power_flow ? "Compact 12-column layout; line color shows MVA loading, dotted lines are open." : "Compact 12-column layout; line color shows DC MW loading, dotted lines are open.",
+    DrawText(env->ac_power_flow ?
+                 "Arrows show active-power direction; dotted gray lines are open. Loading uses MVA." :
+                 "Arrows show active-power direction; dotted gray lines are open. Loading uses DC MW.",
              22, 52, 20, POWER_GRID_MUTED);
     power_grid_draw_branches(env);
     power_grid_draw_stations(env);
