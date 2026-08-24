@@ -158,7 +158,7 @@ if __name__ == "__main__":
     parser.add_argument("source", type=Path)
     parser.add_argument("dataset", type=Path)
     parser.add_argument("destination", type=Path)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--encoder-lr", type=float, default=3e-6)
     parser.add_argument("--decoder-lr", type=float, default=3e-4)
     parser.add_argument("--no-op-weight-scale", type=float, default=1.0)

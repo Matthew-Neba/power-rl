@@ -234,7 +234,7 @@ STAGE13="$OUTPUT/13-set-valued-ac-teacher/policy.bin"
 mkdir -p "$OUTPUT/14-sequence-ac-teacher"
 FINAL="$OUTPUT/14-sequence-ac-teacher/policy.bin"
 "$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_sequence.py" \
-    "$STAGE13" "$DATASET13" "$FINAL" --epochs 5 \
+    "$STAGE13" "$DATASET13" "$FINAL" --epochs 3 \
     --encoder-lr 0.000003 --decoder-lr 0.0003 --no-op-weight-scale 1.0
 
 echo "Final checkpoint: $FINAL"
