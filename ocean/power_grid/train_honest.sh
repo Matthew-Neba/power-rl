@@ -223,11 +223,19 @@ STAGE12="$OUTPUT/12-aggregated-ac-teacher/policy.bin"
 # set exists only in this offline 2019 training file.
 mkdir -p "$OUTPUT/13-set-valued-ac-teacher"
 DATASET13="$OUTPUT/13-set-valued-ac-teacher/recovery-2019.bin"
-FINAL="$OUTPUT/13-set-valued-ac-teacher/policy.bin"
+STAGE13="$OUTPUT/13-set-valued-ac-teacher/policy.bin"
 "$GENERATOR" "$STAGE12" "$DATASET13" 48
 "$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
-    "$STAGE12" "$DATASET13" "$FINAL" --epochs 100 --loss set \
+    "$STAGE12" "$DATASET13" "$STAGE13" --epochs 100 --loss set \
     --no-op-weight-scale 1.0
+
+# Unroll the same complete trajectories through the unchanged MinGRU so the
+# encoder and decoder learn the recurrent transition after each click.
+mkdir -p "$OUTPUT/14-sequence-ac-teacher"
+FINAL="$OUTPUT/14-sequence-ac-teacher/policy.bin"
+"$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_sequence.py" \
+    "$STAGE13" "$DATASET13" "$FINAL" --epochs 5 \
+    --encoder-lr 0.000003 --decoder-lr 0.0003 --no-op-weight-scale 1.0
 
 echo "Final checkpoint: $FINAL"
 echo "Exhaustive held-out AC QA:"
