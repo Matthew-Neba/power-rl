@@ -18,10 +18,16 @@ typedef struct
     float observations[POWER_GRID_OBS_SIZE];
     float hidden[POWER_GRID_POLICY_HIDDEN_SIZE];
     int32_t action;
+    uint8_t acceptable[POWER_GRID_NUM_ACTIONS];
     uint8_t sequence_start;
     uint8_t train;
-    uint8_t padding[2];
 } RecoveryExample;
+
+_Static_assert(sizeof(RecoveryExample) ==
+                   POWER_GRID_OBS_SIZE * sizeof(float) +
+                       POWER_GRID_POLICY_HIDDEN_SIZE * sizeof(float) +
+                       sizeof(int32_t) + POWER_GRID_NUM_ACTIONS + 2,
+               "recovery dataset layout must match fit_recovery_decoder.py");
 
 static void reset_policy(PufferNet *policy)
 {
@@ -43,10 +49,11 @@ static int policy_action_and_hidden(PufferNet *policy, const float *observations
     return (int)action;
 }
 
-static int expert_action(const PowerGrid *env)
+static int expert_action(const PowerGrid *env, uint8_t *acceptable)
 {
     int best_action = POWER_GRID_ACTION_NONE;
     double best_value = -INFINITY;
+    memset(acceptable, 0, POWER_GRID_NUM_ACTIONS);
     for (int action = 0; action < POWER_GRID_NUM_ACTIONS; action++)
     {
         PowerGrid probe = *env;
@@ -60,6 +67,8 @@ static int expert_action(const PowerGrid *env)
         double served = power_grid_served_load_fraction(&probe);
         int secure = probe.solution.max_rho <= 1.0 &&
                      probe.ac_solution.voltage_violation_count == 0;
+        if (secure && served >= 0.90)
+            acceptable[action] = 1;
         double value = 1000000.0 * (secure && served >= 0.90) +
                        100000.0 * (served >= 0.90) + served -
                        1000.0 * fmax(probe.solution.max_rho - 1.0, 0.0) -
@@ -70,17 +79,24 @@ static int expert_action(const PowerGrid *env)
             best_action = action;
         }
     }
+    int acceptable_count = 0;
+    for (int action = 0; action < POWER_GRID_NUM_ACTIONS; action++)
+        acceptable_count += acceptable[action];
+    if (acceptable_count == 0)
+        acceptable[best_action] = 1;
     return best_action;
 }
 
 static void write_example(FILE *dataset, const float *observations,
-                          const float *hidden, int action, int sequence_start,
-                          int train, size_t *count)
+                          const float *hidden, int action,
+                          const uint8_t *acceptable, int sequence_start, int train,
+                          size_t *count)
 {
     RecoveryExample example = {0};
     memcpy(example.observations, observations, sizeof(example.observations));
     memcpy(example.hidden, hidden, sizeof(example.hidden));
     example.action = action;
+    memcpy(example.acceptable, acceptable, sizeof(example.acceptable));
     example.sequence_start = sequence_start;
     example.train = train;
     if (fwrite(&example, sizeof(example), 1, dataset) != 1)
@@ -178,11 +194,13 @@ int main(int argc, char **argv)
                 int deployed_action = policy_action_and_hidden(
                     policy, env.observations, hidden);
                 int target = POWER_GRID_ACTION_NONE;
+                uint8_t acceptable[POWER_GRID_NUM_ACTIONS] = {0};
+                acceptable[POWER_GRID_ACTION_NONE] = 1;
                 if (env.episode_step >= outage_step)
-                    target = expert_action(&env);
+                    target = expert_action(&env, acceptable);
                 int train = env.episode_step == outage_step - 1 ||
                             env.episode_step >= outage_step;
-                write_example(dataset, env.observations, hidden, target,
+                write_example(dataset, env.observations, hidden, target, acceptable,
                               env.episode_step == 0, train, &examples);
 
                 /* Keep the first-click state on the deployed policy's data

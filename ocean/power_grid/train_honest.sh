@@ -207,15 +207,27 @@ DATASET11="$OUTPUT/11-offline-ac-teacher/recovery-2019.bin"
 STAGE11="$OUTPUT/11-offline-ac-teacher/policy.bin"
 "$GENERATOR" "$STAGE10" "$DATASET11" 32
 "$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
-    "$STAGE10" "$DATASET11" "$STAGE11" --epochs 100
+    "$STAGE10" "$DATASET11" "$STAGE11" --epochs 100 --loss single
 
 mkdir -p "$OUTPUT/12-aggregated-ac-teacher"
 DATASET12="$OUTPUT/12-aggregated-ac-teacher/recovery-2019.bin"
-FINAL="$OUTPUT/12-aggregated-ac-teacher/policy.bin"
+STAGE12="$OUTPUT/12-aggregated-ac-teacher/policy.bin"
 "$GENERATOR" "$STAGE11" "$DATASET12" 16
 "$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
-    "$STAGE11" "$DATASET12" "$FINAL" --epochs 100 \
+    "$STAGE11" "$DATASET12" "$STAGE12" --epochs 100 --loss single \
     --no-op-weight-scale 0.0775
+
+# A final aggregation pass avoids teaching one arbitrary topology action when
+# several actions independently satisfy the same AC security and demand gate.
+# The exported policy still selects one action directly; the acceptable-action
+# set exists only in this offline 2019 training file.
+mkdir -p "$OUTPUT/13-set-valued-ac-teacher"
+DATASET13="$OUTPUT/13-set-valued-ac-teacher/recovery-2019.bin"
+FINAL="$OUTPUT/13-set-valued-ac-teacher/policy.bin"
+"$GENERATOR" "$STAGE12" "$DATASET13" 16
+"$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
+    "$STAGE12" "$DATASET13" "$FINAL" --epochs 100 --loss set \
+    --no-op-weight-scale 0.5
 
 echo "Final checkpoint: $FINAL"
 echo "Exhaustive held-out AC QA:"

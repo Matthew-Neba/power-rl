@@ -156,29 +156,32 @@ one-step N-1 recovery, intact-grid service preservation, balanced intact/N-1/N-2
 full-day batches that mix reset-time, naturally delayed, and consecutive-click N-1/N-2 outages.
 The intact stages were added after browser QA caught a policy that shed load before the first
 click; the mixed stages prevent recovery training from forgetting the recurrent transition after
-a click. Sparse PPO still discovered too few corrective actions, so the final two stages fit the
-same decoder to unrestricted AC recovery actions generated offline from 2019 states, then repeat
-that fit on the improved policy's state distribution. The 2020 data is never used by training.
+a click. Sparse PPO still discovered too few corrective actions, so two stages fit the same
+decoder to unrestricted AC recovery actions generated offline from 2019 states. A final
+aggregation stage uses set-valued supervision: when several existing actions independently meet
+the AC thermal, voltage, and demand gates, any of them is a correct target instead of forcing an
+arbitrary tie-break. The 2020 data is never used by training.
 The exported MinGRU acts by itself without action masks, rollback, planners, forced no-op,
 recurrent-state reset on click, or runtime fallbacks. The offline teacher is not compiled into the
 web app. The script writes only beneath `checkpoints/power_grid/honest-surpass-run/` and never
 replaces the resource policy.
 
 The promoted checkpoint is `resources/power_grid/policy.bin`, SHA-256
-`6a91a3a65f1675a8bd300417d6535929a3291c4ea0505eb7f29c23e21a75c0c2`. Exhaustive held-out 2020
-AC confirmation used contexts 8-15 for every combination (1,680 trials total), after policy
-selection had finished on contexts 0-7:
+`b30b5eb5d773caf72d4bc7cd24fd113c2bae426ce3ed73c47f9e270df3d01d5d`. Exhaustive held-out 2020
+AC confirmation used contexts 16-23 for every combination (1,680 trials total), after model and
+loss-weight selection had finished on contexts 0-15:
 
 | Contingency | Survival | Handled | Secure steps | Demand served |
 |---|---:|---:|---:|---:|
-| N-1 (20 sets) | 94.38% | 75.63% | 86.76% | 98.89% |
-| N-2 (190 sets) | 78.42% | 54.21% | 72.11% | 97.33% |
-| Combined | 79.94% | 56.25% | 73.51% | 97.47% |
+| N-1 (20 sets) | 95.00% | 86.25% | 92.02% | 98.07% |
+| N-2 (190 sets) | 79.54% | 62.24% | 75.81% | 96.24% |
+| Combined | 81.01% | 64.52% | 77.35% | 96.41% |
 
 No tested case issued an emergency command before its first click. The earlier emergency policy
 had higher apparent handled performance under the old metric, but browser QA showed it shed load
 before every request; under the corrected product contract its handled rate was 0%. The current
-policy more than doubles the prior honest handled rate while preserving demand, but it does **not**
+policy improves the previous honest checkpoint's fresh-slice handled rate from 54.29% to 64.52%
+while preserving high demand service, but it does **not**
 meet the requested 95% handled gate. It is a research/demo checkpoint, not a real-grid deployment
 policy.
 

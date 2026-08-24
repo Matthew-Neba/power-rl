@@ -19,14 +19,14 @@ EXAMPLE_DTYPE = np.dtype([
     ("observations", "<f4", OBSERVATIONS),
     ("hidden", "<f4", HIDDEN),
     ("action", "<i4"),
+    ("acceptable", "u1", ACTIONS),
     ("sequence_start", "u1"),
     ("train", "u1"),
-    ("padding", "u1", 2),
 ])
 
 
 def fit(source: Path, dataset_path: Path, destination: Path, epochs: int,
-        no_op_weight_scale: float) -> None:
+        no_op_weight_scale: float, loss_mode: str) -> None:
     weights = np.fromfile(source, dtype=np.float32)
     expected = ENCODER_FLOATS + DECODER_FLOATS + RECURRENT_FLOATS
     if weights.size != expected:
@@ -38,6 +38,7 @@ def fit(source: Path, dataset_path: Path, destination: Path, epochs: int,
     examples = examples[examples["train"] != 0]
     hidden = torch.from_numpy(examples["hidden"].copy()).cuda()
     actions = torch.from_numpy(examples["action"].astype(np.int64)).cuda()
+    acceptable = torch.from_numpy(examples["acceptable"].copy()).cuda().bool()
 
     decoder_offset = ENCODER_FLOATS
     original = torch.from_numpy(
@@ -63,25 +64,54 @@ def fit(source: Path, dataset_path: Path, destination: Path, epochs: int,
         for start in range(0, shuffled.shape[0], batch_size):
             batch = shuffled[start : start + batch_size]
             logits = F.linear(hidden[batch], decoder)
-            loss = F.cross_entropy(
-                logits, actions[batch], weight=class_weights
-            ) + 1e-5 * F.mse_loss(decoder, original[:ACTIONS])
+            if loss_mode == "set":
+                accepted_logits = logits.masked_fill(
+                    ~acceptable[batch], -torch.inf
+                )
+                sample_loss = logits.logsumexp(1) - accepted_logits.logsumexp(1)
+                sample_weights = class_weights[actions[batch]]
+                loss = (sample_loss * sample_weights).sum() / sample_weights.sum()
+            else:
+                loss = F.cross_entropy(
+                    logits, actions[batch], weight=class_weights
+                )
+            loss = loss + 1e-5 * F.mse_loss(decoder, original[:ACTIONS])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
         if epoch % 10 == 0 or epoch + 1 == epochs:
             with torch.no_grad():
                 logits = F.linear(hidden[valid_indices], decoder)
-                loss = F.cross_entropy(
-                    logits, actions[valid_indices], weight=class_weights
-                ).item()
                 predicted = logits.argmax(1)
-                accuracy = (predicted == actions[valid_indices]).float().mean().item()
                 recovery = actions[valid_indices] != 0
-                recovery_accuracy = (
-                    (predicted[recovery] == actions[valid_indices][recovery])
-                    .float().mean().item() if recovery.any() else 1.0
-                )
+                if loss_mode == "set":
+                    accuracy = acceptable[
+                        valid_indices, predicted
+                    ].float().mean().item()
+                    recovery_accuracy = (
+                        acceptable[valid_indices[recovery], predicted[recovery]]
+                        .float().mean().item() if recovery.any() else 1.0
+                    )
+                    accepted_logits = logits.masked_fill(
+                        ~acceptable[valid_indices], -torch.inf
+                    )
+                    valid_loss = (
+                        logits.logsumexp(1) - accepted_logits.logsumexp(1)
+                    )
+                    valid_weights = class_weights[actions[valid_indices]]
+                    loss = ((valid_loss * valid_weights).sum() /
+                            valid_weights.sum()).item()
+                else:
+                    loss = F.cross_entropy(
+                        logits, actions[valid_indices], weight=class_weights
+                    ).item()
+                    accuracy = (
+                        predicted == actions[valid_indices]
+                    ).float().mean().item()
+                    recovery_accuracy = (
+                        (predicted[recovery] == actions[valid_indices][recovery])
+                        .float().mean().item() if recovery.any() else 1.0
+                    )
             print(
                 f"epoch {epoch + 1:3d}: validation loss {loss:.4f}, "
                 f"accuracy {accuracy:.2%}, recovery {recovery_accuracy:.2%}"
@@ -103,6 +133,7 @@ if __name__ == "__main__":
     parser.add_argument("destination", type=Path)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--no-op-weight-scale", type=float, default=1.0)
+    parser.add_argument("--loss", choices=("single", "set"), default="set")
     args = parser.parse_args()
     fit(args.source, args.dataset, args.destination, args.epochs,
-        args.no_op_weight_scale)
+        args.no_op_weight_scale, args.loss)
