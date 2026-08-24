@@ -131,7 +131,34 @@ train_stage "$STAGE5" "$OUTPUT/06-balanced-n2" 4709 \
     --env.initial-outage-requires-one-step-recovery False \
     --env.end-episode-on-recovery True --env.max-episode-steps 4 \
     --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
-FINAL=$(latest_checkpoint "$OUTPUT/06-balanced-n2")
+STAGE6=$(latest_checkpoint "$OUTPUT/06-balanced-n2")
+
+# Mix reset recovery with naturally delayed outages in the same full-day AC
+# batch. This prevents alternating curricula from forgetting either immediate
+# recovery or the recurrent transition observed after a user click.
+train_stage "$STAGE6" "$OUTPUT/07-mixed-reset-timed" 4721 \
+    10000000 0.00005 \
+    --train.ent-coef 0.002 \
+    --env.random-outage-count 2 --env.random-outage-count-min 1 \
+    --env.random-outages-at-reset True --env.reset-outage-probability 0.5 \
+    --env.timed-outages-when-not-reset True \
+    --env.randomize-reset-operating-period True \
+    --env.initial-outage-requires-one-step-recovery False \
+    --env.end-episode-on-recovery False --env.max-episode-steps 72 \
+    --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
+STAGE7=$(latest_checkpoint "$OUTPUT/07-mixed-reset-timed")
+
+train_stage "$STAGE7" "$OUTPUT/08-mixed-low-rate" 4723 \
+    10000000 0.000025 \
+    --train.ent-coef 0.001 \
+    --env.random-outage-count 2 --env.random-outage-count-min 1 \
+    --env.random-outages-at-reset True --env.reset-outage-probability 0.5 \
+    --env.timed-outages-when-not-reset True \
+    --env.randomize-reset-operating-period True \
+    --env.initial-outage-requires-one-step-recovery False \
+    --env.end-episode-on-recovery False --env.max-episode-steps 72 \
+    --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
+FINAL=$(latest_checkpoint "$OUTPUT/08-mixed-low-rate")
 
 echo "Final checkpoint: $FINAL"
 echo "Exhaustive held-out AC QA:"

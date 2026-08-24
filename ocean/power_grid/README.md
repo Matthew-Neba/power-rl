@@ -148,22 +148,23 @@ ocean/power_grid/train_honest.sh
 
 The script first expands the old 221/91 checkpoint to 236/106 without changing its legacy argmax
 behavior. Its fixed-seed AC PPO curriculum then progresses through general reset recovery,
-one-step N-1 recovery, intact-grid service preservation, balanced intact/N-1 recovery, and finally
-balanced intact/N-1/N-2 recovery. The intact stages were added after browser QA caught a policy
-that shed load before the first click. It writes only beneath
+one-step N-1 recovery, intact-grid service preservation, balanced intact/N-1/N-2 recovery, and
+full-day batches that mix reset-time with naturally delayed N-1/N-2 outages. The intact stages
+were added after browser QA caught a policy that shed load before the first click; the mixed stages
+prevent recovery training from forgetting the recurrent transition after a click. It writes only beneath
 `checkpoints/power_grid/honest-surpass-run/` and never replaces the resource policy. The policy
 still acts without action masks, rollback, planners, greedy targets, lookahead rewards, forced
 no-op, recurrent-state reset on click, or runtime fallbacks.
 
 The promoted checkpoint is `resources/power_grid/policy.bin`, SHA-256
-`1dd8c7fc544fbf72737ed1242677a608d7dac050b1092097b4cabd4d196f8e49`. Exhaustive held-out 2020
+`8c58b7c4d6f75cd6227fd955216f773e501ac8f8f0e394f206702bd67e18778a`. Exhaustive held-out 2020
 AC validation used 8 rotating contexts per combination (1,680 trials total):
 
 | Contingency | Survival | Handled | Secure steps | Demand served |
 |---|---:|---:|---:|---:|
-| N-1 (20 sets) | 90.63% | 63.75% | 80.04% | 98.61% |
-| N-2 (190 sets) | 70.39% | 28.49% | 53.67% | 96.55% |
-| Combined | 72.32% | 31.85% | 56.18% | 96.75% |
+| N-1 (20 sets) | 91.88% | 65.00% | 81.64% | 98.62% |
+| N-2 (190 sets) | 71.45% | 29.80% | 54.52% | 96.54% |
+| Combined | 73.39% | 33.15% | 57.10% | 96.73% |
 
 No tested case issued an emergency command before its first click. The earlier emergency policy
 had higher apparent handled performance under the old metric, but browser QA showed it shed load

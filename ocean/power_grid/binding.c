@@ -30,6 +30,8 @@ void my_init(Env* env, Dict* kwargs) {
         (int)dict_get(kwargs, "random_outages_at_reset")->value;
     env->reset_outage_probability =
         dict_get(kwargs, "reset_outage_probability")->value;
+    env->timed_outages_when_not_reset =
+        (int)dict_get(kwargs, "timed_outages_when_not_reset")->value;
     env->randomize_reset_operating_period =
         (int)dict_get(kwargs, "randomize_reset_operating_period")->value;
     env->initial_outage_requires_overload =

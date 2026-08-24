@@ -93,16 +93,17 @@ unrestricted result, not a baseline-beating claim.
 The phase-2 policy was expanded deterministically from 221/91 to 236/106, adding explicit load and
 generator connected-state inputs plus agent-selected emergency controls. Browser QA then caught
 anticipatory load shedding, so the reproducible `ocean/power_grid/train_honest.sh` AC curriculum
-now includes intact-grid preservation, balanced N-1 recovery, and balanced N-2 recovery stages.
+now includes intact-grid preservation, balanced N-1/N-2 recovery, and full-day batches mixing
+reset-time with naturally delayed outages.
 It uses every action without masks, rollback, greedy targets, lookahead rewards, forced no-op,
 click-triggered recurrent reset, or fallback control.
 
 ## Final validation
 
 The incumbent checkpoint is `resources/power_grid/policy.bin` (256 hidden units, three MinGRU
-layers, SHA-256 `1dd8c7fc544fbf72737ed1242677a608d7dac050b1092097b4cabd4d196f8e49`).
+layers, SHA-256 `8c58b7c4d6f75cd6227fd955216f773e501ac8f8f0e394f206702bd67e18778a`).
 Its exhaustive 8-context held-out AC gate covers all 20 N-1 and 190 N-2 requests. Combined survival
-is 72.32%, handled rate is 31.85%, secure-step rate is 56.18%, and demand served is 96.75%; no
+is 73.39%, handled rate is 33.15%, secure-step rate is 57.10%, and demand served is 96.73%; no
 trial issues a pre-click emergency command.
 Therefore the web prototype is implemented, but the requested 95% handled performance gate remains
 open. The current 18-test Python/C suite, native build, Emscripten build, exhaustive AC QA, and

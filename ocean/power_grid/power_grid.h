@@ -226,6 +226,7 @@ typedef struct
     int random_outage_count_min;
     int random_outages_at_reset;
     double reset_outage_probability;
+    int timed_outages_when_not_reset;
     int randomize_reset_operating_period;
     int initial_outage_requires_overload;
     int initial_outage_requires_one_step_recovery;
@@ -926,7 +927,8 @@ void c_reset(PowerGrid *env)
             env->scheduled_random_event_count =
                 requested < POWER_GRID_MAX_RANDOM_OUTAGES ? requested :
                                                             POWER_GRID_MAX_RANDOM_OUTAGES;
-            if (env->random_outages_at_reset && !reset_outages_now)
+            if (env->random_outages_at_reset && !reset_outages_now &&
+                !env->timed_outages_when_not_reset)
                 env->scheduled_random_event_count = 0;
             int schedule_accepted;
             int schedule_attempts = 0;
