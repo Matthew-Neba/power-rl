@@ -106,5 +106,7 @@ is 72.32%, handled rate is 31.85%, secure-step rate is 56.18%, and demand served
 trial issues a pre-click emergency command.
 Therefore the web prototype is implemented, but the requested 95% handled performance gate remains
 open. The current 18-test Python/C suite, native build, Emscripten build, exhaustive AC QA, and
-headless-browser click test pass; deployment is not called complete while the performance gate is
-open.
+headless-browser click test pass. GitHub Pages deploys the research prototype at
+`https://matthew-neba.github.io/power-rl/`; the deployed HTTPS/WASM build also passed a held-click
+7-8 bridge-outage test with secure AC recovery, 100% load served, and no browser errors. Product
+readiness remains open while the 95% policy-performance gate is unmet.

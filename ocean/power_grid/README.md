@@ -96,6 +96,11 @@ PATH="$PWD/.venv/bin:$PATH" puffer eval power_grid \
 
 This samples episodes; it does not replace the exhaustive 210-combination browser-contract QA.
 
+The deployed research prototype is available at
+<https://matthew-neba.github.io/power-rl/>. Policy inference and AC validation
+run locally in WebAssembly; at most two persistent user clicks are the only
+outage source.
+
 Build and serve the browser demo using the same Ocean C-to-WebAssembly path as the upstream
 PufferLib demos:
 
