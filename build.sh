@@ -171,6 +171,10 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     exit 0
 elif [ "$MODE" = "web" ]; then
     mkdir -p "build/web/$ENV"
+    WEB_SHELL="vendor/minshell.html"
+    if [ -f "$SRC_DIR/web_shell.html" ]; then
+        WEB_SHELL="$SRC_DIR/web_shell.html"
+    fi
     WEB_PRELOAD=(--preload-file resources/shared@resources/shared)
     if [ -d "resources/$ENV" ]; then
         WEB_PRELOAD+=(--preload-file "resources/$ENV@resources/$ENV")
@@ -185,7 +189,7 @@ elif [ "$MODE" = "web" ]; then
         -L. -L./$RAYLIB_NAME/lib \
         -sASSERTIONS=2 -gsource-map \
         -sUSE_GLFW=3 -sUSE_WEBGL2=1 -sASYNCIFY -sFILESYSTEM -sFORCE_FILESYSTEM=1 \
-        --shell-file vendor/minshell.html \
+        --shell-file "$WEB_SHELL" \
         -sINITIAL_MEMORY=512MB -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=512KB \
         -DNDEBUG -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
         "${WEB_PRELOAD[@]}"

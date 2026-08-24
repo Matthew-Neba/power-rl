@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090e18">
+  <link rel="icon" href="data:,">
+  <title>IEEE-14 AC Grid Recovery</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #090e18; color: #e1e8f2; }
+    header { padding: 12px 20px; border-bottom: 1px solid #36465b; background: #141d2b; }
+    h1 { display: inline; margin: 0 18px 0 0; font-size: 18px; }
+    p { display: inline; margin: 0; color: #91a0b2; font-size: 14px; }
+    strong { color: #e1e8f2; }
+    main { display: grid; place-items: center; width: 100%; overflow: hidden; }
+    canvas { display: block; width: min(100vw, calc((100vh - 51px) * 1.8)); height: auto; outline: none; }
+    #status { position: fixed; right: 12px; bottom: 8px; color: #91a0b2; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>IEEE-14 AC Grid Recovery</h1>
+    <p><strong>Click up to two lines</strong> to create outages. Press <strong>2</strong> for argmax or <strong>1</strong> for stochastic policy inference.</p>
+  </header>
+  <main><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas></main>
+  <div id="status">Loading WebAssembly model…</div>
+  <script>
+    const status = document.getElementById('status');
+    const canvas = document.getElementById('canvas');
+    canvas.addEventListener('click', () => canvas.focus());
+    var Module = {
+      canvas,
+      print: text => console.log(text),
+      setStatus: text => { status.textContent = text || 'Running locally in your browser'; },
+      monitorRunDependencies: left => {
+        if (left) status.textContent = `Loading ${left} component${left === 1 ? '' : 's'}…`;
+      }
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

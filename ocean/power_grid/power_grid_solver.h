@@ -18,8 +18,12 @@
     (POWER_GRID_LINE_ACTION_OFFSET + POWER_GRID_NUM_BRANCHES)
 #define POWER_GRID_COUPLER_ACTION_OFFSET \
     (POWER_GRID_TERMINAL_ACTION_OFFSET + POWER_GRID_NUM_TERMINALS)
-#define POWER_GRID_NUM_ACTIONS \
+#define POWER_GRID_LOAD_SHED_ACTION_OFFSET \
     (POWER_GRID_COUPLER_ACTION_OFFSET + POWER_GRID_NUM_SUBSTATIONS)
+#define POWER_GRID_GENERATOR_TRIP_ACTION_OFFSET \
+    (POWER_GRID_LOAD_SHED_ACTION_OFFSET + POWER_GRID_NUM_LOADS)
+#define POWER_GRID_NUM_ACTIONS \
+    (POWER_GRID_GENERATOR_TRIP_ACTION_OFFSET + POWER_GRID_NUM_GENERATORS - 1)
 
 #define POWER_GRID_LINE_TERMINAL(branch, side) (2 * (branch) + (side))
 #define POWER_GRID_GENERATOR_TERMINAL(generator) \
@@ -41,6 +45,8 @@ typedef struct {
     unsigned char line_closed[POWER_GRID_NUM_BRANCHES];
     unsigned char terminal_busbar[POWER_GRID_NUM_TERMINALS];
     unsigned char coupler_closed[POWER_GRID_NUM_SUBSTATIONS];
+    unsigned char load_connected[POWER_GRID_NUM_LOADS];
+    unsigned char generator_connected[POWER_GRID_NUM_GENERATORS];
 } PowerGridTopology;
 
 typedef struct {
@@ -94,6 +100,8 @@ typedef enum {
     POWER_GRID_ACTION_LINE,
     POWER_GRID_ACTION_TERMINAL,
     POWER_GRID_ACTION_COUPLER,
+    POWER_GRID_ACTION_LOAD_SHED,
+    POWER_GRID_ACTION_GENERATOR_TRIP,
 } PowerGridActionType;
 
 void power_grid_topology_normal(PowerGridTopology* topology);

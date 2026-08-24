@@ -43,21 +43,14 @@ static void power_grid_free_policy(PowerGridRuntimePolicy *policy)
     *policy = (PowerGridRuntimePolicy){0};
 }
 
-static const char *power_grid_inference_name(PowerGridInferenceMode mode)
-{
-    return mode == POWER_GRID_INFERENCE_ARGMAX ? "ARGMAX" : "STOCHASTIC";
-}
-
 int main(void) {
     PowerGrid env = {0};
-    /* This checkpoint was trained with the DC environment. AC remains an
-     * offline validation mode, not a silent deployment-time domain change. */
-    env.ac_power_flow = 0;
+    /* The browser is a held-out AC validation demo. User clicks are the only
+     * outage source, keeping the complete contingency at N-1 or N-2. */
+    env.ac_power_flow = 1;
     env.offline_scenarios = 1;
     env.offline_scenario_validation = 1;
-    env.random_events = 1;
-    env.random_event_probability = 1.0;
-    env.random_outage_count = 2;
+    env.random_events = 0;
     power_grid_allocate(&env);
     c_reset(&env);
     PowerGridUserSession user;
@@ -65,10 +58,9 @@ int main(void) {
     PowerGridRuntimePolicy policy = power_grid_load_policy();
     if (policy.network == NULL)
         return 1;
-    PowerGridInferenceMode mode = POWER_GRID_INFERENCE_STOCHASTIC;
+    PowerGridInferenceMode mode = POWER_GRID_INFERENCE_ARGMAX;
     int terminal_frames = 0;
     int terminal_failed = 0;
-    int terminal_event_failure = 0;
     srand((unsigned int)time(NULL));
     c_render(&env);
     while (!WindowShouldClose()) {
@@ -77,15 +69,15 @@ int main(void) {
         if (IsKeyPressed(KEY_TWO))
             mode = POWER_GRID_INFERENCE_ARGMAX;
         const char *episode_status = terminal_frames == 0 ? "" :
-            (terminal_event_failure ? " | AUTOMATIC OUTAGE CAUSED INSTANT FAILURE" :
-             terminal_failed ? " | EPISODE FAILED - restarting" :
+            (terminal_failed ? " | GRID FAILURE - restarting" :
                                " | EPISODE COMPLETE - restarting");
         const char *user_status = user.last_status == POWER_GRID_SOLVE_OK ? "" :
-            TextFormat(" | user request rejected: %s",
+            TextFormat(" | outage result: %s",
                        power_grid_solve_status_name(user.last_status));
         SetWindowTitle(TextFormat(
-            "IEEE-14 | %s (1 stochastic, 2 argmax) | user outages %d/2%s%s",
-            power_grid_inference_name(mode), power_grid_user_outage_count(&user),
+            "IEEE-14 AC | click up to 2 lines | %s (1 stochastic, 2 argmax) | outages %d/2%s%s",
+            mode == POWER_GRID_INFERENCE_ARGMAX ? "ARGMAX" : "STOCHASTIC",
+            power_grid_user_outage_count(&user),
             episode_status, user_status));
 
         if (terminal_frames > 0)
@@ -108,9 +100,8 @@ int main(void) {
         c_step(&env);
         if (env.terminals[0] > 0.5f)
         {
-            terminal_frames = 90;
+            terminal_frames = 3;
             terminal_failed = env.solution.status != POWER_GRID_SOLVE_OK;
-            terminal_event_failure = env.last_failure_was_event;
         }
         c_render(&env);
     }

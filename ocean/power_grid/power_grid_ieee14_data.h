@@ -44,7 +44,7 @@ static const double POWER_GRID_BRANCH_B[POWER_GRID_NUM_BRANCHES] = {
 
 /* Line 7-8 (index 13) is the sole bridge in the normal IEEE-14 graph. */
 static const unsigned char POWER_GRID_RANDOM_EVENT_ELIGIBLE[POWER_GRID_NUM_BRANCHES] = {
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 };
 
 static const int POWER_GRID_GENERATOR_BUSES[POWER_GRID_NUM_GENERATORS] = {0, 1, 2, 5, 7};

@@ -7,8 +7,6 @@
  * evaluation do not own a user session or inherit its two-outage policy. */
 typedef struct
 {
-    PowerGridTopology topology_before_outage;
-    int topology_before_outage_valid;
     int max_outages;
     unsigned char line_outage[POWER_GRID_NUM_BRANCHES];
     int last_line;
@@ -31,8 +29,8 @@ static inline int power_grid_user_outage_count(const PowerGridUserSession *user)
     return count;
 }
 
-/* Apply a user request transactionally. Invalid N-1/N-2 combinations leave
- * both the solved environment and the user session exactly as they were. */
+/* User outages are exogenous events, not agent actions. Apply them exactly as
+ * requested so an infeasible contingency is visible and counted as a failure. */
 static inline PowerGridSolveStatus power_grid_user_set_line_outage(
     PowerGridUserSession *user, PowerGrid *env, int line, int unavailable)
 {
@@ -52,52 +50,21 @@ static inline PowerGridSolveStatus power_grid_user_set_line_outage(
     if (unavailable && !env->line_available[line])
         return user->last_status = POWER_GRID_INVALID_INPUT;
 
-    PowerGridTopology previous_topology = env->topology;
-    PowerGridSolveResult previous_solution = env->solution;
-    PowerGridACSolveResult previous_ac_solution = env->ac_solution;
-    unsigned char previous_available = env->line_available[line];
-    unsigned char previous_user_line = user->line_outage[line];
-    PowerGridTopology previous_base = user->topology_before_outage;
-    int previous_base_valid = user->topology_before_outage_valid;
-
-    if (unavailable && outage_count == 0)
-    {
-        user->topology_before_outage = env->topology;
-        user->topology_before_outage_valid = 1;
-    }
-
     env->line_available[line] = !unavailable;
     user->line_outage[line] = unavailable;
-    if (!unavailable && outage_count == 1 && user->topology_before_outage_valid)
-        env->topology = user->topology_before_outage;
-    else
-        env->topology.line_closed[line] = !unavailable;
+    if (unavailable)
+        env->topology.line_closed[line] = 0;
+    /* Clearing an outage makes the line operable again without overriding a
+     * topology choice made by the policy while it was unavailable. */
 
     PowerGridSolveStatus status = power_grid_solve_environment(env);
-    if (status != POWER_GRID_SOLVE_OK)
-    {
-        power_grid_topology_normal(&env->topology);
-        for (int index = 0; index < POWER_GRID_NUM_BRANCHES; index++)
-            if (!env->line_available[index])
-                env->topology.line_closed[index] = 0;
-        status = power_grid_solve_environment(env);
-    }
-    if (status != POWER_GRID_SOLVE_OK)
-    {
-        env->line_available[line] = previous_available;
-        user->line_outage[line] = previous_user_line;
-        env->topology = previous_topology;
-        env->solution = previous_solution;
-        env->ac_solution = previous_ac_solution;
-        user->topology_before_outage = previous_base;
-        user->topology_before_outage_valid = previous_base_valid;
-        return user->last_status = status;
-    }
-
-    if (!unavailable && outage_count == 1)
-        user->topology_before_outage_valid = 0;
+    if (unavailable && status != POWER_GRID_SOLVE_OK)
+        env->emergency_recovery_steps = POWER_GRID_EMERGENCY_RECOVERY_STEPS;
+    /* An infeasible click is precisely when the policy most needs the new
+     * topology. Solver outputs are cleared on failure, while line availability
+     * and switch state remain valid observation features. */
     power_grid_compute_observations(env);
-    return user->last_status = POWER_GRID_SOLVE_OK;
+    return user->last_status = status;
 }
 
 #ifndef POWER_GRID_NO_RENDER

@@ -14,11 +14,12 @@
 #include "raylib.h"
 #endif
 
-#define POWER_GRID_OBS_SIZE 221
+#define POWER_GRID_OBS_SIZE 236
 #define POWER_GRID_EPISODE_STEPS 72
 #define POWER_GRID_STEPS_PER_PERIOD 6
 #define POWER_GRID_NUM_PERIODS (POWER_GRID_EPISODE_STEPS / POWER_GRID_STEPS_PER_PERIOD)
 #define POWER_GRID_MAX_RANDOM_OUTAGES 8
+#define POWER_GRID_EMERGENCY_RECOVERY_STEPS 4
 
 typedef struct {
     unsigned int date_yyyymmdd;
@@ -97,6 +98,7 @@ static inline double power_grid_weather_rating_scale(
 #define POWER_GRID_DEFAULT_SECURE_SWITCH_PENALTY 0.10f
 #define POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT 0.01f
 #define POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT 1.0f
+#define POWER_GRID_DEFAULT_UNSERVED_LOAD_COST_WEIGHT 5.0f
 #define POWER_GRID_VALID_REWARD_MARGIN 0.05f
 
 #define POWER_GRID_LINE_OBS_FEATURES 5
@@ -113,13 +115,18 @@ static inline double power_grid_weather_rating_scale(
 #define POWER_GRID_VOLTAGE_OBS_OFFSET (POWER_GRID_WEATHER_OBS_OFFSET + 3)
 #define POWER_GRID_GENERATOR_Q_OBS_OFFSET \
     (POWER_GRID_VOLTAGE_OBS_OFFSET + POWER_GRID_NUM_NODES)
-_Static_assert(POWER_GRID_GENERATOR_Q_OBS_OFFSET + POWER_GRID_NUM_GENERATORS ==
+#define POWER_GRID_EMERGENCY_OBS_OFFSET \
+    (POWER_GRID_GENERATOR_Q_OBS_OFFSET + POWER_GRID_NUM_GENERATORS)
+_Static_assert(POWER_GRID_EMERGENCY_OBS_OFFSET + POWER_GRID_NUM_LOADS +
+                   POWER_GRID_NUM_GENERATORS - 1 ==
                    POWER_GRID_OBS_SIZE,
-               "power-grid observation layout must total 221 floats");
+               "power-grid observation layout must total 236 floats");
 _Static_assert(POWER_GRID_EPISODE_STEPS % POWER_GRID_STEPS_PER_PERIOD == 0,
                "power-grid periods must divide the episode evenly");
 _Static_assert(POWER_GRID_ACTION_NONE == 0 && POWER_GRID_ACTION_LINE == 1 &&
-                   POWER_GRID_ACTION_TERMINAL == 2 && POWER_GRID_ACTION_COUPLER == 3,
+                   POWER_GRID_ACTION_TERMINAL == 2 && POWER_GRID_ACTION_COUPLER == 3 &&
+                   POWER_GRID_ACTION_LOAD_SHED == 4 &&
+                   POWER_GRID_ACTION_GENERATOR_TRIP == 5,
                "power-grid action types must index episode switch counters");
 
 typedef struct
@@ -136,6 +143,8 @@ typedef struct
     float line_switches;
     float busbar_switches;
     float coupler_switches;
+    float load_shed_actions;
+    float generator_trip_actions;
     float overload_free_steps;
     float random_events;
     float demand_fulfilled;
@@ -151,13 +160,13 @@ typedef struct
 
 typedef struct
 {
-    int switches[4]; /* total, line, terminal/busbar, coupler */
+    int switches[6]; /* total followed by each physical control type */
     int no_op_actions;
     int safe_steps;
     int thermal_trips;
     int random_events;
     int recoveries_rewarded;
-    int demand_served_steps;
+    double served_load_fraction_sum;
     int overloaded_line_steps;
     double peak_thermal_stress;
     double peak_line_loading;
@@ -202,6 +211,7 @@ typedef struct
     int scheduled_random_event_line[POWER_GRID_MAX_RANDOM_OUTAGES];
     int active_random_event_line;
     int last_failure_was_event;
+    int emergency_recovery_steps;
     float episode_return;
     int pending_reset;
     int last_action;
@@ -230,6 +240,7 @@ typedef struct
     float secure_switch_penalty;
     float congestion_cost_weight;
     float congestion_progress_weight;
+    float unserved_load_cost_weight;
     double branch_rating_scale;
     double ambient_temperature_c;
     double wind_speed_mps;
@@ -511,11 +522,14 @@ static void power_grid_compute_observations(PowerGrid *env)
             POWER_GRID_LINE_TERMINAL(line, 1), POWER_GRID_BRANCHES[line].to_bus)] = 1;
     }
     for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
-        active_node[power_grid_terminal_node(&env->topology,
-            POWER_GRID_GENERATOR_TERMINAL(generator), POWER_GRID_GENERATOR_BUSES[generator])] = 1;
+        if (env->topology.generator_connected[generator])
+            active_node[power_grid_terminal_node(&env->topology,
+                POWER_GRID_GENERATOR_TERMINAL(generator),
+                POWER_GRID_GENERATOR_BUSES[generator])] = 1;
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
-        active_node[power_grid_terminal_node(&env->topology,
-            POWER_GRID_LOAD_TERMINAL(load), POWER_GRID_LOAD_BUSES[load])] = 1;
+        if (env->topology.load_connected[load])
+            active_node[power_grid_terminal_node(&env->topology,
+                POWER_GRID_LOAD_TERMINAL(load), POWER_GRID_LOAD_BUSES[load])] = 1;
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++)
         env->observations[POWER_GRID_VOLTAGE_OBS_OFFSET + node] = env->ac_power_flow ?
             (float)env->ac_solution.node_voltage_pu[node] : (float)active_node[node];
@@ -524,6 +538,13 @@ static void power_grid_compute_observations(PowerGrid *env)
             env->ac_power_flow ?
                 (float)(env->ac_solution.generator_q_mvar[generator] / POWER_GRID_BASE_MVA) :
                 0.0f;
+    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+        env->observations[POWER_GRID_EMERGENCY_OBS_OFFSET + load] =
+            env->topology.load_connected[load] ? 1.0f : 0.0f;
+    for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++)
+        env->observations[POWER_GRID_EMERGENCY_OBS_OFFSET + POWER_GRID_NUM_LOADS +
+                          generator - 1] =
+            env->topology.generator_connected[generator] ? 1.0f : 0.0f;
 }
 
 /* Agent training-step pipeline. Keep reward and metric calculations pure so their
@@ -535,6 +556,7 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
         .electrical_change = 0,
         .observation_only_terminal = -1,
     };
+    PowerGridTopology previous = env->topology;
     action.type = power_grid_apply_action(&env->topology, action.value);
     action.switched = action.type > POWER_GRID_ACTION_NONE;
     env->last_action = action.value;
@@ -543,10 +565,10 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     if (action.type == POWER_GRID_ACTION_LINE)
     {
         int line = action.value - POWER_GRID_LINE_ACTION_OFFSET;
-        int previous_state = env->topology.line_closed[line] ^ 1;
         if (!env->line_available[line])
             env->topology.line_closed[line] = 0;
-        action.switched = env->topology.line_closed[line] != previous_state;
+        action.switched = env->topology.line_closed[line] !=
+                          previous.line_closed[line];
         action.electrical_change = action.switched;
     }
     else if (action.type == POWER_GRID_ACTION_TERMINAL)
@@ -585,6 +607,20 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     {
         action.electrical_change = action.switched;
     }
+    else if (action.type == POWER_GRID_ACTION_LOAD_SHED)
+    {
+        int load = action.value - POWER_GRID_LOAD_SHED_ACTION_OFFSET;
+        action.switched = previous.load_connected[load] !=
+                          env->topology.load_connected[load];
+        action.electrical_change = action.switched;
+    }
+    else if (action.type == POWER_GRID_ACTION_GENERATOR_TRIP)
+    {
+        int generator = 1 + action.value - POWER_GRID_GENERATOR_TRIP_ACTION_OFFSET;
+        action.switched = previous.generator_connected[generator] !=
+                          env->topology.generator_connected[generator];
+        action.electrical_change = action.switched;
+    }
     env->episode.no_op_actions += action.type == POWER_GRID_ACTION_NONE;
     env->episode.switches[0] += action.switched;
     if (action.switched)
@@ -592,12 +628,24 @@ static PowerGridAppliedAction apply_agent_action(PowerGrid *env, float raw_actio
     return action;
 }
 
+static double power_grid_served_load_fraction(const PowerGrid *env)
+{
+    double total = 0.0, served = 0.0;
+    for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+    {
+        total += env->operating_point.load_mw[load];
+        if (env->topology.load_connected[load])
+            served += env->operating_point.load_mw[load];
+    }
+    return total > 0.0 ? served / total : 1.0;
+}
 
 static float calculate_reward(const PowerGrid *env,
                               PowerGridSolveStatus solve_status,
                               double constraint_cost, double congestion_progress,
                               int switched, int electrical_change,
-                              int previously_safe, int safe)
+                              int previously_safe, int safe,
+                              double served_load_fraction)
 {
     if (solve_status != POWER_GRID_SOLVE_OK)
         return env->failure_reward;
@@ -609,12 +657,14 @@ static float calculate_reward(const PowerGrid *env,
      * state must be strictly better than an action that destroys connectivity.
      * Bound only the state cost so the signed progress potential remains
      * exactly reversible for topology changes. */
+    double state_reward = env->safe_step_reward * safe -
+        env->unserved_load_cost_weight * (1.0 - served_load_fraction);
     double maximum_constraint_cost = fmax(
-        0.0, env->safe_step_reward * safe - env->failure_reward -
+        0.0, state_reward - env->failure_reward -
                  POWER_GRID_VALID_REWARD_MARGIN);
     double bounded_constraint_cost = fmin(constraint_cost,
                                           maximum_constraint_cost);
-    return (float)(env->safe_step_reward * safe - bounded_constraint_cost +
+    return (float)(state_reward - bounded_constraint_cost +
                    env->congestion_progress_weight * congestion_progress -
                    ((!electrical_change || previously_safe) ?
                         env->secure_switch_penalty : env->switch_penalty) * switched);
@@ -631,7 +681,7 @@ static void power_grid_finish_episode(PowerGrid *env)
     env->log.overload_free_steps += (float)env->episode.safe_steps;
     env->log.random_events += (float)env->episode.random_events;
     env->log.demand_fulfilled +=
-        (float)env->episode.demand_served_steps / POWER_GRID_EPISODE_STEPS;
+        (float)(env->episode.served_load_fraction_sum / steps);
     if (env->scheduled_random_event_count > 0)
     {
         env->log.outage_completion += (float)env->episode.random_events /
@@ -663,6 +713,10 @@ static void power_grid_finish_episode(PowerGrid *env)
     env->log.line_switches += (float)env->episode.switches[POWER_GRID_ACTION_LINE];
     env->log.busbar_switches += (float)env->episode.switches[POWER_GRID_ACTION_TERMINAL];
     env->log.coupler_switches += (float)env->episode.switches[POWER_GRID_ACTION_COUPLER];
+    env->log.load_shed_actions +=
+        (float)env->episode.switches[POWER_GRID_ACTION_LOAD_SHED];
+    env->log.generator_trip_actions +=
+        (float)env->episode.switches[POWER_GRID_ACTION_GENERATOR_TRIP];
     env->log.n += 1.0f;
     if (env->rendering)
     {
@@ -742,9 +796,10 @@ static inline void power_grid_prepare_one_step_recovery_cache(void)
                 PowerGridSolveResult solution;
                 power_grid_topology_normal(&topology);
                 topology.line_closed[line] = 0;
-                if (power_grid_solve_scaled(
-                        &topology, &probe.operating_point, &solution,
-                        probe.branch_rating_scale) != POWER_GRID_SOLVE_OK ||
+                PowerGridSolveStatus outage_status = power_grid_solve_scaled(
+                    &topology, &probe.operating_point, &solution,
+                    probe.branch_rating_scale);
+                if (outage_status == POWER_GRID_SOLVE_OK &&
                     solution.max_rho <= 1.0)
                     continue;
                 probe.line_available[line] = 0;
@@ -811,6 +866,7 @@ void c_reset(PowerGrid *env)
     env->episode_return = 0.0f;
     env->active_random_event_line = -1;
     env->last_failure_was_event = 0;
+    env->emergency_recovery_steps = 0;
     int reset_outages_now = env->random_outages_at_reset;
     if (reset_outages_now && env->reset_outage_probability < 1.0)
     {
@@ -913,17 +969,6 @@ void c_reset(PowerGrid *env)
                             for (int prior = 0; prior < event; prior++)
                                 unique_line &=
                                     env->scheduled_random_event_line[prior] != line;
-                            if (unique_line)
-                            {
-                                PowerGridTopology candidate;
-                                power_grid_topology_normal(&candidate);
-                                candidate.line_closed[line] = 0;
-                                for (int prior = 0; prior < event; prior++)
-                                    candidate.line_closed[
-                                        env->scheduled_random_event_line[prior]] = 0;
-                                unique_line = power_grid_validate_topology(
-                                    &candidate, NULL, NULL) == POWER_GRID_SOLVE_OK;
-                            }
                         }
                         while (!unique_line);
                     }
@@ -975,6 +1020,8 @@ void c_reset(PowerGrid *env)
         env->episode.random_events++;
     }
     power_grid_solve_environment(env);
+    if (env->solution.status != POWER_GRID_SOLVE_OK && reset_outages_now)
+        env->emergency_recovery_steps = POWER_GRID_EMERGENCY_RECOVERY_STEPS;
     power_grid_compute_observations(env);
 }
 
@@ -993,6 +1040,8 @@ void c_step(PowerGrid *env)
     }
     int previously_safe = env->solution.status == POWER_GRID_SOLVE_OK &&
                           env->solution.max_rho <= 1.0;
+    int failure_pending_from_event = env->last_failure_was_event &&
+                                     env->solution.status != POWER_GRID_SOLVE_OK;
     double previous_overload = env->solution.status == POWER_GRID_SOLVE_OK ?
         fmax(env->solution.max_rho - 1.0, 0.0) : 0.0;
     PowerGridAppliedAction action = apply_agent_action(env, env->actions[0]);
@@ -1033,8 +1082,22 @@ void c_step(PowerGrid *env)
 
     env->episode_step++;
 
+    if (status != POWER_GRID_SOLVE_OK && env->emergency_recovery_steps > 0)
+    {
+        env->emergency_recovery_steps--;
+        env->rewards[0] = calculate_reward(
+            env, status, 0.0, 0.0, action.switched, action.electrical_change,
+            previously_safe, 0, power_grid_served_load_fraction(env));
+        env->episode_return += env->rewards[0];
+        power_grid_compute_observations(env);
+        return;
+    }
+    if (status == POWER_GRID_SOLVE_OK)
+        env->emergency_recovery_steps = 0;
+
     int metric_safe = 0;
     int reward_safe = 0;
+    double served_load_fraction = power_grid_served_load_fraction(env);
     double constraint_cost = 0.0;
     double congestion_progress = 0.0;
     if (status == POWER_GRID_SOLVE_OK)
@@ -1058,12 +1121,13 @@ void c_step(PowerGrid *env)
          * has zero net progress, so oscillations cannot farm reward. */
         congestion_progress = previous_overload - overload;
         env->episode.safe_steps += metric_safe;
-        env->episode.demand_served_steps++;
+        env->episode.served_load_fraction_sum += served_load_fraction;
     }
 
     env->rewards[0] = calculate_reward(
         env, status, constraint_cost, congestion_progress,
-        action.switched, action.electrical_change, previously_safe, reward_safe);
+        action.switched, action.electrical_change, previously_safe, reward_safe,
+        served_load_fraction);
     if (action.electrical_change && env->episode.random_events > 0 &&
         env->episode.recoveries_rewarded < env->episode.random_events &&
         !previously_safe && reward_safe)
@@ -1082,11 +1146,13 @@ void c_step(PowerGrid *env)
 
     if (env->terminals[0])
     {
-        env->last_failure_was_event = 0;
+        env->log.event_failure += failure_pending_from_event;
+        env->last_failure_was_event = failure_pending_from_event;
         env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);
         return;
     }
+    env->last_failure_was_event = 0;
 
     int random_event_applied = 0;
     int next_period = (env->episode_step / POWER_GRID_STEPS_PER_PERIOD) %
@@ -1114,11 +1180,25 @@ void c_step(PowerGrid *env)
     }
     if (status != POWER_GRID_SOLVE_OK)
     {
-        /* New injections can expose an infeasible state without another agent action. */
+        /* A new outage can itself disconnect equipment. Expose that state and
+         * give the policy one step to use an explicit emergency action. */
+        if (random_event_applied)
+        {
+            env->last_failure_was_event = 1;
+            env->emergency_recovery_steps = POWER_GRID_EMERGENCY_RECOVERY_STEPS;
+            env->rewards[0] = calculate_reward(
+                env, status, 0.0, 0.0, 0, 0, 0, 0,
+                power_grid_served_load_fraction(env));
+            env->episode_return += env->rewards[0];
+            power_grid_compute_observations(env);
+            return;
+        }
+        /* New injections can expose an infeasible state without an outage. */
         env->log.event_failure += random_event_applied;
         env->last_failure_was_event = random_event_applied;
         env->rewards[0] = calculate_reward(
-            env, status, 0.0, 0.0, 0, 0, 0, 0);
+            env, status, 0.0, 0.0, 0, 0, 0, 0,
+            power_grid_served_load_fraction(env));
         env->terminals[0] = 1.0f;
         env->episode_return += env->rewards[0];
         power_grid_finish_episode(env);
@@ -1152,6 +1232,7 @@ void power_grid_allocate(PowerGrid *env)
     env->secure_switch_penalty = POWER_GRID_DEFAULT_SECURE_SWITCH_PENALTY;
     env->congestion_cost_weight = POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT;
     env->congestion_progress_weight = POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT;
+    env->unserved_load_cost_weight = POWER_GRID_DEFAULT_UNSERVED_LOAD_COST_WEIGHT;
     if (env->reset_outage_probability == 0.0)
         env->reset_outage_probability = 1.0;
     env->branch_rating_scale = 1.0;
@@ -1370,14 +1451,17 @@ static void power_grid_draw_generator(const PowerGrid *env, int generator)
     Vector2 station = POWER_GRID_STATION_POSITIONS[bus];
     Vector2 busbar = {station.x - 19.0f, station.y + (bar ? 8.0f : -8.0f)};
     Vector2 symbol = {station.x - 19.0f, station.y - 49.0f};
-    DrawLineEx(busbar, (Vector2){symbol.x, symbol.y + 13.0f}, 2.0f,
-               bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
-    DrawCircleV(symbol, 17.0f, (Color){34, 78, 100, 255});
+    int connected = env->topology.generator_connected[generator];
+    Color terminal_color = connected ? (bar ? POWER_GRID_BB2 : POWER_GRID_BB1) :
+                                       POWER_GRID_OPEN;
+    DrawLineEx(busbar, (Vector2){symbol.x, symbol.y + 13.0f}, 2.0f, terminal_color);
+    DrawCircleV(symbol, 17.0f, connected ? (Color){34, 78, 100, 255} :
+                                             (Color){68, 72, 80, 255});
     DrawCircleLines((int)symbol.x, (int)symbol.y, 17.0f, POWER_GRID_BB1);
     DrawText("G", (int)symbol.x - 7, (int)symbol.y - 11, 21, RAYWHITE);
     double output = generator == 0 ? env->solution.slack_generation_mw :
                                      env->operating_point.generator_mw[generator];
-    const char *label = env->ac_power_flow ?
+    const char *label = !connected ? "TRIPPED" : env->ac_power_flow ?
         TextFormat("%.0f MW  %+.0f MVAr", output,
                    env->ac_solution.generator_q_mvar[generator]) :
         TextFormat("%.1f MW", output);
@@ -1397,14 +1481,18 @@ static void power_grid_draw_load(const PowerGrid *env, int load)
     Vector2 station = POWER_GRID_STATION_POSITIONS[bus];
     Vector2 busbar = {station.x + 19.0f, station.y + (bar ? 8.0f : -8.0f)};
     Vector2 symbol = {station.x + 19.0f, station.y + 49.0f};
+    int connected = env->topology.load_connected[load];
     DrawLineEx(busbar, (Vector2){symbol.x, symbol.y - 12.0f}, 2.0f,
-               bar ? POWER_GRID_BB2 : POWER_GRID_BB1);
+               connected ? (bar ? POWER_GRID_BB2 : POWER_GRID_BB1) :
+                           POWER_GRID_OPEN);
     Rectangle load_box = {symbol.x - 15.0f, symbol.y - 13.0f, 30.0f, 26.0f};
-    DrawRectangleRounded(load_box, 0.25f, 4, (Color){178, 77, 50, 255});
+    DrawRectangleRounded(load_box, 0.25f, 4,
+                         connected ? (Color){178, 77, 50, 255} :
+                                     (Color){68, 72, 80, 255});
     DrawRectangleRoundedLinesEx(load_box, 0.25f, 4, 1.0f,
                                 (Color){255, 154, 105, 255});
     DrawText("L", (int)symbol.x - 6, (int)symbol.y - 10, 20, RAYWHITE);
-    const char *label = env->ac_power_flow ?
+    const char *label = !connected ? "SHED" : env->ac_power_flow ?
         TextFormat("%.1f MW  %+.1f MVAr", env->operating_point.load_mw[load],
                    power_grid_ac_load_q_mvar(&env->operating_point, load)) :
         TextFormat("%.1f MW", env->operating_point.load_mw[load]);
@@ -1501,6 +1589,18 @@ static void power_grid_action_summary(const PowerGrid *env, char *buffer, size_t
         snprintf(buffer, size, "COUPLER SUB %d  %s", substation + 1,
                  env->topology.coupler_closed[substation] ? "CLOSED" : "OPEN");
     }
+    else if (env->last_action_type == POWER_GRID_ACTION_LOAD_SHED)
+    {
+        int load = action - POWER_GRID_LOAD_SHED_ACTION_OFFSET;
+        snprintf(buffer, size, "EMERGENCY SHED LOAD %d AT SUB %d", load,
+                 POWER_GRID_LOAD_BUSES[load] + 1);
+    }
+    else if (env->last_action_type == POWER_GRID_ACTION_GENERATOR_TRIP)
+    {
+        int generator = 1 + action - POWER_GRID_GENERATOR_TRIP_ACTION_OFFSET;
+        snprintf(buffer, size, "EMERGENCY TRIP GENERATOR %d AT SUB %d", generator,
+                 POWER_GRID_GENERATOR_BUSES[generator] + 1);
+    }
     else
     {
         snprintf(buffer, size, "INVALID ACTION %d", action);
@@ -1564,9 +1664,14 @@ static void power_grid_draw_sidebar(const PowerGrid *env)
     float total_steps = env->log.episode_length;
     float failed_pct = episodes > 0.0f ? 100.0f * env->log.total_failure / episodes : 0.0f;
     float safe_pct = total_steps > 0.0f ? 100.0f * env->log.overload_free_steps / total_steps : 0.0f;
-    DrawText(TextFormat("episodes %.0f   switches %.0f", episodes, env->log.total_switches),
+    float episode_safe_pct = env->episode_step > 0 ?
+        100.0f * env->episode.safe_steps / env->episode_step : 0.0f;
+    DrawText(TextFormat("safe %.1f%%   served %.1f%%   controls %d", episode_safe_pct,
+                        100.0 * power_grid_served_load_fraction(env),
+                        env->episode.switches[0]),
              x + 18, 334, 17, POWER_GRID_TEXT);
-    DrawText(TextFormat("safe steps %.1f%%   failures %.1f%%", safe_pct, failed_pct),
+    DrawText(TextFormat("completed %.0f   safe %.1f%%   failures %.1f%%",
+                        episodes, safe_pct, failed_pct),
              x + 18, 360, 17, failed_pct > 0.0f ? POWER_GRID_WARN : POWER_GRID_SAFE);
 
     DrawText("HOTTEST LINES", x + 18, 404, 18, POWER_GRID_MUTED);

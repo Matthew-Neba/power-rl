@@ -51,6 +51,8 @@ void my_init(Env* env, Dict* kwargs) {
         (float)dict_get(kwargs, "congestion_cost_weight")->value;
     env->congestion_progress_weight =
         (float)dict_get(kwargs, "congestion_progress_weight")->value;
+    env->unserved_load_cost_weight =
+        (float)dict_get(kwargs, "unserved_load_cost_weight")->value;
     if (env->initial_outage_requires_one_step_recovery &&
         env->offline_scenario_probability >= 1.0)
         power_grid_prepare_one_step_recovery_cache();
@@ -70,6 +72,8 @@ void my_log(Log* log, Dict* out) {
     POWER_GRID_LOG(line_switches);
     POWER_GRID_LOG(busbar_switches);
     POWER_GRID_LOG(coupler_switches);
+    POWER_GRID_LOG(load_shed_actions);
+    POWER_GRID_LOG(generator_trip_actions);
     POWER_GRID_LOG(overload_free_steps);
     POWER_GRID_LOG(random_events);
     POWER_GRID_LOG(demand_fulfilled);

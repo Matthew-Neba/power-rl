@@ -10,9 +10,11 @@ Alberta-driven synthetic benchmark rather than a reconstruction of Alberta's tra
 - 14 substations represented by 28 independently configurable busbars.
 - 20 switchable branches, 5 generators, 11 loads, and a 100 MVA base.
 - 56 movable branch/generator/load terminals and 14 ideal busbar couplers.
-- 91 unmasked actions: no-op, line toggles, terminal transfers, and coupler toggles.
-- 221 observations: line loading/state/stress, terminal and coupler state, injections,
-  weather/rating state, busbar voltage or DC activity, and generator reactive output.
+- 106 unmasked actions: no-op, line toggles, terminal transfers, coupler toggles,
+  11 irreversible load sheds, and 4 irreversible non-slack generator trips.
+- 236 observations: line loading/state/stress, terminal and coupler state, injections,
+  weather/rating state, busbar voltage or DC activity, generator reactive output, and the
+  connected state of controllable loads and generators.
 
 `power_grid_solver.c` retains the IEEE-118-era optimized implementation: union-find topology
 validation, topology caches, precomputed branch coefficients, a minimum-degree sparse Cholesky
@@ -21,9 +23,10 @@ observation reuse. AC Newton-Raphson is integrated in the same solver and adds r
 transformer taps, the bus-9 shunt, voltage/reactive limits, losses, worst-end MVA loading, and
 inverse-time thermal protection.
 
-Every load and generator must remain connected to the bus-1 slack component. Random-event
-eligibility guarantees that removing a line leaves the normal topology connected and DC-solvable;
-it does not guarantee AC convergence, absence of overload, or security after later policy actions.
+Connected equipment must remain in an energized island. Deliberately shed loads, deliberately
+tripped generators, and de-energized islands with no injection are represented explicitly. Outage
+requests are never rejected merely because they island the network; AC convergence, thermal
+security, and continued service are outcomes measured after the request.
 
 ## Scenarios and outages
 
@@ -40,9 +43,9 @@ IEEE 738 approximation. No files, parsing, allocation, Python, or network calls 
 environment hot path.
 
 Training mixes 65% historical days with 35% synthetic global, regional-transfer, and renewable
-stress ramps. Every standard training episode schedules one or two persistent outages at distinct
-later periods. The radial 7-8 line is excluded, and each sampled multi-line set is validated
-together before use.
+stress ramps. Every standard training episode schedules one or two distinct persistent outages at
+later periods. All 20 lines are eligible, including radial line 7-8, and multi-line sets are not
+prefiltered for feasibility.
 
 ## Reward and metrics
 
@@ -51,15 +54,16 @@ The DC training reward is:
 ```text
 -congestion_cost * congestion_cost_weight
 +signed congestion-progress reward
+-unserved_load_fraction * unserved_load_cost_weight
 -switch_penalty when a physical switch occurs
 +safe_step_reward when all lines are within their limits
 +recovery_reward on a physical action that restores security after an outage
 ```
 
 Invalid topology or solver failure terminates with `failure_reward`. The current defaults are
-failure `-1.0`, safe step `1.0`, recovery `0.5`, congestion weight `0.01`, switch penalty `0.002`,
-secure-state switch penalty `0.1`, and congestion progress `1.0`. These coefficients remain
-configurable; Puffer clips individual training rewards to `[-1, 1]`.
+failure `-1.0`, safe step `1.0`, recovery `0.5`, congestion weight `0.01`, unserved-load weight
+`5.0`, switch penalty `0.002`, secure-state switch penalty `0.1`, and congestion progress `1.0`.
+These coefficients remain configurable; Puffer clips individual training rewards to `[-1, 1]`.
 AC voltage violations and thermal trips remain evaluation metrics because AC
 power flow is disabled during high-throughput training.
 
@@ -77,40 +81,90 @@ PATH="$PWD/.venv/bin:$PATH" puffer train power_grid
 PATH="$PWD/.venv/bin:$PATH" puffer eval power_grid
 ```
 
+The plain evaluation command follows `config/power_grid.ini`: DC physics with automatic N-1/N-2
+outages. To evaluate a named checkpoint with AC physics and an outage in every episode, use:
+
+```sh
+PATH="$PWD/.venv/bin:$PATH" puffer eval power_grid \
+  --load-model-path resources/power_grid/policy.bin \
+  --env.ac-power-flow True \
+  --env.random-events True \
+  --env.random-event-probability 1 \
+  --env.random-outage-count 2 \
+  --env.random-outage-count-min 1
+```
+
+This samples episodes; it does not replace the exhaustive 210-combination browser-contract QA.
+
+Build and serve the browser demo using the same Ocean C-to-WebAssembly path as the upstream
+PufferLib demos:
+
+```sh
+source /path/to/emsdk/emsdk_env.sh
+./build.sh power_grid --web
+python -m http.server 8000 --directory build/web/power_grid
+```
+
+Open `http://localhost:8000/game.html`. The browser runs the embedded 256x3 MinGRU policy and AC
+solver locally. It draws held-out 2020 demand, renewable, and weather conditions; automatic
+outages are disabled, so clicking up to two lines is the only contingency source. Argmax is the
+default inference mode; keys `1` and `2` select stochastic and argmax inference respectively.
+Infeasible user outages remain applied and are counted as failures rather than being rejected or
+rolled back.
+
+The exhaustive browser-contract QA enumerates all 20 N-1 and 190 N-2 line sets, alternates both
+N-2 click orders, and rotates outage time and held-out context:
+
+```sh
+clang -std=c11 -O3 -Wall -Wextra -Werror -pedantic \
+  -Iocean/power_grid -Isrc -Ivendor ocean/power_grid/qa_user_outages.c \
+  -lm -o build/qa_user_outages
+./build/qa_user_outages resources/power_grid/policy.bin 8
+```
+
+The QA report keeps physical feasibility separate from policy performance and defines a handled
+trial as issuing no pre-click emergency command, completing the day without solver/connectivity
+failure, keeping at least 95% of post-click steps thermally and voltage secure, and serving at
+least 90% of demand on average. The first and last gates prevent anticipatory or indiscriminate
+shedding from counting as recovery. Impossible islanding combinations remain in the denominator
+rather than being hidden behind a request filter.
+
 The default configuration samples one or two outages in every training episode
 (`random_outage_count_min = 1`, `random_outage_count = 2`). A plain
 `puffer train power_grid` therefore trains on a mixture of N-1 and N-2 events,
 but its dashboard averages the two cases and is not an exact N-1 or N-2 gate.
 
-For the tested unrestricted recovery curriculum, run:
+To reproduce the current emergency-control curriculum from the 91-action checkpoint recorded by
+commit `fcef678b`, run:
 
 ```sh
 ocean/power_grid/train_honest.sh
 ```
 
-It starts from the resource weights, applies three fixed-seed,
-low-learning-rate PPO stages on the 2019 historical pool (N-1, N-2, then a
-small N-1 polish), and writes only beneath
-`checkpoints/power_grid/honest-surpass-run/`. The script never replaces the resource
-policy itself. This is honest unrestricted fine-tuning, not an independent reproduction
-of the checkpoint's old assisted pretraining. The resulting 2026-08-14 policy is
-preserved at `checkpoints/power_grid/honest-surpass-20260814/policy.bin` and promoted to
-`resources/power_grid/policy.bin` for the standalone and web runtimes.
+The script first expands the old 221/91 checkpoint to 236/106 without changing its legacy argmax
+behavior. Its fixed-seed AC PPO curriculum then progresses through general reset recovery,
+one-step N-1 recovery, intact-grid service preservation, balanced intact/N-1 recovery, and finally
+balanced intact/N-1/N-2 recovery. The intact stages were added after browser QA caught a policy
+that shed load before the first click. It writes only beneath
+`checkpoints/power_grid/honest-surpass-run/` and never replaces the resource policy. The policy
+still acts without action masks, rollback, planners, greedy targets, lookahead rewards, forced
+no-op, recurrent-state reset on click, or runtime fallbacks.
 
-On held-out 2020 seeds 0..1023 with an outage in every episode, that honest
-checkpoint measured:
+The promoted checkpoint is `resources/power_grid/policy.bin`, SHA-256
+`1dd8c7fc544fbf72737ed1242677a608d7dac050b1092097b4cabd4d196f8e49`. Exhaustive held-out 2020
+AC validation used 8 rotating contexts per combination (1,680 trials total):
 
-| Physics / contingency | Perf | Failure | Switches |
-|---|---:|---:|---:|
-| DC N-1 | 0.9115 | 0.00% | 0.367 |
-| DC N-2 | 0.7886 | 1.86% | 1.154 |
-| AC N-1 | 0.8004 | 13.77% | 0.451 |
-| AC N-2 | 0.5769 | 32.32% | 1.122 |
+| Contingency | Survival | Handled | Secure steps | Demand served |
+|---|---:|---:|---:|---:|
+| N-1 (20 sets) | 90.63% | 63.75% | 80.04% | 98.61% |
+| N-2 (190 sets) | 70.39% | 28.49% | 53.67% | 96.55% |
+| Combined | 72.32% | 31.85% | 56.18% | 96.75% |
 
-The fine-tuned checkpoint slightly surpassed the previous protected policy on both fixed
-DC gates and switches less. AC N-1 is slightly lower (0.8004 versus 0.8015),
-while AC N-2 is higher (0.5769 versus 0.5756). It remains a research checkpoint,
-not a real-grid deployment policy.
+No tested case issued an emergency command before its first click. The earlier emergency policy
+had higher apparent handled performance under the old metric, but browser QA showed it shed load
+before every request; under the corrected product contract its handled rate was 0%. The current
+policy improves honest survival and preserves much more demand, but it does **not** meet the
+requested 95% handled gate. It is a research/demo checkpoint, not a real-grid deployment policy.
 
 Compare a checkpoint against deterministic baselines on held-out 2020 scenarios:
 
@@ -131,7 +185,7 @@ its final results were:
 | N-2 argmax | 0.7978 | 0.78% | 0.8026 | 0.8049 |
 | N-2 stochastic | 0.7898 | 1.56% | 0.8026 | 0.8049 |
 
-These were unrestricted 91-action inference results: no action mask, rollback, fallback, forced
+These historical results used unrestricted 91-action inference: no action mask, rollback, fallback, forced
 no-op, or line-only policy was used when the checkpoint ran. Repository history shows that this
 previous checkpoint's earlier training lineage did use action shielding and a lookahead-action
 reward, however, so it is not evidence of fully unassisted PPO training. The honest recovery
@@ -162,6 +216,7 @@ deployment requires authenticated network cases and facility ratings, route/cond
 dispatch and remedial-action rules, protection/interlocks, N-1/N-k and transient/frequency studies,
 operator review, and deployment monitoring.
 
-The policy also remains below simple planning baselines in held-out secure-step performance and was
-trained with the DC solver. AC validation checks feasibility but is not evidence that the policy is
-ready for real-grid control. N-2 generalization is the principal learned-policy limitation.
+The legacy policy remained below simple planning baselines in held-out secure-step performance.
+The current emergency policy was fine-tuned with AC power flow and is validated under AC, but that
+still does not establish transient, frequency, protection, or real-grid safety. N-2 recovery and
+service preservation remain the principal learned-policy limitations.

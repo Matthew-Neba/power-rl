@@ -59,16 +59,22 @@ int main(void)
 
     PowerGridUserSession user;
     power_grid_user_init(&user, 2);
-    PowerGridTopology topology_before_outages = env.topology;
-    PowerGridSolveResult solution_before_invalid = env.solution;
+    float bridge_available_before =
+        env.observations[POWER_GRID_LINE_OBS_OFFSET +
+                         bridge * POWER_GRID_LINE_OBS_FEATURES + 3];
     CHECK(power_grid_user_set_line_outage(&user, &env, bridge, 1) !=
           POWER_GRID_SOLVE_OK);
-    CHECK(env.line_available[bridge]);
-    CHECK(memcmp(&env.topology, &topology_before_outages,
-                 sizeof(topology_before_outages)) == 0);
-    CHECK(memcmp(&env.solution, &solution_before_invalid,
-                 sizeof(solution_before_invalid)) == 0);
-    CHECK(!user.topology_before_outage_valid);
+    CHECK(!env.line_available[bridge]);
+    CHECK(!env.topology.line_closed[bridge]);
+    CHECK(user.line_outage[bridge]);
+    CHECK(bridge_available_before == 1.0f);
+    CHECK(env.observations[POWER_GRID_LINE_OBS_OFFSET +
+                           bridge * POWER_GRID_LINE_OBS_FEATURES + 2] == 0.0f);
+    CHECK(env.observations[POWER_GRID_LINE_OBS_OFFSET +
+                           bridge * POWER_GRID_LINE_OBS_FEATURES + 3] == 0.0f);
+
+    c_reset(&env);
+    power_grid_user_init(&user, 2);
 
     CHECK(power_grid_user_set_line_outage(&user, &env, first, 1) ==
           POWER_GRID_SOLVE_OK);
@@ -80,7 +86,7 @@ int main(void)
     CHECK(memcmp(&env.topology, &before_third, sizeof(before_third)) == 0);
     CHECK(power_grid_user_set_line_outage(&user, &env, first, 0) ==
           POWER_GRID_SOLVE_OK);
-    CHECK(env.line_available[first] && env.topology.line_closed[first]);
+    CHECK(env.line_available[first] && !env.topology.line_closed[first]);
 
     PowerGridTopology persistent = env.topology;
     for (int step = 0; step < POWER_GRID_EPISODE_STEPS + 1; step++)
@@ -96,9 +102,7 @@ int main(void)
 
     CHECK(power_grid_user_set_line_outage(&user, &env, second, 0) ==
           POWER_GRID_SOLVE_OK);
-    CHECK(memcmp(&env.topology, &topology_before_outages,
-                 sizeof(topology_before_outages)) == 0);
-    CHECK(!user.topology_before_outage_valid);
+    CHECK(env.line_available[second]);
     c_close(&env);
 
     if (failures)

@@ -52,47 +52,55 @@ static PowerGridSolveStatus solve_dense_reference(
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
         if (!isfinite(point->load_mw[load]) || point->load_mw[load] < 0.0)
             return result->status = POWER_GRID_INVALID_INPUT;
-        load_total += point->load_mw[load];
+        if (topology->load_connected[load]) load_total += point->load_mw[load];
     }
     for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS; generator++) {
         if (!isfinite(point->generator_mw[generator]) ||
                 point->generator_mw[generator] < 0.0)
             return result->status = POWER_GRID_INVALID_INPUT;
-        non_slack_generation += point->generator_mw[generator];
+        if (topology->generator_connected[generator])
+            non_slack_generation += point->generator_mw[generator];
     }
     result->slack_generation_mw = load_total - non_slack_generation;
     if (!isfinite(result->slack_generation_mw) ||
             result->slack_generation_mw < 0.0)
         return result->status = POWER_GRID_INVALID_INPUT;
 
-    for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
-        if (!topology->line_closed[branch]) continue;
-        const PowerGridBranch *line = &POWER_GRID_BRANCHES[branch];
-        active[power_grid_terminal_node(topology,
-            POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus)] = 1;
-        active[power_grid_terminal_node(topology,
-            POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus)] = 1;
-    }
+    int reference = power_grid_terminal_node(topology,
+        POWER_GRID_GENERATOR_TERMINAL(0), POWER_GRID_GENERATOR_BUSES[0]);
+    active[reference] = 1;
+    int changed;
+    do {
+        changed = 0;
+        for (int branch = 0; branch < POWER_GRID_NUM_BRANCHES; branch++) {
+            if (!topology->line_closed[branch]) continue;
+            const PowerGridBranch *line = &POWER_GRID_BRANCHES[branch];
+            int from = power_grid_terminal_node(topology,
+                POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
+            int to = power_grid_terminal_node(topology,
+                POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+            if (active[from] && !active[to]) { active[to] = 1; changed = 1; }
+            if (active[to] && !active[from]) { active[from] = 1; changed = 1; }
+        }
+    } while (changed);
     for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++) {
+        if (!topology->generator_connected[generator]) continue;
         int node = power_grid_terminal_node(topology,
             POWER_GRID_GENERATOR_TERMINAL(generator),
             POWER_GRID_GENERATOR_BUSES[generator]);
-        active[node] = 1;
         double output = generator == 0 ? result->slack_generation_mw :
                                          point->generator_mw[generator];
         injection[node] += output;
         result->substation_injection_mw[POWER_GRID_GENERATOR_BUSES[generator]] += output;
     }
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++) {
+        if (!topology->load_connected[load]) continue;
         int node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
                                             POWER_GRID_LOAD_BUSES[load]);
-        active[node] = 1;
         injection[node] -= point->load_mw[load];
         result->substation_injection_mw[POWER_GRID_LOAD_BUSES[load]] -= point->load_mw[load];
     }
 
-    int reference = power_grid_terminal_node(topology,
-        POWER_GRID_GENERATOR_TERMINAL(0), POWER_GRID_GENERATOR_BUSES[0]);
     int dimensions = 0;
     for (int node = 0; node < POWER_GRID_NUM_NODES; node++) {
         row_for_node[node] = active[node] && node != reference ? dimensions++ : -1;
@@ -104,6 +112,7 @@ static PowerGridSolveStatus solve_dense_reference(
             POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
         int to = power_grid_terminal_node(topology,
             POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+        if (!active[from] || !active[to]) continue;
         int from_row = row_for_node[from];
         int to_row = row_for_node[to];
         double susceptance = POWER_GRID_BASE_MVA /
@@ -132,6 +141,7 @@ static PowerGridSolveStatus solve_dense_reference(
             POWER_GRID_LINE_TERMINAL(branch, 0), line->from_bus);
         int to = power_grid_terminal_node(topology,
             POWER_GRID_LINE_TERMINAL(branch, 1), line->to_bus);
+        if (!active[from] || !active[to]) continue;
         double flow = POWER_GRID_BASE_MVA *
             (result->node_angle[from] - result->node_angle[to]) /
             (line->reactance * line->tap_ratio);
@@ -158,6 +168,7 @@ static void check_kirchhoff(const PowerGridTopology *topology,
     double outgoing[POWER_GRID_NUM_NODES] = {0};
     for (int generator = 0; generator < POWER_GRID_NUM_GENERATORS; generator++)
     {
+        if (!topology->generator_connected[generator]) continue;
         int node = power_grid_terminal_node(topology,
             POWER_GRID_GENERATOR_TERMINAL(generator),
             POWER_GRID_GENERATOR_BUSES[generator]);
@@ -166,6 +177,7 @@ static void check_kirchhoff(const PowerGridTopology *topology,
     }
     for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
     {
+        if (!topology->load_connected[load]) continue;
         int node = power_grid_terminal_node(topology, POWER_GRID_LOAD_TERMINAL(load),
                                             POWER_GRID_LOAD_BUSES[load]);
         injection[node] -= point->load_mw[load];
@@ -228,7 +240,7 @@ static void test_dimensions_and_nominal_solution(void)
     CHECK(POWER_GRID_NUM_GENERATORS == 5);
     CHECK(POWER_GRID_NUM_LOADS == 11);
     CHECK(POWER_GRID_NUM_TERMINALS == 56);
-    CHECK(POWER_GRID_NUM_ACTIONS == 91);
+    CHECK(POWER_GRID_NUM_ACTIONS == 106);
     CHECK(POWER_GRID_GENERATOR_BUSES[0] == POWER_GRID_IEEE14_SLACK_BUS);
 
     PowerGridTopology topology;
@@ -268,7 +280,7 @@ static void test_profiles(void)
     }
 }
 
-static void test_contingency_eligibility(void)
+static void test_contingency_coverage(void)
 {
     PowerGridOperatingPoint point;
     power_grid_operating_point_nominal(&point);
@@ -284,15 +296,12 @@ static void test_contingency_eligibility(void)
         if (power_grid_random_event_eligible(line))
         {
             eligible++;
-            CHECK(status == POWER_GRID_SOLVE_OK);
+            bridges += status != POWER_GRID_SOLVE_OK;
         }
         else
-        {
-            bridges++;
-            CHECK(status != POWER_GRID_SOLVE_OK);
-        }
+            CHECK(0);
     }
-    CHECK(eligible == POWER_GRID_NUM_BRANCHES - POWER_GRID_IEEE14_BRIDGE_COUNT);
+    CHECK(eligible == POWER_GRID_NUM_BRANCHES);
     CHECK(bridges == POWER_GRID_IEEE14_BRIDGE_COUNT);
 }
 
@@ -306,7 +315,8 @@ static void test_randomized_dense_parity(void)
 
     for (int trial = 0; trial < 128; trial++) {
         random = random * 1664525u + 1013904223u;
-        int action = 1 + (int)(random % (POWER_GRID_NUM_ACTIONS - 1));
+        int action = 1 +
+            (int)(random % (POWER_GRID_LOAD_SHED_ACTION_OFFSET - 1));
         PowerGridTopology candidate = topology;
         CHECK(power_grid_apply_action(&candidate, action) != POWER_GRID_ACTION_INVALID);
 
@@ -371,14 +381,63 @@ static void test_busbar_actions(void)
           POWER_GRID_ACTION_INVALID);
 }
 
+static void test_emergency_disconnection(void)
+{
+    PowerGridTopology topology;
+    PowerGridOperatingPoint point;
+    PowerGridSolveResult result;
+    power_grid_topology_normal(&topology);
+    power_grid_operating_point_nominal(&point);
+
+    int bridge = -1;
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        PowerGridTopology candidate = topology;
+        candidate.line_closed[line] = 0;
+        if (power_grid_solve(&candidate, &point, &result) != POWER_GRID_SOLVE_OK)
+        {
+            topology = candidate;
+            bridge = line;
+            break;
+        }
+    }
+    CHECK(bridge >= 0);
+
+    int tripped = 0;
+    PowerGridSolveStatus status = power_grid_solve(&topology, &point, &result);
+    for (int generator = 1; generator < POWER_GRID_NUM_GENERATORS &&
+                            status == POWER_GRID_DISCONNECTED_GENERATOR;
+         generator++)
+    {
+        PowerGridActionType type = power_grid_apply_action(
+            &topology, POWER_GRID_GENERATOR_TRIP_ACTION_OFFSET + generator - 1);
+        CHECK(type == POWER_GRID_ACTION_GENERATOR_TRIP);
+        tripped++;
+        status = power_grid_solve(&topology, &point, &result);
+    }
+    CHECK(tripped > 0 && tripped < POWER_GRID_NUM_GENERATORS);
+    CHECK(status == POWER_GRID_SOLVE_OK);
+
+    power_grid_topology_normal(&topology);
+    topology.terminal_busbar[POWER_GRID_LOAD_TERMINAL(0)] = 1;
+    CHECK(power_grid_solve(&topology, &point, &result) ==
+          POWER_GRID_DISCONNECTED_LOAD);
+    CHECK(power_grid_apply_action(&topology, POWER_GRID_LOAD_SHED_ACTION_OFFSET) ==
+          POWER_GRID_ACTION_LOAD_SHED);
+    CHECK(power_grid_solve(&topology, &point, &result) == POWER_GRID_SOLVE_OK);
+    PowerGridACSolveResult ac;
+    CHECK(power_grid_ac_solve(&topology, &point, &ac) == POWER_GRID_AC_OK);
+}
+
 int main(void)
 {
     test_dimensions_and_nominal_solution();
     test_profiles();
-    test_contingency_eligibility();
+    test_contingency_coverage();
     test_randomized_dense_parity();
     test_invalid_input_parity();
     test_busbar_actions();
+    test_emergency_disconnection();
     if (failures)
         return 1;
     puts("IEEE-14 DC solver tests passed");

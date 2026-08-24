@@ -13,13 +13,14 @@ retained as an explicit validation mode.
 | Substations / electrical nodes | 14 / 28 |
 | Branches / generators / loads | 20 / 5 / 11 |
 | Equipment terminals / couplers | 56 / 14 |
-| Environment actions | 91 |
-| PPO actions | 91 (all environment actions) |
-| Float observations | 221 |
+| Environment actions | 106 |
+| PPO actions | 106 (all environment actions) |
+| Float observations | 236 |
 | Training episode | 72 steps / 12 periods |
 | Interactive runtime | 72-step episodes; fresh environment and policy after terminal |
 
-PPO can select every line, terminal-busbar, and coupler action. Invalid topology commands and
+PPO can select every line, terminal-busbar, coupler, load-shed, and non-slack-generator-trip
+action. Invalid topology commands and
 outage-sensitive topology choices have their real episode-ending consequences; the environment
 does not silently replace them with no-op or roll them back for the agent.
 
@@ -47,22 +48,23 @@ The read-only cache keeps 2019 training and disjoint 2020 validation days. Train
 recorded days and 35% synthetic stress profiles. AESO/ERA5 demand, renewable, temperature, wind,
 and solar traces retain their daily correlation and drive injections and IEEE-738-style ratings.
 
-Training now guarantees one or two non-islanding outages per episode, covering N-1 and N-2 while
-matching the live N-2 limit.
+Training now guarantees one or two outages per episode, covering N-1 and N-2 while matching the
+live N-2 limit. No line or pair is removed from the outage distribution for feasibility.
 The interactive controller in `power_grid_user.h` accepts at most two user-selected outages,
-rejects invalid combinations, and restores the pre-contingency topology when the final outage is
-cleared. This state and mouse input are separate from the training environment. The app retains
-automatic outages and uses ordinary 72-step episodes. A terminal state starts a fresh environment
-episode and a newly initialized policy instance.
+applies them as exogenous events, and never rolls an infeasible request back. Clearing an outage
+makes its line available without overwriting topology changes made by the policy. This state and
+mouse input are separate from the training environment. The app uses ordinary 72-step episodes.
+A terminal state starts a fresh environment episode and a newly initialized policy instance.
 
 The web app offers both stochastic Puffer-style sampling and deterministic argmax inference. It
-keeps automatic N-2 outages enabled, reports an automatic outage that immediately invalidates the
-topology, and starts a new policy instance only when the episode terminates. Training likewise
-preserves memory across rollout boundaries and clears only a vector slot whose episode terminated.
+runs held-out 2020 days with AC physics, defaults to argmax, and disables automatic outages so the
+one or two clicked lines are the complete contingency. It reports infeasible clicks as grid
+failures instead of silently filtering them. Training likewise preserves memory across rollout
+boundaries and clears only a vector slot whose episode terminated.
 
 ## Phase-2 training audit
 
-The original phase-2 checkpoint was one 256x3 recurrent PPO policy with all 91 actions. It was
+The original phase-2 checkpoint was one 256x3 recurrent PPO policy with all 91 legacy actions. It was
 selected after unrestricted PPO curricula, reward-scale experiments, standard on-policy
 fine-tuning, logit-temperature tests, and full-action imitation probes. Selection used 2019 data;
 the fixed 2020 gate was reserved for finalists.
@@ -86,20 +88,23 @@ more reliable but did not beat their safe-step performance. No masking, rollback
 forced no-op, or line-only restriction is used. The phase-2 model is therefore an honest strong
 unrestricted result, not a baseline-beating claim.
 
-## Fine-tuned incumbent
+## Emergency-control incumbent
 
-The phase-2 resource policy was subsequently fine-tuned by the reproducible unrestricted
-curriculum in `ocean/power_grid/train_honest.sh`: 30M N-1 steps, 20M N-2 steps, and a 5M N-1
-polish, all on the 2019 pool with fixed seeds and low learning rates. The curriculum uses all 91
-actions without masks, rollback, greedy targets, or lookahead rewards. Its held-out 2020 AC and
-DC results are recorded in `ocean/power_grid/README.md`.
+The phase-2 policy was expanded deterministically from 221/91 to 236/106, adding explicit load and
+generator connected-state inputs plus agent-selected emergency controls. Browser QA then caught
+anticipatory load shedding, so the reproducible `ocean/power_grid/train_honest.sh` AC curriculum
+now includes intact-grid preservation, balanced N-1 recovery, and balanced N-2 recovery stages.
+It uses every action without masks, rollback, greedy targets, lookahead rewards, forced no-op,
+click-triggered recurrent reset, or fallback control.
 
 ## Final validation
 
 The incumbent checkpoint is `resources/power_grid/policy.bin` (256 hidden units, three MinGRU
-layers, SHA-256 `48b48f0194a4b3a2e19b5cf28332cbf0431e1edb80abad6d9f35e7b43d5a82f8`).
-The phase-2 gate reran all four inference/baseline rows above on the fixed held-out set. The complete
-power-grid Python/C suite passed (16 tests), and both the native CUDA float build and Emscripten web
-build completed successfully. Temporary training, benchmark, web-build, and downloaded dependency
-artifacts were removed after validation; unrelated user-owned sweep and tool directories were not
-modified.
+layers, SHA-256 `1dd8c7fc544fbf72737ed1242677a608d7dac050b1092097b4cabd4d196f8e49`).
+Its exhaustive 8-context held-out AC gate covers all 20 N-1 and 190 N-2 requests. Combined survival
+is 72.32%, handled rate is 31.85%, secure-step rate is 56.18%, and demand served is 96.75%; no
+trial issues a pre-click emergency command.
+Therefore the web prototype is implemented, but the requested 95% handled performance gate remains
+open. The current 18-test Python/C suite, native build, Emscripten build, exhaustive AC QA, and
+headless-browser click test pass; deployment is not called complete while the performance gate is
+open.

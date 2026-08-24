@@ -1,0 +1,62 @@
+name: power-grid web
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/power-grid-pages.yml"
+      - "build.sh"
+      - "ocean/power_grid/**"
+      - "resources/power_grid/**"
+      - "resources/shared/**"
+      - "src/puffernet.h"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: 6.0.8
+          actions-cache-folder: emsdk-cache
+
+      - name: Build IEEE-14 WebAssembly app
+        run: ./build.sh power_grid --web
+
+      - name: Prepare static site
+        run: |
+          cp build/web/power_grid/game.html build/web/power_grid/index.html
+          touch build/web/power_grid/.nojekyll
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: build/web/power_grid
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages artifact
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -102,11 +102,9 @@ static void test_topology_and_contingencies(void)
         power_grid_topology_normal(&topology);
         topology.line_closed[line] = 0;
         PowerGridACStatus status = power_grid_ac_solve(&topology, &point, &result);
-        if (power_grid_random_event_eligible(line))
+        CHECK(power_grid_random_event_eligible(line));
+        if (result.topology_status == POWER_GRID_SOLVE_OK)
         {
-            /* Event eligibility guarantees a connected, DC-solvable topology;
-             * it intentionally does not promise AC convergence. */
-            CHECK(result.topology_status == POWER_GRID_SOLVE_OK);
             if (status == POWER_GRID_AC_OK)
                 check_complex_balance(&topology, &point, &result);
             else
