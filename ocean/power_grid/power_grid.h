@@ -227,6 +227,7 @@ typedef struct
     int random_outages_at_reset;
     double reset_outage_probability;
     int timed_outages_when_not_reset;
+    int sequential_outages;
     int randomize_reset_operating_period;
     int initial_outage_requires_overload;
     int initial_outage_requires_one_step_recovery;
@@ -939,17 +940,22 @@ void c_reset(PowerGrid *env)
                     int period = 0;
                     if (!reset_outages_now)
                     {
-                        int unique_period;
-                        do
+                        if (env->sequential_outages && event > 0)
+                            period = env->scheduled_random_event_period[0];
+                        else
                         {
-                            period = 1 +
-                                (int)(next_random(env) % (POWER_GRID_NUM_PERIODS - 1));
-                            unique_period = 1;
-                            for (int prior = 0; prior < event; prior++)
-                                unique_period &=
-                                    env->scheduled_random_event_period[prior] != period;
+                            int unique_period;
+                            do
+                            {
+                                period = 1 + (int)(next_random(env) %
+                                    (POWER_GRID_NUM_PERIODS - 1));
+                                unique_period = 1;
+                                for (int prior = 0; prior < event; prior++)
+                                    unique_period &=
+                                        env->scheduled_random_event_period[prior] != period;
+                            }
+                            while (!unique_period);
                         }
-                        while (!unique_period);
                     }
                     env->scheduled_random_event_period[event] = period;
 
@@ -1027,6 +1033,32 @@ void c_reset(PowerGrid *env)
     power_grid_compute_observations(env);
 }
 
+static int power_grid_apply_due_sequential_outages(PowerGrid *env,
+                                                    int first_event)
+{
+    if (!env->sequential_outages ||
+        env->scheduled_random_event_period[0] <= 0)
+        return 0;
+
+    int applied = 0;
+    for (int event = first_event; event < env->scheduled_random_event_count; event++)
+    {
+        int outage_step = POWER_GRID_STEPS_PER_PERIOD *
+                              env->scheduled_random_event_period[event] + event;
+        if (env->episode_step != outage_step)
+            continue;
+        int line = env->scheduled_random_event_line[event];
+        env->line_available[line] = 0;
+        env->topology.line_closed[line] = 0;
+        env->active_random_event_line = line;
+        env->episode.random_events++;
+        applied = 1;
+    }
+    if (applied)
+        power_grid_solve_environment(env);
+    return applied;
+}
+
 void c_step(PowerGrid *env)
 {
     if (env->single_episode_evaluation && env->log.n > 0.0f)
@@ -1091,6 +1123,14 @@ void c_step(PowerGrid *env)
             env, status, 0.0, 0.0, action.switched, action.electrical_change,
             previously_safe, 0, power_grid_served_load_fraction(env));
         env->episode_return += env->rewards[0];
+        /* A rapid second click occurs after this response to the first click,
+         * even when the first state is still inside its emergency window. */
+        if (power_grid_apply_due_sequential_outages(env, 1) &&
+            env->solution.status != POWER_GRID_SOLVE_OK)
+        {
+            env->last_failure_was_event = 1;
+            env->emergency_recovery_steps = POWER_GRID_EMERGENCY_RECOVERY_STEPS;
+        }
         power_grid_compute_observations(env);
         return;
     }
@@ -1167,18 +1207,24 @@ void c_step(PowerGrid *env)
         power_grid_set_operating_period(
             env, (env->operating_period_offset + next_period) %
                      POWER_GRID_NUM_PERIODS);
-        for (int event = 0; event < env->scheduled_random_event_count; event++)
-        {
-            if (next_period != env->scheduled_random_event_period[event])
-                continue;
-            int line = env->scheduled_random_event_line[event];
-            env->line_available[line] = 0;
-            env->topology.line_closed[line] = 0;
-            env->active_random_event_line = line;
-            env->episode.random_events++;
-            random_event_applied = 1;
-        }
+        if (!env->sequential_outages)
+            for (int event = 0; event < env->scheduled_random_event_count; event++)
+            {
+                if (next_period != env->scheduled_random_event_period[event])
+                    continue;
+                int line = env->scheduled_random_event_line[event];
+                env->line_available[line] = 0;
+                env->topology.line_closed[line] = 0;
+                env->active_random_event_line = line;
+                env->episode.random_events++;
+                random_event_applied = 1;
+            }
         status = power_grid_solve_environment(env);
+    }
+    if (power_grid_apply_due_sequential_outages(env, 0))
+    {
+        random_event_applied = 1;
+        status = env->solution.status;
     }
     if (status != POWER_GRID_SOLVE_OK)
     {

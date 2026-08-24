@@ -124,8 +124,12 @@ N-2 click orders, and rotates outage time and held-out context:
 clang -std=c11 -O3 -Wall -Wextra -Werror -pedantic \
   -Iocean/power_grid -Isrc -Ivendor ocean/power_grid/qa_user_outages.c \
   -lm -o build/qa_user_outages
-./build/qa_user_outages resources/power_grid/policy.bin 8
+./build/qa_user_outages resources/power_grid/policy.bin 8 8
 ```
+
+The final argument is a context offset. Contexts 0-7 are the 2020 validation
+subset used during policy selection; contexts 8-15 are the separate confirmation
+subset shown below.
 
 The QA report keeps physical feasibility separate from policy performance and defines a handled
 trial as issuing no pre-click emergency command, completing the day without solver/connectivity
@@ -149,28 +153,34 @@ ocean/power_grid/train_honest.sh
 The script first expands the old 221/91 checkpoint to 236/106 without changing its legacy argmax
 behavior. Its fixed-seed AC PPO curriculum then progresses through general reset recovery,
 one-step N-1 recovery, intact-grid service preservation, balanced intact/N-1/N-2 recovery, and
-full-day batches that mix reset-time with naturally delayed N-1/N-2 outages. The intact stages
-were added after browser QA caught a policy that shed load before the first click; the mixed stages
-prevent recovery training from forgetting the recurrent transition after a click. It writes only beneath
-`checkpoints/power_grid/honest-surpass-run/` and never replaces the resource policy. The policy
-still acts without action masks, rollback, planners, greedy targets, lookahead rewards, forced
-no-op, recurrent-state reset on click, or runtime fallbacks.
+full-day batches that mix reset-time, naturally delayed, and consecutive-click N-1/N-2 outages.
+The intact stages were added after browser QA caught a policy that shed load before the first
+click; the mixed stages prevent recovery training from forgetting the recurrent transition after
+a click. Sparse PPO still discovered too few corrective actions, so the final two stages fit the
+same decoder to unrestricted AC recovery actions generated offline from 2019 states, then repeat
+that fit on the improved policy's state distribution. The 2020 data is never used by training.
+The exported MinGRU acts by itself without action masks, rollback, planners, forced no-op,
+recurrent-state reset on click, or runtime fallbacks. The offline teacher is not compiled into the
+web app. The script writes only beneath `checkpoints/power_grid/honest-surpass-run/` and never
+replaces the resource policy.
 
 The promoted checkpoint is `resources/power_grid/policy.bin`, SHA-256
-`68c0f24240a3f26384071fda015785a20bf5f1dd859b6e7478f8199e3d1da664`. Exhaustive held-out 2020
-AC validation used 8 rotating contexts per combination (1,680 trials total):
+`6a91a3a65f1675a8bd300417d6535929a3291c4ea0505eb7f29c23e21a75c0c2`. Exhaustive held-out 2020
+AC confirmation used contexts 8-15 for every combination (1,680 trials total), after policy
+selection had finished on contexts 0-7:
 
 | Contingency | Survival | Handled | Secure steps | Demand served |
 |---|---:|---:|---:|---:|
-| N-1 (20 sets) | 91.88% | 65.00% | 81.59% | 98.62% |
-| N-2 (190 sets) | 71.58% | 30.20% | 54.82% | 96.53% |
-| Combined | 73.51% | 33.51% | 57.37% | 96.73% |
+| N-1 (20 sets) | 94.38% | 75.63% | 86.76% | 98.89% |
+| N-2 (190 sets) | 78.42% | 54.21% | 72.11% | 97.33% |
+| Combined | 79.94% | 56.25% | 73.51% | 97.47% |
 
 No tested case issued an emergency command before its first click. The earlier emergency policy
 had higher apparent handled performance under the old metric, but browser QA showed it shed load
 before every request; under the corrected product contract its handled rate was 0%. The current
-policy improves honest survival and preserves much more demand, but it does **not** meet the
-requested 95% handled gate. It is a research/demo checkpoint, not a real-grid deployment policy.
+policy more than doubles the prior honest handled rate while preserving demand, but it does **not**
+meet the requested 95% handled gate. It is a research/demo checkpoint, not a real-grid deployment
+policy.
 
 Compare a checkpoint against deterministic baselines on held-out 2020 scenarios:
 

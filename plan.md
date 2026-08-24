@@ -93,20 +93,22 @@ unrestricted result, not a baseline-beating claim.
 The phase-2 policy was expanded deterministically from 221/91 to 236/106, adding explicit load and
 generator connected-state inputs plus agent-selected emergency controls. Browser QA then caught
 anticipatory load shedding, so the reproducible `ocean/power_grid/train_honest.sh` AC curriculum
-now includes intact-grid preservation, balanced N-1/N-2 recovery, and full-day batches mixing
-reset-time with naturally delayed outages.
-It uses every action without masks, rollback, greedy targets, lookahead rewards, forced no-op,
+now includes intact-grid preservation, balanced N-1/N-2 recovery, full-day batches mixing
+reset-time with naturally delayed outages, and consecutive-click training. An offline AC teacher
+then fits the same decoder on 2019 recovery states and one aggregated policy-state pass. The
+deployed model still uses every action without masks, rollback, a runtime planner, forced no-op,
 click-triggered recurrent reset, or fallback control.
 
 ## Final validation
 
 The incumbent checkpoint is `resources/power_grid/policy.bin` (256 hidden units, three MinGRU
-layers, SHA-256 `68c0f24240a3f26384071fda015785a20bf5f1dd859b6e7478f8199e3d1da664`).
-Its exhaustive 8-context held-out AC gate covers all 20 N-1 and 190 N-2 requests. Combined survival
-is 73.51%, handled rate is 33.51%, secure-step rate is 57.37%, and demand served is 96.73%; no
-trial issues a pre-click emergency command.
+layers, SHA-256 `6a91a3a65f1675a8bd300417d6535929a3291c4ea0505eb7f29c23e21a75c0c2`).
+Its exhaustive confirmation gate uses 8 untouched 2020 contexts after selection on a disjoint
+8-context subset and covers all 20 N-1 and 190 N-2 requests. Combined survival is 79.94%, handled
+rate is 56.25%, secure-step rate is 73.51%, and demand served is 97.47%; no trial issues a
+pre-click emergency command.
 Therefore the web prototype is implemented, but the requested 95% handled performance gate remains
-open. The current 18-test Python/C suite, native build, Emscripten build, exhaustive AC QA, and
+open. The current 14-test Python/C suite, native build, Emscripten build, exhaustive AC QA, and
 headless-browser click test pass. GitHub Pages deploys the research prototype at
 `https://matthew-neba.github.io/power-rl/`; the deployed HTTPS/WASM build also passed a held-click
 7-8 bridge-outage test with secure AC recovery, 100% load served, and no browser errors. Product

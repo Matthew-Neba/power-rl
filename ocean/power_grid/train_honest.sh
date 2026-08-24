@@ -4,8 +4,9 @@ set -eu
 # Reproduce the emergency-control curriculum used for the deployed
 # 106-action checkpoint. The default legacy policy is read from the requested
 # historical commit; neither repository files nor PufferLib core are changed.
-# PPO always selects directly from the complete action space without masks,
-# rollback, greedy targets, lookahead rewards, or runtime fallback control.
+# PPO and the offline AC recovery teacher both evaluate the complete action
+# space. Deployment uses only the learned MinGRU: no masks, rollback, planner,
+# lookahead, or runtime fallback control is present.
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 LEGACY=${1:-}
@@ -173,7 +174,48 @@ train_stage "$STAGE8" "$OUTPUT/09-mixed-stress" 4725 \
     --env.initial-outage-requires-one-step-recovery False \
     --env.end-episode-on-recovery False --env.max-episode-steps 72 \
     --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
-FINAL=$(latest_checkpoint "$OUTPUT/09-mixed-stress")
+STAGE9=$(latest_checkpoint "$OUTPUT/09-mixed-stress")
+
+# Match the browser contract: the second delayed outage arrives after exactly
+# one policy response to the first, with both click orders represented.
+train_stage "$STAGE9" "$OUTPUT/10-sequential-clicks" 4727 \
+    10000000 0.000025 \
+    --train.ent-coef 0.001 \
+    --env.offline-scenario-probability 0.65 \
+    --env.random-outage-count 2 --env.random-outage-count-min 1 \
+    --env.random-outages-at-reset True --env.reset-outage-probability 0.25 \
+    --env.timed-outages-when-not-reset True \
+    --env.sequential-outages True \
+    --env.randomize-reset-operating-period True \
+    --env.initial-outage-requires-one-step-recovery False \
+    --env.end-episode-on-recovery False --env.max-episode-steps 72 \
+    --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
+STAGE10=$(latest_checkpoint "$OUTPUT/10-sequential-clicks")
+
+# Sparse PPO discovers too few of the secure actions that already exist. Build
+# an offline 2019-only AC dataset, fit the same linear decoder, then aggregate
+# one more dataset on the improved policy's state distribution. The 2020 gate
+# is never read here, and the teacher is absent from the exported checkpoint.
+GENERATOR="$OUTPUT/generate-recovery-dataset"
+cc -O3 -std=c11 -Wno-unknown-pragmas -Wno-unused-function \
+    -Wno-unused-parameter -Wno-unused-variable \
+    -I"$ROOT/ocean/power_grid" -I"$ROOT/src" -I"$ROOT/vendor" \
+    "$ROOT/ocean/power_grid/generate_recovery_dataset.c" -lm -o "$GENERATOR"
+
+mkdir -p "$OUTPUT/11-offline-ac-teacher"
+DATASET11="$OUTPUT/11-offline-ac-teacher/recovery-2019.bin"
+STAGE11="$OUTPUT/11-offline-ac-teacher/policy.bin"
+"$GENERATOR" "$STAGE10" "$DATASET11" 32
+"$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
+    "$STAGE10" "$DATASET11" "$STAGE11" --epochs 100
+
+mkdir -p "$OUTPUT/12-aggregated-ac-teacher"
+DATASET12="$OUTPUT/12-aggregated-ac-teacher/recovery-2019.bin"
+FINAL="$OUTPUT/12-aggregated-ac-teacher/policy.bin"
+"$GENERATOR" "$STAGE11" "$DATASET12" 16
+"$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
+    "$STAGE11" "$DATASET12" "$FINAL" --epochs 100 \
+    --no-op-weight-scale 0.0775
 
 echo "Final checkpoint: $FINAL"
 echo "Exhaustive held-out AC QA:"

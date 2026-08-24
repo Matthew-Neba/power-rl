@@ -359,6 +359,36 @@ static void test_reset_and_timed_outage_mix(void)
     c_close(&env);
 }
 
+static void test_sequential_outages_match_rapid_clicks(void)
+{
+    PowerGrid env = {
+        .rng = 93u,
+        .random_events = 1,
+        .random_event_probability = 1.0,
+        .random_outage_count = 2,
+        .random_outage_count_min = 2,
+        .sequential_outages = 1,
+        .single_episode_evaluation = 1,
+    };
+    power_grid_allocate(&env);
+    c_reset(&env);
+    CHECK(env.scheduled_random_event_count == 2);
+    CHECK(env.scheduled_random_event_period[0] ==
+          env.scheduled_random_event_period[1]);
+    int first_step = POWER_GRID_STEPS_PER_PERIOD *
+                     env.scheduled_random_event_period[0];
+    while (env.episode_step < first_step)
+    {
+        env.actions[0] = POWER_GRID_ACTION_NONE;
+        c_step(&env);
+    }
+    CHECK(env.episode.random_events == 1);
+    env.actions[0] = POWER_GRID_ACTION_NONE;
+    c_step(&env);
+    CHECK(env.episode.random_events == 2);
+    c_close(&env);
+}
+
 static void test_reset_period_advances_relative_to_start(void)
 {
     PowerGrid env = {
@@ -709,6 +739,7 @@ int main(void)
     test_random_outage_count_range();
     test_random_outages_at_reset();
     test_reset_and_timed_outage_mix();
+    test_sequential_outages_match_rapid_clicks();
     test_reset_period_advances_relative_to_start();
     test_recovery_waits_for_all_scheduled_outages();
     test_congestion_progress_is_potential_based();
