@@ -167,20 +167,20 @@ web app. The script writes only beneath `checkpoints/power_grid/honest-surpass-r
 replaces the resource policy.
 
 The promoted checkpoint is `resources/power_grid/policy.bin`, SHA-256
-`b30b5eb5d773caf72d4bc7cd24fd113c2bae426ce3ed73c47f9e270df3d01d5d`. Exhaustive held-out 2020
-AC confirmation used contexts 16-23 for every combination (1,680 trials total), after model and
-loss-weight selection had finished on contexts 0-15:
+`6897ef1e549dffc8fba515d48e223aa3bc756c6f7b0227b9c22be1345528b867`. Exhaustive held-out 2020
+AC confirmation used contexts 24-31 for every combination (1,680 trials total), after the policy
+lineage and training parameters had been evaluated on contexts 0-23:
 
 | Contingency | Survival | Handled | Secure steps | Demand served |
 |---|---:|---:|---:|---:|
-| N-1 (20 sets) | 95.00% | 86.25% | 92.02% | 98.07% |
-| N-2 (190 sets) | 79.54% | 62.24% | 75.81% | 96.24% |
-| Combined | 81.01% | 64.52% | 77.35% | 96.41% |
+| N-1 (20 sets) | 93.13% | 86.25% | 91.21% | 97.88% |
+| N-2 (190 sets) | 80.13% | 63.62% | 76.95% | 95.99% |
+| Combined | 81.37% | 65.77% | 78.31% | 96.17% |
 
 No tested case issued an emergency command before its first click. The earlier emergency policy
 had higher apparent handled performance under the old metric, but browser QA showed it shed load
 before every request; under the corrected product contract its handled rate was 0%. The current
-policy improves the previous honest checkpoint's fresh-slice handled rate from 54.29% to 64.52%
+policy improves the earlier honest checkpoint's fresh-slice handled rate from 54.29% to 65.77%
 while preserving high demand service, but it does **not**
 meet the requested 95% handled gate. It is a research/demo checkpoint, not a real-grid deployment
 policy.

@@ -224,10 +224,10 @@ STAGE12="$OUTPUT/12-aggregated-ac-teacher/policy.bin"
 mkdir -p "$OUTPUT/13-set-valued-ac-teacher"
 DATASET13="$OUTPUT/13-set-valued-ac-teacher/recovery-2019.bin"
 FINAL="$OUTPUT/13-set-valued-ac-teacher/policy.bin"
-"$GENERATOR" "$STAGE12" "$DATASET13" 16
+"$GENERATOR" "$STAGE12" "$DATASET13" 48
 "$ROOT/.venv/bin/python" "$ROOT/ocean/power_grid/fit_recovery_decoder.py" \
     "$STAGE12" "$DATASET13" "$FINAL" --epochs 100 --loss set \
-    --no-op-weight-scale 0.5
+    --no-op-weight-scale 1.0
 
 echo "Final checkpoint: $FINAL"
 echo "Exhaustive held-out AC QA:"
