@@ -158,7 +158,22 @@ train_stage "$STAGE7" "$OUTPUT/08-mixed-low-rate" 4723 \
     --env.initial-outage-requires-one-step-recovery False \
     --env.end-episode-on-recovery False --env.max-episode-steps 72 \
     --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
-FINAL=$(latest_checkpoint "$OUTPUT/08-mixed-low-rate")
+STAGE8=$(latest_checkpoint "$OUTPUT/08-mixed-low-rate")
+
+# Reintroduce the deliberately stressed synthetic profiles alongside historical
+# days to reduce year-specific overfitting before the held-out 2020 gate.
+train_stage "$STAGE8" "$OUTPUT/09-mixed-stress" 4725 \
+    10000000 0.000025 \
+    --train.ent-coef 0.001 \
+    --env.offline-scenario-probability 0.65 \
+    --env.random-outage-count 2 --env.random-outage-count-min 1 \
+    --env.random-outages-at-reset True --env.reset-outage-probability 0.5 \
+    --env.timed-outages-when-not-reset True \
+    --env.randomize-reset-operating-period True \
+    --env.initial-outage-requires-one-step-recovery False \
+    --env.end-episode-on-recovery False --env.max-episode-steps 72 \
+    --env.secure-switch-penalty 1 --env.unserved-load-cost-weight 20
+FINAL=$(latest_checkpoint "$OUTPUT/09-mixed-stress")
 
 echo "Final checkpoint: $FINAL"
 echo "Exhaustive held-out AC QA:"

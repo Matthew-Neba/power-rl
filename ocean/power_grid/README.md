@@ -157,14 +157,14 @@ still acts without action masks, rollback, planners, greedy targets, lookahead r
 no-op, recurrent-state reset on click, or runtime fallbacks.
 
 The promoted checkpoint is `resources/power_grid/policy.bin`, SHA-256
-`8c58b7c4d6f75cd6227fd955216f773e501ac8f8f0e394f206702bd67e18778a`. Exhaustive held-out 2020
+`68c0f24240a3f26384071fda015785a20bf5f1dd859b6e7478f8199e3d1da664`. Exhaustive held-out 2020
 AC validation used 8 rotating contexts per combination (1,680 trials total):
 
 | Contingency | Survival | Handled | Secure steps | Demand served |
 |---|---:|---:|---:|---:|
-| N-1 (20 sets) | 91.88% | 65.00% | 81.64% | 98.62% |
-| N-2 (190 sets) | 71.45% | 29.80% | 54.52% | 96.54% |
-| Combined | 73.39% | 33.15% | 57.10% | 96.73% |
+| N-1 (20 sets) | 91.88% | 65.00% | 81.59% | 98.62% |
+| N-2 (190 sets) | 71.58% | 30.20% | 54.82% | 96.53% |
+| Combined | 73.51% | 33.51% | 57.37% | 96.73% |
 
 No tested case issued an emergency command before its first click. The earlier emergency policy
 had higher apparent handled performance under the old metric, but browser QA showed it shed load

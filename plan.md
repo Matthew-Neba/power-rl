@@ -101,9 +101,9 @@ click-triggered recurrent reset, or fallback control.
 ## Final validation
 
 The incumbent checkpoint is `resources/power_grid/policy.bin` (256 hidden units, three MinGRU
-layers, SHA-256 `8c58b7c4d6f75cd6227fd955216f773e501ac8f8f0e394f206702bd67e18778a`).
+layers, SHA-256 `68c0f24240a3f26384071fda015785a20bf5f1dd859b6e7478f8199e3d1da664`).
 Its exhaustive 8-context held-out AC gate covers all 20 N-1 and 190 N-2 requests. Combined survival
-is 73.39%, handled rate is 33.15%, secure-step rate is 57.10%, and demand served is 96.73%; no
+is 73.51%, handled rate is 33.51%, secure-step rate is 57.37%, and demand served is 96.73%; no
 trial issues a pre-click emergency command.
 Therefore the web prototype is implemented, but the requested 95% handled performance gate remains
 open. The current 18-test Python/C suite, native build, Emscripten build, exhaustive AC QA, and
