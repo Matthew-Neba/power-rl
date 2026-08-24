@@ -55,6 +55,7 @@ def replay(
         args["env"]["random_event_probability"] = random_event_probability
     if random_outage_count is not None:
         args["env"]["random_outage_count"] = random_outage_count
+        args["env"]["random_outage_count_min"] = random_outage_count
     args["vec"]["total_agents"] = agents
     args["reset_state"] = False
     args["train"]["horizon"] = horizon

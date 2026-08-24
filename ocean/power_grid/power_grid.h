@@ -97,6 +97,7 @@ static inline double power_grid_weather_rating_scale(
 #define POWER_GRID_DEFAULT_SECURE_SWITCH_PENALTY 0.10f
 #define POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT 0.01f
 #define POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT 1.0f
+#define POWER_GRID_VALID_REWARD_MARGIN 0.05f
 
 #define POWER_GRID_LINE_OBS_FEATURES 5
 #define POWER_GRID_LINE_OBS_OFFSET 0
@@ -603,7 +604,17 @@ static float calculate_reward(const PowerGrid *env,
     /* The main term is exactly the evaluation target: one unit for a secure
      * valid step and zero for an overloaded valid step. Failure remains worse
      * than continuing to seek recovery. */
-    return (float)(env->safe_step_reward * safe - constraint_cost +
+    /* The trainer clips rewards to [-1, 1]. Preserve the intended ordering
+     * after that clip for the passive choice: remaining in a solved overloaded
+     * state must be strictly better than an action that destroys connectivity.
+     * Bound only the state cost so the signed progress potential remains
+     * exactly reversible for topology changes. */
+    double maximum_constraint_cost = fmax(
+        0.0, env->safe_step_reward * safe - env->failure_reward -
+                 POWER_GRID_VALID_REWARD_MARGIN);
+    double bounded_constraint_cost = fmin(constraint_cost,
+                                          maximum_constraint_cost);
+    return (float)(env->safe_step_reward * safe - bounded_constraint_cost +
                    env->congestion_progress_weight * congestion_progress -
                    ((!electrical_change || previously_safe) ?
                         env->secure_switch_penalty : env->switch_penalty) * switched);

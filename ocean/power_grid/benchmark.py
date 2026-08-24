@@ -20,7 +20,7 @@ from evaluate import replay, resolve_checkpoint
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-BASELINE_COUNT = 6
+BASELINE_COUNT = 7
 METRIC_COLUMNS = (
     "perf", "score", "total_failure", "event_failure", "total_switches",
     "random_events", "demand_fulfilled", "outage_completion",

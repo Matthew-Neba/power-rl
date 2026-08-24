@@ -40,6 +40,13 @@ static void test_contract_and_reward(void)
                                  1, 1, 0, 0), 0.098);
     CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3,
                                  1, 0, 0, 0), 0.0);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 10.0, 0.0,
+                                 0, 0, 0, 0),
+                POWER_GRID_DEFAULT_FAILURE_REWARD + POWER_GRID_VALID_REWARD_MARGIN);
+    CHECK(calculate_reward(&env, POWER_GRID_SOLVE_OK, 10.0, 0.0,
+                           0, 0, 0, 0) >
+          calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY, 0.0, 0.0,
+                           0, 0, 0, 0));
 
     power_grid_topology_normal(&env.topology);
     memset(env.line_available, 1, sizeof(env.line_available));

@@ -62,14 +62,15 @@ preserves memory across rollout boundaries and clears only a vector slot whose e
 
 ## Phase-2 training audit
 
-The deployed phase-2 checkpoint is one 256x3 recurrent PPO policy with all 91 actions. It was
+The original phase-2 checkpoint was one 256x3 recurrent PPO policy with all 91 actions. It was
 selected after unrestricted PPO curricula, reward-scale experiments, standard on-policy
 fine-tuning, logit-temperature tests, and full-action imitation probes. Selection used 2019 data;
 the fixed 2020 gate was reserved for finalists.
 
 After recurrent-state handling was corrected, an additional mixed N-1/N-2 continuation and an
 overloaded recovery curriculum were screened. Both were rejected because they improved neither
-held-out performance nor the overall N-1/N-2 tradeoff, so the deployed checkpoint was not replaced.
+held-out performance nor the overall N-1/N-2 tradeoff, so that checkpoint was not replaced during
+the phase-2 audit.
 
 Fixed 256-episode held-out 2020 results (seed offset 50,000):
 
@@ -82,14 +83,22 @@ Fixed 256-episode held-out 2020 results (seed offset 50,000):
 
 The N-2 greedy and lookahead baselines each failed in 1.95% of episodes, so deterministic PPO was
 more reliable but did not beat their safe-step performance. No masking, rollback, fallback,
-forced no-op, or line-only restriction is used. The deployed model is therefore an honest strong
+forced no-op, or line-only restriction is used. The phase-2 model is therefore an honest strong
 unrestricted result, not a baseline-beating claim.
+
+## Fine-tuned incumbent
+
+The phase-2 resource policy was subsequently fine-tuned by the reproducible unrestricted
+curriculum in `ocean/power_grid/train_honest.sh`: 30M N-1 steps, 20M N-2 steps, and a 5M N-1
+polish, all on the 2019 pool with fixed seeds and low learning rates. The curriculum uses all 91
+actions without masks, rollback, greedy targets, or lookahead rewards. Its held-out 2020 AC and
+DC results are recorded in `ocean/power_grid/README.md`.
 
 ## Final validation
 
 The incumbent checkpoint is `resources/power_grid/policy.bin` (256 hidden units, three MinGRU
-layers, SHA-256 `e12e265b68308bb6547419f4e121769de99bf79f7563240eb961f1c38e045fcd`).
-The final gate reran all four inference/baseline rows above on the fixed held-out set. The complete
+layers, SHA-256 `48b48f0194a4b3a2e19b5cf28332cbf0431e1edb80abad6d9f35e7b43d5a82f8`).
+The phase-2 gate reran all four inference/baseline rows above on the fixed held-out set. The complete
 power-grid Python/C suite passed (16 tests), and both the native CUDA float build and Emscripten web
 build completed successfully. Temporary training, benchmark, web-build, and downloaded dependency
 artifacts were removed after validation; unrelated user-owned sweep and tool directories were not

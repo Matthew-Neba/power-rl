@@ -77,6 +77,41 @@ PATH="$PWD/.venv/bin:$PATH" puffer train power_grid
 PATH="$PWD/.venv/bin:$PATH" puffer eval power_grid
 ```
 
+The default configuration samples one or two outages in every training episode
+(`random_outage_count_min = 1`, `random_outage_count = 2`). A plain
+`puffer train power_grid` therefore trains on a mixture of N-1 and N-2 events,
+but its dashboard averages the two cases and is not an exact N-1 or N-2 gate.
+
+For the tested unrestricted recovery curriculum, run:
+
+```sh
+ocean/power_grid/train_honest.sh
+```
+
+It starts from the resource weights, applies three fixed-seed,
+low-learning-rate PPO stages on the 2019 historical pool (N-1, N-2, then a
+small N-1 polish), and writes only beneath
+`checkpoints/power_grid/honest-surpass-run/`. The script never replaces the resource
+policy itself. This is honest unrestricted fine-tuning, not an independent reproduction
+of the checkpoint's old assisted pretraining. The resulting 2026-08-14 policy is
+preserved at `checkpoints/power_grid/honest-surpass-20260814/policy.bin` and promoted to
+`resources/power_grid/policy.bin` for the standalone and web runtimes.
+
+On held-out 2020 seeds 0..1023 with an outage in every episode, that honest
+checkpoint measured:
+
+| Physics / contingency | Perf | Failure | Switches |
+|---|---:|---:|---:|
+| DC N-1 | 0.9115 | 0.00% | 0.367 |
+| DC N-2 | 0.7886 | 1.86% | 1.154 |
+| AC N-1 | 0.8004 | 13.77% | 0.451 |
+| AC N-2 | 0.5769 | 32.32% | 1.122 |
+
+The fine-tuned checkpoint slightly surpassed the previous protected policy on both fixed
+DC gates and switches less. AC N-1 is slightly lower (0.8004 versus 0.8015),
+while AC N-2 is higher (0.5769 versus 0.5756). It remains a research checkpoint,
+not a real-grid deployment policy.
+
 Compare a checkpoint against deterministic baselines on held-out 2020 scenarios:
 
 ```sh
@@ -85,8 +120,9 @@ PATH="$PWD/.venv/bin:$PATH" python ocean/power_grid/benchmark.py \
   --random-event-probability 1.0 --random-outages 2
 ```
 
-The checked-in 256x3 MinGRU PPO checkpoint was frozen after model selection on 2019 training data.
-On the fixed 256-episode held-out 2020 set (seed offset 50,000), its final results are:
+The previous protected 256x3 MinGRU PPO checkpoint at commit `c80d9d83` was frozen after model
+selection on 2019 training data. On the fixed 256-episode held-out 2020 set (seed offset 50,000),
+its final results were:
 
 | Scenario / inference | PPO perf | PPO failures | Greedy perf | Lookahead perf |
 |---|---:|---:|---:|---:|
@@ -95,10 +131,13 @@ On the fixed 256-episode held-out 2020 set (seed offset 50,000), its final resul
 | N-2 argmax | 0.7978 | 0.78% | 0.8026 | 0.8049 |
 | N-2 stochastic | 0.7898 | 1.56% | 0.8026 | 0.8049 |
 
-These are unrestricted 91-action results: no action mask, rollback, fallback, forced no-op, or
-line-only policy is used. The PPO policy did not beat greedy or two-step lookahead on secure-step
-performance. Its useful result is lower deterministic N-2 failure (0.78% versus 1.95% for both
-baselines), not a performance-baseline win. Argmax is the stronger deployment mode on this gate;
+These were unrestricted 91-action inference results: no action mask, rollback, fallback, forced
+no-op, or line-only policy was used when the checkpoint ran. Repository history shows that this
+previous checkpoint's earlier training lineage did use action shielding and a lookahead-action
+reward, however, so it is not evidence of fully unassisted PPO training. The honest recovery
+curriculum above deliberately uses neither mechanism. The archived policy did not beat greedy or
+two-step lookahead on secure-step performance. Its useful result is lower deterministic N-2
+failure, not a performance-baseline win. Argmax is the stronger deployment mode on this gate;
 stochastic sampling remains available in the interactive app for direct comparison.
 
 For environment-only throughput:
