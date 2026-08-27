@@ -11,6 +11,11 @@
 #include "power_grid_solver.c"
 #include "power_grid.h"
 #include "power_grid_user.h"
+#ifdef POWER_GRID_POLICY_MLP
+#include "power_grid_mlp_policy.h"
+#define PufferNet PowerGridMlpPolicy
+#define power_grid_policy_action power_grid_mlp_policy_action
+#endif
 
 #define QA_MIN_SAFE_STEPS 0.95
 #define QA_MIN_SERVED_LOAD 0.90
@@ -32,10 +37,20 @@ typedef struct
     double safe_fraction;
     double peak_rho;
     double served_load_fraction;
-    double load_shed_actions;
-    double generator_trip_actions;
-    int premature_emergency_trials;
-    double premature_emergency_actions;
+    long pre_action_count[POWER_GRID_NUM_ACTIONS];
+    long first_response_action_count[POWER_GRID_NUM_ACTIONS];
+    long unsafe_first_response_action_count[POWER_GRID_NUM_ACTIONS];
+    long post_action_count[POWER_GRID_NUM_ACTIONS];
+    long unsafe_first_responses;
+    long unsafe_first_responses_secured;
+    long repeated_post_actions;
+    long total_post_actions;
+    long repeated_nonnoop_post_actions;
+    long total_nonnoop_post_actions;
+    long solved_post_steps;
+    long thermal_unsafe_post_steps;
+    long voltage_unsafe_post_steps;
+    long voltage_only_unsafe_post_steps;
 } UserOutageMetrics;
 
 /* Diagnostic oracle only: determine whether the post-click AC state has any
@@ -52,8 +67,7 @@ static int has_one_step_secure_action(const PowerGrid *env)
                 probe.topology.line_closed[line] = 0;
         if (power_grid_solve_environment(&probe) == POWER_GRID_SOLVE_OK &&
             probe.solution.max_rho <= 1.0 &&
-            probe.ac_solution.voltage_violation_count == 0 &&
-            power_grid_served_load_fraction(&probe) >= QA_MIN_SERVED_LOAD)
+            probe.ac_solution.voltage_violation_count == 0)
             return 1;
     }
     return 0;
@@ -61,19 +75,24 @@ static int has_one_step_secure_action(const PowerGrid *env)
 
 static void reset_policy(PufferNet *policy)
 {
+#ifndef POWER_GRID_POLICY_MLP
     memset(policy->mingru->state, 0,
            (size_t)policy->mingru->num_layers * policy->mingru->hidden_size *
                sizeof(float));
+#else
+    (void)policy;
+#endif
 }
 
 static void run_trial(PufferNet *policy, int first, int second, int context,
+                      int ac_power_flow, int forced_outage_step,
                       UserOutageMetrics *metrics)
 {
     int pair = second >= 0;
     int case_id = first * POWER_GRID_NUM_BRANCHES + (pair ? second : first);
     PowerGrid env = {
         .rng = UINT32_C(0x51f15e5d) ^ (uint32_t)(context * 421 + case_id),
-        .ac_power_flow = 1,
+        .ac_power_flow = ac_power_flow,
         .offline_scenarios = 1,
         .offline_scenario_validation = 1,
         .random_events = 0,
@@ -85,13 +104,14 @@ static void run_trial(PufferNet *policy, int first, int second, int context,
 
     PowerGridUserSession user;
     power_grid_user_init(&user, 2);
-    int outage_step = POWER_GRID_STEPS_PER_PERIOD * (1 + (context + case_id) % 9);
+    int outage_step = forced_outage_step >= 0 ? forced_outage_step :
+        POWER_GRID_STEPS_PER_PERIOD * (1 + (context + case_id) % 9);
     int post_steps = 0;
     int safe_steps = 0;
     int request_feasible = 1;
-    int premature_emergency_actions = 0;
     int one_step_secure = 0;
     double peak_rho = 0.0;
+    int previous_post_action = -1;
 
     while (env.log.n == 0.0f)
     {
@@ -103,7 +123,7 @@ static void run_trial(PufferNet *policy, int first, int second, int context,
             if (!pair)
                 one_step_secure = has_one_step_secure_action(&env);
         }
-        if (pair && env.episode_step == outage_step + 1)
+        if (pair && env.episode_step == outage_step)
         {
             request_feasible &= power_grid_user_set_line_outage(
                 &user, &env, context % 2 == 0 ? second : first, 1) ==
@@ -112,16 +132,62 @@ static void run_trial(PufferNet *policy, int first, int second, int context,
         }
 
         int before_request = env.episode_step < outage_step;
+        int first_response_was_unsafe = 0;
         power_grid_policy_action(policy, env.observations, env.actions,
                                  POWER_GRID_INFERENCE_ARGMAX);
+        int policy_action = (int)env.actions[0];
+        if (before_request)
+            metrics->pre_action_count[policy_action]++;
+        else
+        {
+            metrics->post_action_count[policy_action]++;
+            metrics->total_post_actions++;
+            if (env.episode_step == outage_step)
+            {
+                metrics->first_response_action_count[policy_action]++;
+                int unsafe = env.solution.status != POWER_GRID_SOLVE_OK ||
+                    env.solution.max_rho > 1.0 ||
+                    (env.ac_power_flow &&
+                     env.ac_solution.voltage_violation_count > 0);
+                if (unsafe)
+                {
+                    first_response_was_unsafe = 1;
+                    metrics->unsafe_first_response_action_count[policy_action]++;
+                    metrics->unsafe_first_responses++;
+                }
+            }
+            if (policy_action == previous_post_action)
+                metrics->repeated_post_actions++;
+            if (policy_action != POWER_GRID_ACTION_NONE)
+            {
+                metrics->total_nonnoop_post_actions++;
+                if (policy_action == previous_post_action)
+                    metrics->repeated_nonnoop_post_actions++;
+            }
+            previous_post_action = policy_action;
+        }
         c_step(&env);
-        if (before_request &&
-            (env.last_action_type == POWER_GRID_ACTION_LOAD_SHED ||
-             env.last_action_type == POWER_GRID_ACTION_GENERATOR_TRIP))
-            premature_emergency_actions++;
+        if (!before_request && env.episode_step == outage_step + 1 &&
+            env.solution.status == POWER_GRID_SOLVE_OK &&
+            env.solution.max_rho <= 1.0 &&
+            (!env.ac_power_flow ||
+             env.ac_solution.voltage_violation_count == 0))
+            metrics->unsafe_first_responses_secured +=
+                first_response_was_unsafe;
         if (env.episode_step > outage_step)
         {
             post_steps++;
+            if (env.solution.status == POWER_GRID_SOLVE_OK)
+            {
+                int thermal_unsafe = env.solution.max_rho > 1.0;
+                int voltage_unsafe = env.ac_power_flow &&
+                    env.ac_solution.voltage_violation_count > 0;
+                metrics->solved_post_steps++;
+                metrics->thermal_unsafe_post_steps += thermal_unsafe;
+                metrics->voltage_unsafe_post_steps += voltage_unsafe;
+                metrics->voltage_only_unsafe_post_steps +=
+                    voltage_unsafe && !thermal_unsafe;
+            }
             int secure = env.solution.status == POWER_GRID_SOLVE_OK &&
                          env.solution.max_rho <= 1.0 &&
                          env.ac_solution.voltage_violation_count == 0;
@@ -143,8 +209,7 @@ static void run_trial(PufferNet *policy, int first, int second, int context,
     metrics->survived_secure += survived && secure_enough;
     metrics->survived_served += survived && served_enough;
     metrics->one_step_secure += one_step_secure;
-    int handled = survived && premature_emergency_actions == 0 &&
-                  secure_enough && served_enough;
+    int handled = survived && secure_enough && served_enough;
     metrics->handled += handled;
     metrics->feasible_survived += request_feasible && survived;
     metrics->feasible_handled +=
@@ -153,11 +218,14 @@ static void run_trial(PufferNet *policy, int first, int second, int context,
     metrics->safe_fraction += safe_fraction;
     metrics->peak_rho += peak_rho;
     metrics->served_load_fraction += env.log.demand_fulfilled;
-    metrics->load_shed_actions += env.log.load_shed_actions;
-    metrics->generator_trip_actions += env.log.generator_trip_actions;
-    metrics->premature_emergency_trials += premature_emergency_actions > 0;
-    metrics->premature_emergency_actions += premature_emergency_actions;
     c_close(&env);
+}
+
+static void print_action_counts(const char *phase, const long *counts)
+{
+    for (int action = 0; action < POWER_GRID_NUM_ACTIONS; action++)
+        if (counts[action] > 0)
+            printf("action,%s,%d,%ld\n", phase, action, counts[action]);
 }
 
 static void print_metrics(const char *name, int combinations,
@@ -165,7 +233,7 @@ static void print_metrics(const char *name, int combinations,
 {
     double scale = metrics->trials > 0 ? 1.0 / metrics->trials : 0.0;
     double feasible_scale = metrics->feasible > 0 ? 1.0 / metrics->feasible : 0.0;
-    printf("%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+    printf("%s,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
            name,
            combinations, metrics->trials, metrics->feasible * scale,
            metrics->survived * scale, metrics->handled * scale,
@@ -174,10 +242,6 @@ static void print_metrics(const char *name, int combinations,
            metrics->safe_fraction * scale, metrics->peak_rho * scale,
            metrics->thermal_trip_episodes * scale,
            metrics->served_load_fraction * scale,
-           metrics->load_shed_actions * scale,
-           metrics->generator_trip_actions * scale,
-           metrics->premature_emergency_trials * scale,
-           metrics->premature_emergency_actions * scale,
            metrics->secure_enough * scale, metrics->served_enough * scale,
            metrics->survived_secure * scale,
            metrics->survived_served * scale,
@@ -189,6 +253,9 @@ int main(int argc, char **argv)
     const char *checkpoint = argc > 1 ? argv[1] : "resources/power_grid/policy.bin";
     int contexts = argc > 2 ? atoi(argv[2]) : 8;
     int context_offset = argc > 3 ? atoi(argv[3]) : 0;
+    int ac_power_flow = argc > 4 ? atoi(argv[4]) : 1;
+    int forced_outage_step = argc > 5 ? atoi(argv[5]) : -1;
+    int print_diagnostics = argc > 6 ? atoi(argv[6]) : 0;
     if (contexts < 2)
     {
         fprintf(stderr, "contexts must be at least 2 to cover both N-2 orders\n");
@@ -204,9 +271,14 @@ int main(int argc, char **argv)
     if (weights == NULL)
         return 1;
     int action_sizes[1] = {POWER_GRID_NUM_ACTIONS};
-    PufferNet *policy = make_puffernet(
+    PufferNet *policy =
+#ifdef POWER_GRID_POLICY_MLP
+        power_grid_make_mlp_policy(weights);
+#else
+        make_puffernet(
         weights, 1, POWER_GRID_OBS_SIZE, POWER_GRID_POLICY_HIDDEN_SIZE,
         POWER_GRID_POLICY_NUM_LAYERS, action_sizes, 1);
+#endif
     if (policy == NULL)
     {
         free(weights);
@@ -219,18 +291,18 @@ int main(int argc, char **argv)
     {
         for (int context = context_offset;
              context < context_offset + contexts; context++)
-            run_trial(policy, first, -1, context, &n1);
+            run_trial(policy, first, -1, context, ac_power_flow,
+                      forced_outage_step, &n1);
         for (int second = first + 1; second < POWER_GRID_NUM_BRANCHES; second++)
             for (int context = context_offset;
                  context < context_offset + contexts; context++)
-                run_trial(policy, first, second, context, &n2);
+                run_trial(policy, first, second, context, ac_power_flow,
+                          forced_outage_step, &n2);
     }
 
     puts("mode,combinations,trials,feasible_rate,survival_rate,handle_rate,"
          "feasible_survival_rate,feasible_handle_rate,safe_step_rate,"
-         "mean_peak_rho,thermal_trip_rate,served_load_rate,mean_load_sheds,"
-         "mean_generator_trips,premature_emergency_rate,"
-         "mean_premature_emergency_actions,secure_enough_rate,"
+         "mean_peak_rho,thermal_trip_rate,served_load_rate,secure_enough_rate,"
          "served_enough_rate,survived_secure_rate,survived_served_rate,"
          "one_step_secure_rate");
     print_metrics("N-1", POWER_GRID_NUM_BRANCHES, &n1);
@@ -252,18 +324,83 @@ int main(int argc, char **argv)
         .safe_fraction = n1.safe_fraction + n2.safe_fraction,
         .peak_rho = n1.peak_rho + n2.peak_rho,
         .served_load_fraction = n1.served_load_fraction + n2.served_load_fraction,
-        .load_shed_actions = n1.load_shed_actions + n2.load_shed_actions,
-        .generator_trip_actions =
-            n1.generator_trip_actions + n2.generator_trip_actions,
-        .premature_emergency_trials =
-            n1.premature_emergency_trials + n2.premature_emergency_trials,
-        .premature_emergency_actions =
-            n1.premature_emergency_actions + n2.premature_emergency_actions,
+        .solved_post_steps = n1.solved_post_steps + n2.solved_post_steps,
+        .thermal_unsafe_post_steps = n1.thermal_unsafe_post_steps +
+                                     n2.thermal_unsafe_post_steps,
+        .voltage_unsafe_post_steps = n1.voltage_unsafe_post_steps +
+                                     n2.voltage_unsafe_post_steps,
+        .voltage_only_unsafe_post_steps = n1.voltage_only_unsafe_post_steps +
+                                          n2.voltage_only_unsafe_post_steps,
     };
+    for (int action = 0; action < POWER_GRID_NUM_ACTIONS; action++)
+    {
+        all.pre_action_count[action] =
+            n1.pre_action_count[action] + n2.pre_action_count[action];
+        all.first_response_action_count[action] =
+            n1.first_response_action_count[action] +
+            n2.first_response_action_count[action];
+        all.unsafe_first_response_action_count[action] =
+            n1.unsafe_first_response_action_count[action] +
+            n2.unsafe_first_response_action_count[action];
+        all.post_action_count[action] =
+            n1.post_action_count[action] + n2.post_action_count[action];
+    }
+    all.repeated_post_actions =
+        n1.repeated_post_actions + n2.repeated_post_actions;
+    all.total_post_actions = n1.total_post_actions + n2.total_post_actions;
+    all.repeated_nonnoop_post_actions =
+        n1.repeated_nonnoop_post_actions + n2.repeated_nonnoop_post_actions;
+    all.total_nonnoop_post_actions =
+        n1.total_nonnoop_post_actions + n2.total_nonnoop_post_actions;
+    all.unsafe_first_responses =
+        n1.unsafe_first_responses + n2.unsafe_first_responses;
+    all.unsafe_first_responses_secured =
+        n1.unsafe_first_responses_secured + n2.unsafe_first_responses_secured;
     print_metrics("all", POWER_GRID_NUM_BRANCHES * (POWER_GRID_NUM_BRANCHES + 1) / 2,
                   &all);
+    if (print_diagnostics)
+    {
+        print_action_counts("n1_unsafe_first_response",
+                            n1.unsafe_first_response_action_count);
+        printf("action,n1_unsafe_first_secured_fraction,-1,%.6f\n",
+               n1.unsafe_first_responses > 0 ?
+                   (double)n1.unsafe_first_responses_secured /
+                       n1.unsafe_first_responses : 0.0);
+        print_action_counts("pre", all.pre_action_count);
+        print_action_counts("first_response", all.first_response_action_count);
+        print_action_counts("unsafe_first_response",
+                            all.unsafe_first_response_action_count);
+        print_action_counts("post", all.post_action_count);
+        printf("action,repeated_post_fraction,-1,%.6f\n",
+               all.total_post_actions > 0 ?
+                   (double)all.repeated_post_actions / all.total_post_actions : 0.0);
+        printf("action,repeated_nonnoop_post_fraction,-1,%.6f\n",
+               all.total_nonnoop_post_actions > 0 ?
+                   (double)all.repeated_nonnoop_post_actions /
+                       all.total_nonnoop_post_actions : 0.0);
+        printf("action,unsafe_first_secured_fraction,-1,%.6f\n",
+               all.unsafe_first_responses > 0 ?
+                   (double)all.unsafe_first_responses_secured /
+                       all.unsafe_first_responses : 0.0);
+        printf("diagnostic,thermal_unsafe_solved_post_fraction,-1,%.6f\n",
+               all.solved_post_steps > 0 ?
+                   (double)all.thermal_unsafe_post_steps /
+                       all.solved_post_steps : 0.0);
+        printf("diagnostic,voltage_unsafe_solved_post_fraction,-1,%.6f\n",
+               all.solved_post_steps > 0 ?
+                   (double)all.voltage_unsafe_post_steps /
+                       all.solved_post_steps : 0.0);
+        printf("diagnostic,voltage_only_unsafe_solved_post_fraction,-1,%.6f\n",
+               all.solved_post_steps > 0 ?
+                   (double)all.voltage_only_unsafe_post_steps /
+                       all.solved_post_steps : 0.0);
+    }
 
+#ifdef POWER_GRID_POLICY_MLP
+    free(policy);
+#else
     free_puffernet(policy);
+#endif
     free(weights);
     return 0;
 }

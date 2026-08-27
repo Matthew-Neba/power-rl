@@ -112,12 +112,9 @@ static double immediate_action_value(const PowerGrid *env, int action)
             congestion_cost += (rho - 1.0) * (rho - 1.0);
     }
     int switched = memcmp(&topology, &env->topology, sizeof(topology)) != 0;
-    return env->safe_step_reward * (max_rho <= 1.0) -
-           env->congestion_cost_weight * congestion_cost -
-           env->congestion_progress_weight *
-               (congestion_cost - env->solution.congestion_cost) -
-           (env->solution.max_rho <= 1.0 ? env->secure_switch_penalty :
-                                          env->switch_penalty) * switched;
+    return calculate_reward(env, POWER_GRID_SOLVE_OK, max_rho, congestion_cost,
+                            env->solution.congestion_cost - congestion_cost,
+                            switched);
 }
 
 static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t *rng)
@@ -197,7 +194,7 @@ static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t
 static BenchmarkMetrics run_baseline(
     BaselinePolicy policy, int episodes, int ac_power_flow,
     double random_event_probability, int random_outage_count, int seed_offset,
-    const char *checkpoint)
+    int curriculum_mode, const char *checkpoint)
 {
     BenchmarkMetrics total = {0};
     Weights *weights = NULL;
@@ -230,6 +227,29 @@ static BenchmarkMetrics run_baseline(
             .random_event_probability = random_event_probability,
             .random_outage_count = random_outage_count,
         };
+        if (curriculum_mode)
+        {
+            env.curriculum_steps = 65536;
+            env.curriculum_recovery_probability = 1.0;
+            env.curriculum_recovery_probability_final = 1.0;
+            env.curriculum_safe_probability = 0.05;
+            env.curriculum_sequence_probability = 0.30;
+            env.curriculum_trial_steps = 4;
+            env.curriculum_one_step_fraction = 1.0;
+            env.curriculum_outage_line = -1;
+            env.sequential_outages = 1;
+            env.reward_failure = POWER_GRID_REWARD_DEFAULT_FAILURE;
+            env.reward_thermal_trip = POWER_GRID_REWARD_DEFAULT_THERMAL_TRIP;
+            env.reward_alive = 0.15f;
+            env.reward_warning_threshold =
+                POWER_GRID_REWARD_DEFAULT_WARNING_THRESHOLD;
+            env.reward_worst_line_cost_weight =
+                POWER_GRID_REWARD_DEFAULT_WORST_LINE_COST_WEIGHT;
+            env.reward_congestion_cost_weight =
+                POWER_GRID_REWARD_DEFAULT_CONGESTION_COST_WEIGHT;
+            env.reward_congestion_progress_weight = 2.0f;
+            env.reward_switch_penalty = 0.0005f;
+        }
         uint32_t action_rng = UINT32_C(0x9e3779b9) ^ (uint32_t)episode;
         power_grid_allocate(&env);
         c_reset(&env);
@@ -299,7 +319,8 @@ int main(int argc, char **argv)
     int random_outage_count = argc > 4 ? atoi(argv[4]) : 3;
     int selected_policy = argc > 5 ? atoi(argv[5]) : -1;
     int seed_offset = argc > 6 ? atoi(argv[6]) : 0;
-    const char *checkpoint = argc > 7 ? argv[7] : NULL;
+    int curriculum_mode = argc > 7 ? atoi(argv[7]) : 0;
+    const char *checkpoint = argc > 8 ? argv[8] : NULL;
     if (episodes <= 0)
     {
         fprintf(stderr, "episodes must be positive\n");
@@ -329,11 +350,14 @@ int main(int argc, char **argv)
            "peak_thermal_stress,peak_line_loading,overloaded_line_fraction\n");
     int first_policy = selected_policy < 0 ? 0 : selected_policy;
     int final_policy = selected_policy < 0 ? BASELINE_COUNT : selected_policy + 1;
+    if (curriculum_mode)
+        power_grid_prepare_one_step_recovery_cache();
     for (int policy = first_policy; policy < final_policy; policy++)
     {
         BenchmarkMetrics metrics = run_baseline(
             (BaselinePolicy)policy, episodes, ac_power_flow,
-            random_event_probability, random_outage_count, seed_offset, checkpoint);
+            random_event_probability, random_outage_count, seed_offset,
+            curriculum_mode, checkpoint);
         printf("%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
                "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                BASELINE_NAMES[policy], episodes, metrics.perf, metrics.score,

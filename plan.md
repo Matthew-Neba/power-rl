@@ -92,7 +92,7 @@ unrestricted result, not a baseline-beating claim.
 
 The phase-2 policy was expanded deterministically from 221/91 to 236/106, adding explicit load and
 generator connected-state inputs plus agent-selected emergency controls. Browser QA then caught
-anticipatory load shedding, so the reproducible `ocean/power_grid/train_honest.sh` AC curriculum
+anticipatory load shedding, so the reproducible `config/power_grid.ini` AC curriculum
 now includes intact-grid preservation, balanced N-1/N-2 recovery, full-day batches mixing
 reset-time with naturally delayed outages, and consecutive-click training. An offline AC teacher
 then fits the same decoder on 2019 recovery states and one aggregated policy-state pass. The

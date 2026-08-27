@@ -58,11 +58,9 @@ static inline PowerGridSolveStatus power_grid_user_set_line_outage(
      * topology choice made by the policy while it was unavailable. */
 
     PowerGridSolveStatus status = power_grid_solve_environment(env);
-    if (unavailable && status != POWER_GRID_SOLVE_OK)
-        env->emergency_recovery_steps = POWER_GRID_EMERGENCY_RECOVERY_STEPS;
-    /* An infeasible click is precisely when the policy most needs the new
-     * topology. Solver outputs are cleared on failure, while line availability
-     * and switch state remain valid observation features. */
+    /* An infeasible click is visible to the policy on its next step. Solver
+     * outputs are cleared on failure, while line availability and switch state
+     * remain valid observation features. */
     power_grid_compute_observations(env);
     return user->last_status = status;
 }

@@ -16,40 +16,42 @@ static int failures;
 
 static void test_contract_and_reward(void)
 {
-    CHECK(POWER_GRID_OBS_SIZE == 236);
-    CHECK(POWER_GRID_NUM_ACTIONS == 106);
+    CHECK(POWER_GRID_OBS_SIZE == 221);
+    CHECK(POWER_GRID_NUM_ACTIONS == 91);
     PowerGrid env = {
-        .failure_reward = POWER_GRID_DEFAULT_FAILURE_REWARD,
-        .safe_step_reward = POWER_GRID_DEFAULT_SAFE_STEP_REWARD,
-        .recovery_reward = POWER_GRID_DEFAULT_RECOVERY_REWARD,
-        .switch_penalty = POWER_GRID_DEFAULT_SWITCH_PENALTY,
-        .secure_switch_penalty = POWER_GRID_DEFAULT_SECURE_SWITCH_PENALTY,
-        .congestion_cost_weight = POWER_GRID_DEFAULT_CONGESTION_COST_WEIGHT,
-        .congestion_progress_weight = POWER_GRID_DEFAULT_CONGESTION_PROGRESS_WEIGHT,
-        .unserved_load_cost_weight = POWER_GRID_DEFAULT_UNSERVED_LOAD_COST_WEIGHT,
+        .reward_failure = POWER_GRID_REWARD_DEFAULT_FAILURE,
+        .reward_thermal_trip = POWER_GRID_REWARD_DEFAULT_THERMAL_TRIP,
+        .reward_alive = POWER_GRID_REWARD_DEFAULT_ALIVE,
+        .reward_warning_threshold = POWER_GRID_REWARD_DEFAULT_WARNING_THRESHOLD,
+        .reward_worst_line_cost_weight =
+            POWER_GRID_REWARD_DEFAULT_WORST_LINE_COST_WEIGHT,
+        .reward_congestion_cost_weight =
+            POWER_GRID_REWARD_DEFAULT_CONGESTION_COST_WEIGHT,
+        .reward_congestion_progress_weight =
+            POWER_GRID_REWARD_DEFAULT_CONGESTION_PROGRESS_WEIGHT,
+        .reward_switch_penalty = POWER_GRID_REWARD_DEFAULT_SWITCH_PENALTY,
     };
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY, 0.0, 0.0,
-                                 0, 0, 0, 0, 1.0),
-                POWER_GRID_DEFAULT_FAILURE_REWARD);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0,
-                                 0, 0, 1, 1, 1.0), 1.0);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0,
-                                 1, 1, 1, 1, 1.0), 0.9);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.0,
-                                 0, 0, 0, 0, 1.0), -0.2);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3,
-                                 1, 1, 0, 0, 1.0), 0.098);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.2, 0.3,
-                                 1, 0, 0, 0, 1.0), 0.0);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 10.0, 0.0,
-                                 0, 0, 0, 0, 1.0),
-                POWER_GRID_DEFAULT_FAILURE_REWARD + POWER_GRID_VALID_REWARD_MARGIN);
-    CHECK(calculate_reward(&env, POWER_GRID_SOLVE_OK, 10.0, 0.0,
-                           0, 0, 0, 0, 1.0) >
-          calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY, 0.0, 0.0,
-                           0, 0, 0, 0, 1.0));
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK, 0.0, 0.0,
-                                 0, 0, 1, 1, 0.95), 0.75);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY,
+                                 0.0, 0.0, 0.0, 0),
+                POWER_GRID_REWARD_DEFAULT_FAILURE);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                                 0.80, 0.0, 0.0, 0), 0.5);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                                 0.90, 0.0, 0.0, 1), 0.49);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                                 1.10, 0.01, 0.0, 0), 0.35);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                                 1.10, 0.01, 0.01, 0), 0.36);
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                                 2.0, 1.0, 0.0, 0),
+                POWER_GRID_REWARD_DEFAULT_THERMAL_TRIP +
+                    POWER_GRID_VALID_REWARD_MARGIN);
+    CHECK(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                           2.0, 1.0, 0.0, 0) >
+          calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY,
+                           0.0, 0.0, 0.0, 0));
+    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
+                                 0.0, 0.0, 10.0, 0), POWER_GRID_REWARD_MAX);
 
 
     power_grid_topology_normal(&env.topology);
@@ -58,14 +60,9 @@ static void test_contract_and_reward(void)
     CHECK(no_op.type == POWER_GRID_ACTION_NONE && !no_op.switched);
     PowerGridAppliedAction line = apply_agent_action(&env, 1.0f);
     CHECK(line.type == POWER_GRID_ACTION_LINE && line.switched);
-    PowerGridAppliedAction shed = apply_agent_action(
-        &env, (float)POWER_GRID_LOAD_SHED_ACTION_OFFSET);
-    CHECK(shed.type == POWER_GRID_ACTION_LOAD_SHED && shed.switched);
-    CHECK(!env.topology.load_connected[0]);
-    shed = apply_agent_action(&env, (float)POWER_GRID_LOAD_SHED_ACTION_OFFSET);
-    CHECK(shed.type == POWER_GRID_ACTION_LOAD_SHED && !shed.switched);
     PowerGridAppliedAction invalid = apply_agent_action(&env, NAN);
     CHECK(invalid.type == POWER_GRID_ACTION_INVALID && !invalid.switched);
+
 }
 
 static void test_scenario_cache(void)
@@ -77,7 +74,8 @@ static void test_scenario_cache(void)
     CHECK(POWER_GRID_OFFLINE_SCENARIOS[730].date_yyyymmdd == 20201231u);
 
     int derated = 0, uprated = 0;
-    double peak_loading = 0.0;
+    double fixed_generation[POWER_GRID_NUM_GENERATORS] = {0};
+    int fixed_generation_set = 0;
     PowerGrid env = {.offline_scenarios = 1};
     power_grid_allocate(&env);
     power_grid_topology_normal(&env.topology);
@@ -89,10 +87,23 @@ static void test_scenario_cache(void)
         {
             env.ac_power_flow = 0;
             power_grid_set_operating_period(&env, period);
+            for (int load = 0; load < POWER_GRID_NUM_LOADS; load++)
+                CHECK_CLOSE(env.operating_point.load_mw[load],
+                            POWER_GRID_LOAD_P_NOMINAL[load]);
+            if (!fixed_generation_set)
+            {
+                memcpy(fixed_generation, env.operating_point.generator_mw,
+                       sizeof(fixed_generation));
+                fixed_generation_set = 1;
+            }
+            else
+                for (int generator = 0;
+                     generator < POWER_GRID_NUM_GENERATORS; generator++)
+                    CHECK_CLOSE(env.operating_point.generator_mw[generator],
+                                fixed_generation[generator]);
             CHECK(power_grid_solve_environment(&env) == POWER_GRID_SOLVE_OK);
             derated += env.branch_rating_scale < 0.95;
             uprated += env.branch_rating_scale > 1.05;
-            peak_loading = fmax(peak_loading, env.solution.max_rho);
         }
         env.ac_power_flow = 1;
         power_grid_set_operating_period(&env, 8);
@@ -101,9 +112,6 @@ static void test_scenario_cache(void)
     }
     CHECK(derated > 0);
     CHECK(uprated > 0);
-    /* Historical days should approach the limit; deliberately overloaded
-     * cases remain in the synthetic curriculum and random contingencies. */
-    CHECK(peak_loading > 0.95);
     c_close(&env);
 }
 
@@ -196,7 +204,7 @@ static void test_invalid_agent_switch_fails_episode(void)
 
     CHECK(!env.topology.line_closed[bridge]);
     CHECK(env.solution.status != POWER_GRID_SOLVE_OK);
-    CHECK_CLOSE(env.rewards[0], env.failure_reward);
+    CHECK_CLOSE(env.rewards[0], env.reward_failure);
     CHECK(env.terminals[0] == 1.0f);
     CHECK(env.episode.switches[0] == 1);
     CHECK_CLOSE(env.log.total_failure, 1.0);
@@ -359,6 +367,41 @@ static void test_reset_and_timed_outage_mix(void)
     c_close(&env);
 }
 
+static void test_single_run_curriculum(void)
+{
+    power_grid_prepare_one_step_recovery_cache();
+    PowerGrid env = {
+        .rng = 808u,
+        .offline_scenarios = 1,
+        .offline_scenario_probability = 1.0,
+        .random_events = 1,
+        .random_event_probability = 1.0,
+        .random_outage_count = 2,
+        .random_outage_count_min = 1,
+        .sequential_outages = 1,
+        .curriculum_steps = 8,
+        .curriculum_recovery_probability = 1.0,
+        .curriculum_outage_line = -2,
+    };
+    power_grid_allocate(&env);
+
+    env.lifetime_steps = 0;
+    c_reset(&env);
+    CHECK(env.scheduled_random_event_count == 1);
+    CHECK(env.scheduled_random_event_period[0] == 0);
+    CHECK(env.scheduled_random_event_line[0] == 3);
+    CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
+    CHECK(env.solution.max_rho > 1.0);
+    CHECK(power_grid_has_one_step_recovery(&env, &env.topology));
+
+    env.lifetime_steps = 8;
+    c_reset(&env);
+    CHECK(env.scheduled_random_event_count >= 1);
+    CHECK(env.scheduled_random_event_count <= 2);
+    CHECK(env.scheduled_random_event_period[0] > 0);
+    c_close(&env);
+}
+
 static void test_sequential_outages_match_rapid_clicks(void)
 {
     PowerGrid env = {
@@ -443,12 +486,11 @@ static void test_congestion_progress_is_potential_based(void)
         .initial_outage_requires_overload = 1,
     };
     power_grid_allocate(&env);
-    env.safe_step_reward = 0.0f;
-    env.recovery_reward = 0.0f;
-    env.switch_penalty = 0.0f;
-    env.secure_switch_penalty = 0.0f;
-    env.congestion_cost_weight = 0.0f;
-    env.congestion_progress_weight = 100.0f;
+    env.reward_alive = 0.0f;
+    env.reward_worst_line_cost_weight = 0.0f;
+    env.reward_switch_penalty = 0.0f;
+    env.reward_congestion_cost_weight = 0.0f;
+    env.reward_congestion_progress_weight = 1.0f;
     c_reset(&env);
 
     int improving_action = POWER_GRID_ACTION_NONE;
@@ -484,6 +526,40 @@ static void test_congestion_progress_is_potential_based(void)
     c_step(&env);
     CHECK_CLOSE(env.rewards[0], improvement_reward);
     CHECK_CLOSE(reversal_reward + env.rewards[0], 0.0);
+    c_close(&env);
+}
+
+static void test_survivable_thermal_trip_reward(void)
+{
+    PowerGrid env = {.ac_power_flow = 1};
+    power_grid_allocate(&env);
+    c_reset(&env);
+    CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
+
+    int survivable_line = -1;
+    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
+    {
+        PowerGridTopology candidate = env.topology;
+        PowerGridACSolveResult solution;
+        candidate.line_closed[line] = 0;
+        if (power_grid_ac_solve(&candidate, &env.operating_point, &solution) ==
+            POWER_GRID_AC_OK)
+        {
+            survivable_line = line;
+            break;
+        }
+    }
+    CHECK(survivable_line >= 0);
+    env.line_thermal_stress[survivable_line] =
+        POWER_GRID_THERMAL_TRIP_THRESHOLD + POWER_GRID_THERMAL_COOLING_PER_STEP;
+    env.actions[0] = POWER_GRID_ACTION_NONE;
+    c_step(&env);
+
+    CHECK(!env.line_available[survivable_line]);
+    CHECK(!env.topology.line_closed[survivable_line]);
+    CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
+    CHECK_CLOSE(env.rewards[0], env.reward_thermal_trip);
+    CHECK(!env.terminals[0]);
     c_close(&env);
 }
 
@@ -579,13 +655,7 @@ static void test_bridge_failure_and_single_episode_stop(void)
         env.actions[0] = POWER_GRID_ACTION_NONE;
         c_step(&env);
     }
-    CHECK(env.terminals[0] == 0.0f);
-    for (int attempt = 0; attempt <= POWER_GRID_EMERGENCY_RECOVERY_STEPS;
-         attempt++)
-    {
-        env.actions[0] = POWER_GRID_ACTION_NONE;
-        c_step(&env);
-    }
+    CHECK(env.terminals[0] == 1.0f);
     CHECK_CLOSE(env.log.total_failure, 1.0);
     CHECK_CLOSE(env.log.connectivity_failure, 1.0);
     CHECK_CLOSE(env.log.event_failure, 1.0);
@@ -594,53 +664,6 @@ static void test_bridge_failure_and_single_episode_stop(void)
     c_step(&env);
     CHECK(env.terminals[0] == 1.0f);
     CHECK_CLOSE(env.log.n, 1.0);
-    c_close(&env);
-}
-
-static void test_bridge_generator_trip_recovers(void)
-{
-    int bridge = -1, generator = -1;
-    for (int line = 0; line < POWER_GRID_NUM_BRANCHES && bridge < 0; line++)
-        for (int candidate_generator = 1;
-             candidate_generator < POWER_GRID_NUM_GENERATORS;
-             candidate_generator++)
-        {
-            PowerGridTopology topology;
-            power_grid_topology_normal(&topology);
-            topology.line_closed[line] = 0;
-            if (power_grid_validate_topology(&topology, NULL, NULL) !=
-                POWER_GRID_DISCONNECTED_GENERATOR)
-                continue;
-            topology.generator_connected[candidate_generator] = 0;
-            if (power_grid_validate_topology(&topology, NULL, NULL) ==
-                POWER_GRID_SOLVE_OK)
-            {
-                bridge = line;
-                generator = candidate_generator;
-                break;
-            }
-        }
-    CHECK(bridge >= 0 && generator > 0);
-
-    PowerGrid env = {.single_episode_evaluation = 1};
-    power_grid_allocate(&env);
-    c_reset(&env);
-    env.scheduled_random_event_count = 1;
-    env.scheduled_random_event_period[0] = 1;
-    env.scheduled_random_event_line[0] = bridge;
-    for (int step = 0; step < POWER_GRID_STEPS_PER_PERIOD; step++)
-    {
-        env.actions[0] = POWER_GRID_ACTION_NONE;
-        c_step(&env);
-    }
-    CHECK(env.solution.status == POWER_GRID_DISCONNECTED_GENERATOR);
-    CHECK(env.emergency_recovery_steps == POWER_GRID_EMERGENCY_RECOVERY_STEPS);
-    env.actions[0] = (float)(POWER_GRID_GENERATOR_TRIP_ACTION_OFFSET + generator - 1);
-    c_step(&env);
-    CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
-    CHECK(env.terminals[0] == 0.0f);
-    CHECK(env.emergency_recovery_steps == 0);
-    CHECK(env.episode.switches[POWER_GRID_ACTION_GENERATOR_TRIP] == 1);
     c_close(&env);
 }
 
@@ -680,13 +703,7 @@ static void test_second_outage_can_fail_recovery_topology(void)
         env.actions[0] = POWER_GRID_ACTION_NONE;
         c_step(&env);
     }
-    CHECK(env.terminals[0] == 0.0f);
-    for (int attempt = 0; attempt <= POWER_GRID_EMERGENCY_RECOVERY_STEPS;
-         attempt++)
-    {
-        env.actions[0] = POWER_GRID_ACTION_NONE;
-        c_step(&env);
-    }
+    CHECK(env.terminals[0] == 1.0f);
     CHECK(env.solution.status != POWER_GRID_SOLVE_OK);
     CHECK(!env.topology.line_closed[recovery_line]);
     CHECK(!env.topology.line_closed[outage_line]);
@@ -739,14 +756,15 @@ int main(void)
     test_random_outage_count_range();
     test_random_outages_at_reset();
     test_reset_and_timed_outage_mix();
+    test_single_run_curriculum();
     test_sequential_outages_match_rapid_clicks();
     test_reset_period_advances_relative_to_start();
     test_recovery_waits_for_all_scheduled_outages();
     test_congestion_progress_is_potential_based();
+    test_survivable_thermal_trip_reward();
     test_recovery_curriculum_terminal();
     test_one_step_recovery_curriculum();
     test_bridge_failure_and_single_episode_stop();
-    test_bridge_generator_trip_recovers();
     test_second_outage_can_fail_recovery_topology();
     test_randomized_lifecycle();
     if (failures)
