@@ -289,7 +289,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
             if (sweep_obj is not None
                     and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
-                    sweep_obj.early_stop(logs, target_key)):
+                    sweep_obj.early_stop(logs, args['sweep']['metric'])):
                 break
         elif flat_logs['env/n'] > args['eval_episodes']:
             break
@@ -378,7 +378,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [match_score],
                 [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
         else:
-            result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
+            result_queue.put((args['gpu_id'], metrics[target_key], metrics['uptime'], metrics['agent_steps']))
 
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
