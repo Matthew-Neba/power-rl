@@ -52,31 +52,20 @@ inference use the identical transformation.
 
 ## Reward and metrics
 
-The current configurable reward is the guide's simple topology-control form,
-adapted to the quantities this environment actually models:
+The reward contains overload cost and a switch-action cost:
 
 ```text
-+reward_alive
--reward_worst_line_cost_weight * max(0, max_line_loading - reward_warning_threshold)^2
 -reward_congestion_cost_weight * sum(max(0, line_loading - 1)^2)
-+reward_congestion_progress_weight * (previous_overload_cost - current_overload_cost)
--reward_switch_penalty * physical_topology_changes
+-reward_switch_penalty * valid_non_noop_switch_action
 ```
 
 Invalid topology, an unpowered island, a disconnected load or generator, or solver failure terminates
-with `reward_failure = -1`. An AC thermal-protection trip also receives `reward_thermal_trip = -1` and
-continues only when the post-trip topology remains feasible; otherwise it is the same terminal failure.
-Every reward is clamped to `[-1, 1]`, and ordinary solved steps are floored at `-0.95` so intentionally
-causing a line trip cannot be preferable to remaining in a difficult but feasible state. The progress
-term is signed, so an undo/redo cycle has zero net progress.
-The guide's nonterminal coefficients are uniformly scaled by one half for this range: alive `0.5`,
-worst-line warning `2.5`, quadratic overload `5`, overload progress `1`, and switching `0.01`.
-Uniform scaling preserves their relative tradeoffs and leaves headroom above the alive reward for a
-useful recovery signal.
+with a fixed reward of `-1`. A survivable AC thermal-protection trip updates the topology and then uses
+the same overload reward. Every reward is clamped to `[-1, 1]`.
 
 There is no separate reward for unserved load, frequency, reference-topology distance, or losses:
 this version has fixed injections and no load-shedding/frequency control, and infeasible demand service
-already appears as a terminal connectivity failure. All reward hyperparameters are exposed in
+already appears as a terminal connectivity failure. Both reward weights are exposed in
 `config/power_grid.ini` and copied into each native environment by `binding.c`.
 This exactly matches the unmodified PufferLib PPO trainer's reward range.
 Reward-independent metrics include survival, secure-step fraction, outage completion, switching,

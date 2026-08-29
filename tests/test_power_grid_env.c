@@ -19,39 +19,22 @@ static void test_contract_and_reward(void)
     CHECK(POWER_GRID_OBS_SIZE == 221);
     CHECK(POWER_GRID_NUM_ACTIONS == 91);
     PowerGrid env = {
-        .reward_failure = POWER_GRID_REWARD_DEFAULT_FAILURE,
-        .reward_thermal_trip = POWER_GRID_REWARD_DEFAULT_THERMAL_TRIP,
-        .reward_alive = POWER_GRID_REWARD_DEFAULT_ALIVE,
-        .reward_warning_threshold = POWER_GRID_REWARD_DEFAULT_WARNING_THRESHOLD,
-        .reward_worst_line_cost_weight =
-            POWER_GRID_REWARD_DEFAULT_WORST_LINE_COST_WEIGHT,
         .reward_congestion_cost_weight =
             POWER_GRID_REWARD_DEFAULT_CONGESTION_COST_WEIGHT,
-        .reward_congestion_progress_weight =
-            POWER_GRID_REWARD_DEFAULT_CONGESTION_PROGRESS_WEIGHT,
         .reward_switch_penalty = POWER_GRID_REWARD_DEFAULT_SWITCH_PENALTY,
     };
     CHECK_CLOSE(calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY,
-                                 0.0, 0.0, 0.0, 0),
-                POWER_GRID_REWARD_DEFAULT_FAILURE);
+                                 0.0, 0),
+                POWER_GRID_REWARD_MIN);
     CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                                 0.80, 0.0, 0.0, 0), 0.5);
+                                 0.0, 0), 0.0);
     CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                                 0.90, 0.0, 0.0, 1), 0.49);
+                                 0.01, 0), -0.05);
     CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                                 1.10, 0.01, 0.0, 0), 0.35);
+                                 1.0, 0), POWER_GRID_REWARD_MIN);
     CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                                 1.10, 0.01, 0.01, 0), 0.36);
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                                 2.0, 1.0, 0.0, 0),
-                POWER_GRID_REWARD_DEFAULT_THERMAL_TRIP +
-                    POWER_GRID_VALID_REWARD_MARGIN);
-    CHECK(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                           2.0, 1.0, 0.0, 0) >
-          calculate_reward(&env, POWER_GRID_INVALID_TOPOLOGY,
-                           0.0, 0.0, 0.0, 0));
-    CHECK_CLOSE(calculate_reward(&env, POWER_GRID_SOLVE_OK,
-                                 0.0, 0.0, 10.0, 0), POWER_GRID_REWARD_MAX);
+                                 0.0, 1),
+                -POWER_GRID_REWARD_DEFAULT_SWITCH_PENALTY);
 
 
     power_grid_topology_normal(&env.topology);
@@ -204,7 +187,7 @@ static void test_invalid_agent_switch_fails_episode(void)
 
     CHECK(!env.topology.line_closed[bridge]);
     CHECK(env.solution.status != POWER_GRID_SOLVE_OK);
-    CHECK_CLOSE(env.rewards[0], env.reward_failure);
+    CHECK_CLOSE(env.rewards[0], POWER_GRID_REWARD_MIN);
     CHECK(env.terminals[0] == 1.0f);
     CHECK(env.episode.switches[0] == 1);
     CHECK_CLOSE(env.log.total_failure, 1.0);
@@ -474,61 +457,6 @@ static void test_recovery_waits_for_all_scheduled_outages(void)
     c_close(&env);
 }
 
-static void test_congestion_progress_is_potential_based(void)
-{
-    PowerGrid env = {
-        .rng = 37u,
-        .random_events = 1,
-        .random_event_probability = 1.0,
-        .random_outage_count = 1,
-        .random_outages_at_reset = 1,
-        .reset_outage_probability = 1.0,
-        .initial_outage_requires_overload = 1,
-    };
-    power_grid_allocate(&env);
-    env.reward_alive = 0.0f;
-    env.reward_worst_line_cost_weight = 0.0f;
-    env.reward_switch_penalty = 0.0f;
-    env.reward_congestion_cost_weight = 0.0f;
-    env.reward_congestion_progress_weight = 1.0f;
-    c_reset(&env);
-
-    int improving_action = POWER_GRID_ACTION_NONE;
-    double initial_rho = env.solution.max_rho;
-    for (int action = 1; action < POWER_GRID_NUM_ACTIONS; action++)
-    {
-        PowerGrid candidate = env;
-        PowerGridAppliedAction applied = apply_agent_action(&candidate, (float)action);
-        if (!applied.electrical_change)
-            continue;
-        PowerGridSolveResult solution;
-        if (power_grid_solve_scaled(&candidate.topology, &env.operating_point, &solution,
-                                    env.branch_rating_scale) == POWER_GRID_SOLVE_OK &&
-            solution.max_rho < initial_rho - 1e-9)
-        {
-            improving_action = action;
-            break;
-        }
-    }
-    CHECK(improving_action != POWER_GRID_ACTION_NONE);
-
-    env.actions[0] = (float)improving_action;
-    c_step(&env);
-    CHECK(env.rewards[0] > 0.0f);
-    float improvement_reward = env.rewards[0];
-
-    env.actions[0] = (float)improving_action;
-    c_step(&env);
-    CHECK(env.rewards[0] < 0.0f);
-    float reversal_reward = env.rewards[0];
-
-    env.actions[0] = (float)improving_action;
-    c_step(&env);
-    CHECK_CLOSE(env.rewards[0], improvement_reward);
-    CHECK_CLOSE(reversal_reward + env.rewards[0], 0.0);
-    c_close(&env);
-}
-
 static void test_survivable_thermal_trip_reward(void)
 {
     PowerGrid env = {.ac_power_flow = 1};
@@ -558,7 +486,7 @@ static void test_survivable_thermal_trip_reward(void)
     CHECK(!env.line_available[survivable_line]);
     CHECK(!env.topology.line_closed[survivable_line]);
     CHECK(env.solution.status == POWER_GRID_SOLVE_OK);
-    CHECK_CLOSE(env.rewards[0], env.reward_thermal_trip);
+    CHECK(env.rewards[0] <= 0.0f);
     CHECK(!env.terminals[0]);
     c_close(&env);
 }
@@ -760,7 +688,6 @@ int main(void)
     test_sequential_outages_match_rapid_clicks();
     test_reset_period_advances_relative_to_start();
     test_recovery_waits_for_all_scheduled_outages();
-    test_congestion_progress_is_potential_based();
     test_survivable_thermal_trip_reward();
     test_recovery_curriculum_terminal();
     test_one_step_recovery_curriculum();

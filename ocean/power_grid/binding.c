@@ -68,18 +68,8 @@ void my_init(Env* env, Dict* kwargs) {
         (int)dict_get(kwargs, "end_episode_on_recovery")->value;
     env->single_episode_evaluation =
         (int)dict_get(kwargs, "single_episode_evaluation")->value;
-    env->reward_failure = (float)dict_get(kwargs, "reward_failure")->value;
-    env->reward_thermal_trip =
-        (float)dict_get(kwargs, "reward_thermal_trip")->value;
-    env->reward_alive = (float)dict_get(kwargs, "reward_alive")->value;
-    env->reward_warning_threshold =
-        (float)dict_get(kwargs, "reward_warning_threshold")->value;
-    env->reward_worst_line_cost_weight =
-        (float)dict_get(kwargs, "reward_worst_line_cost_weight")->value;
     env->reward_congestion_cost_weight =
         (float)dict_get(kwargs, "reward_congestion_cost_weight")->value;
-    env->reward_congestion_progress_weight =
-        (float)dict_get(kwargs, "reward_congestion_progress_weight")->value;
     env->reward_switch_penalty =
         (float)dict_get(kwargs, "reward_switch_penalty")->value;
     if (env->offline_scenarios &&

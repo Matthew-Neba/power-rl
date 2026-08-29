@@ -97,7 +97,6 @@ static double immediate_action_value(const PowerGrid *env, int action)
         return -INFINITY;
 
     double congestion_cost = 0.0;
-    double max_rho = 0.0;
     for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
     {
         double rating = (env->ac_power_flow ? power_grid_ac_branch_rating_mva(line) :
@@ -107,14 +106,10 @@ static double immediate_action_value(const PowerGrid *env, int action)
             fmax(ac_solution.branch_from_mva[line], ac_solution.branch_to_mva[line]) :
             fabs(solution.branch_flow_mw[line]);
         double rho = loading / rating;
-        max_rho = fmax(max_rho, rho);
         if (rho > 1.0)
             congestion_cost += (rho - 1.0) * (rho - 1.0);
     }
-    int switched = memcmp(&topology, &env->topology, sizeof(topology)) != 0;
-    return calculate_reward(env, POWER_GRID_SOLVE_OK, max_rho, congestion_cost,
-                            env->solution.congestion_cost - congestion_cost,
-                            switched);
+    return calculate_reward(env, POWER_GRID_SOLVE_OK, congestion_cost, 1);
 }
 
 static int baseline_action(const PowerGrid *env, BaselinePolicy policy, uint32_t *rng)
@@ -238,17 +233,9 @@ static BenchmarkMetrics run_baseline(
             env.curriculum_one_step_fraction = 1.0;
             env.curriculum_outage_line = -1;
             env.sequential_outages = 1;
-            env.reward_failure = POWER_GRID_REWARD_DEFAULT_FAILURE;
-            env.reward_thermal_trip = POWER_GRID_REWARD_DEFAULT_THERMAL_TRIP;
-            env.reward_alive = 0.15f;
-            env.reward_warning_threshold =
-                POWER_GRID_REWARD_DEFAULT_WARNING_THRESHOLD;
-            env.reward_worst_line_cost_weight =
-                POWER_GRID_REWARD_DEFAULT_WORST_LINE_COST_WEIGHT;
             env.reward_congestion_cost_weight =
                 POWER_GRID_REWARD_DEFAULT_CONGESTION_COST_WEIGHT;
-            env.reward_congestion_progress_weight = 2.0f;
-            env.reward_switch_penalty = 0.0005f;
+            env.reward_switch_penalty = POWER_GRID_REWARD_DEFAULT_SWITCH_PENALTY;
         }
         uint32_t action_rng = UINT32_C(0x9e3779b9) ^ (uint32_t)episode;
         power_grid_allocate(&env);

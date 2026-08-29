@@ -49,6 +49,7 @@ def replay(
     args["env"]["ac_power_flow"] = ac_power_flow
     args["env"]["offline_scenarios"] = True
     args["env"]["offline_scenario_validation"] = True
+    args["env"]["curriculum_steps"] = 0
     args["env"]["single_episode_evaluation"] = True
     if random_event_probability is not None:
         args["env"]["random_events"] = random_event_probability > 0.0

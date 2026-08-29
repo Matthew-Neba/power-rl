@@ -91,6 +91,8 @@ def main():
         description="Compare a trained policy with held-out seeded baselines"
     )
     parser.add_argument("--checkpoint", default="latest")
+    parser.add_argument("--hidden-size", type=int)
+    parser.add_argument("--num-layers", type=int)
     parser.add_argument("--episodes", type=int, default=1024)
     parser.add_argument("--physics", choices=("dc", "ac"), default="dc")
     parser.add_argument("--random-event-probability", type=float, default=0.50)
@@ -121,6 +123,11 @@ def main():
         args = pufferl.load_config("power_grid")
     finally:
         sys.argv = original_argv
+
+    if options.hidden_size is not None:
+        args["policy"]["hidden_size"] = options.hidden_size
+    if options.num_layers is not None:
+        args["policy"]["num_layers"] = options.num_layers
 
     checkpoint = resolve_checkpoint(options.checkpoint)
     ac_power_flow = options.physics == "ac"
