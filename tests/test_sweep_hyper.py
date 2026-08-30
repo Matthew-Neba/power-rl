@@ -12,7 +12,43 @@ try:
 except ImportError:
     _MATPLOTLIB_AVAILABLE = False
 from pufferlib import pufferl
-from pufferlib.sweep import Protein
+from pufferlib.sweep import Protein, ProteinEarlyStopper
+
+
+def test_protein_worker_view_is_cpu_only_and_preserves_early_stop_state():
+    config = {
+        "metric": "perf",
+        "goal": "maximize",
+        "metric_distribution": "linear",
+        "downsample": 5,
+        "early_stop_quantile": 0.3,
+        "use_gpu": False,
+        "train": {
+            "learning_rate": {
+                "distribution": "log_normal",
+                "min": 0.0003,
+                "max": 0.005,
+                "scale": "auto",
+            }
+        },
+    }
+    protein = Protein(config)
+    protein.stop_threshold_model.is_fitted = True
+    protein.stop_threshold_model.A = 0.4
+    protein.stop_threshold_model.B = 0.1
+    protein.stop_threshold_model.upper_cost_threshold = 100
+
+    worker = protein.worker_view()
+
+    assert isinstance(worker, ProteinEarlyStopper)
+    assert not any(isinstance(value, torch.Tensor) for value in vars(worker).values())
+    assert worker.get_early_stop_threshold(50) == protein.get_early_stop_threshold(50)
+
+    worker_logs = {"loss": {"policy": 0.0}, "uptime": 50, "env": {"perf": 0.1}}
+    protein_logs = {"loss": {"policy": 0.0}, "uptime": 50, "env": {"perf": 0.1}}
+    assert worker.early_stop(worker_logs, "perf") == protein.early_stop(
+        protein_logs, "perf"
+    )
 
 
 def evaluate_gp(gp_model, likelihood, test_x, test_y):

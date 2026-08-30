@@ -156,7 +156,10 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
             param_spaces[name] = _params_from_puffer_sweep(param, only_include)
             continue
  
-        if only_include and not any(k in name for k in only_include):
+        # sweep_only contains exact leaf parameter names. Substring matching
+        # made selecting ``clip_coef`` unintentionally include
+        # ``vf_clip_coef``, defeating constrained sweeps.
+        if only_include and name not in only_include:
             continue
 
         assert 'distribution' in param
@@ -520,6 +523,47 @@ class RobustLogCostModel:
         return self.A + self.B * np.log(cost)
 
 
+class ProteinEarlyStopper:
+    """CPU-only sweep state needed by a training worker for early stopping."""
+    def __init__(self, protein):
+        self.metric_distribution = protein.metric_distribution
+        self.stop_threshold_model = deepcopy(protein.stop_threshold_model)
+        self._running_target_buffer = deque(maxlen=30)
+
+    def logit_transform(self, value, epsilon=1e-9):
+        value = np.clip(value, epsilon, 1 - epsilon)
+        logit = math.log(value / (1 - value))
+        return np.clip(logit, -5, 100)
+
+    def get_early_stop_threshold(self, cost):
+        return self.stop_threshold_model.get_threshold(cost)
+
+    def should_stop(self, score, cost):
+        threshold = self.get_early_stop_threshold(cost)
+        if self.metric_distribution == 'percentile':
+            score = self.logit_transform(score)
+        return score < threshold
+
+    def early_stop(self, logs, target_key):
+        for value in logs['loss'].values():
+            if np.isnan(value):
+                logs['is_loss_nan'] = True
+                return True
+
+        if 'uptime' not in logs or target_key not in logs.get('env', {}):
+            return False
+
+        metric_val, cost = logs['env'][target_key], logs['uptime']
+        self._running_target_buffer.append(metric_val)
+        target_running_mean = np.mean(self._running_target_buffer)
+        threshold = self.get_early_stop_threshold(cost)
+        logs['early_stop_threshold'] = max(threshold, -5)
+        if self.should_stop(max(target_running_mean, metric_val), cost):
+            logs['is_loss_nan'] = False
+            return True
+        return False
+
+
 # TODO: Eval defaults
 class Protein:
     def __init__(self,
@@ -630,6 +674,9 @@ class Protein:
             for state in opt.state.values():
                 state.update({k: v.to(self.device) for k, v in state.items() if isinstance(v, torch.Tensor)})
         return self
+
+    def worker_view(self):
+        return ProteinEarlyStopper(self)
 
     def _filter_near_duplicates(self, inputs, duplicate_threshold=EPSILON):
         if len(inputs) < 2:
