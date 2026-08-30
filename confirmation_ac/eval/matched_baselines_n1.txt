@@ -1,0 +1,28 @@
+Checkpoint: confirmation_ac/checkpoints/power_grid/1787974733219/0000000046669824.bin
+Held-out 2020 scenarios; AC physics; random event probability 1.00; 1 outages per event episode; environment seeds 0..1999
+Policy                  N     Perf    Score     Fail  EvtFail   Switches   Events
+------------------------------------------------------------------------------------
+PPO agent            2000   0.6566   0.9145   0.2505   0.0520      5.596   1.0000
+No action            2000   0.6614   1.0000   0.2410   0.0520      0.000   1.0000
+Uniform random       2000   0.0000   0.0090   1.0000   0.0025      3.360   0.0115
+Random lines         2000   0.0000   0.0392   1.0000   0.0070      4.011   0.0180
+Safe random          2000   0.0017   0.0132   0.9960   0.0545     10.677   0.1355
+Greedy lines         2000   0.7544   0.9862   0.1600   0.0520      0.980   1.0000
+Greedy all           2000   0.7611   0.9856   0.1600   0.0520      1.024   1.0000
+Lookahead lines      2000   0.7546   0.9861   0.1600   0.0520      0.992   1.0000
+
+Policy               Demand%   Outage%  Survive%   TripEp%    Trips  PeakStress   PeakRho   OLLine%
+---------------------------------------------------------------------------------------------------------
+PPO agent              99.28    100.00     74.95      7.25    0.157       0.164     1.028     0.900
+No action              99.45    100.00     75.90     21.50    0.472       0.576     1.196     1.332
+Uniform random         54.29      1.15      0.00     20.15    0.257       0.502     1.113     4.541
+Random lines           67.25      1.80      0.00     33.90    0.429       0.788     1.486     7.352
+Safe random            81.48     13.55      0.40     94.25    1.273       1.840     2.029    11.049
+Greedy lines           99.62    100.00     84.00     10.80    0.209       0.428     1.111     1.094
+Greedy all             99.62    100.00     84.00     10.80    0.209       0.420     1.111     1.030
+Lookahead lines        99.62    100.00     84.00     10.80    0.209       0.425     1.111     1.111
+Detected discrete action space with 1 heads
+Num workers: 4
+Num workers: 4
+Num workers: 4
+Num workers: 4

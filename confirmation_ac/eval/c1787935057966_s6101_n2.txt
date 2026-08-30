@@ -1,0 +1,14 @@
+Checkpoint: confirmation_ac/checkpoints/power_grid/1787974840681/0000000048144384.bin
+Held-out 2020 scenarios; AC physics; random event probability 1.00; 2 outages per event episode; environment seeds 0..1999
+Policy                  N     Perf    Score     Fail  EvtFail   Switches   Events
+------------------------------------------------------------------------------------
+PPO agent            2000   0.3380   0.8941   0.5830   0.3175      4.700   1.8840
+
+Policy               Demand%   Outage%  Survive%   TripEp%    Trips  PeakStress   PeakRho   OLLine%
+---------------------------------------------------------------------------------------------------------
+PPO agent              99.16     94.20     41.70     24.20    0.392       0.440     1.223     1.654
+Detected discrete action space with 1 heads
+Num workers: 4
+Num workers: 4
+Num workers: 4
+Num workers: 4

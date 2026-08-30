@@ -75,7 +75,7 @@ int main(void) {
             TextFormat(" | outage result: %s",
                        power_grid_solve_status_name(user.last_status));
         SetWindowTitle(TextFormat(
-            "IEEE-14 AC | click up to 2 lines | %s (1 stochastic, 2 argmax) | outages %d/2%s%s",
+            "IEEE-14 AC | third click replaces oldest outage | %s (1 stochastic, 2 argmax) | outages %d/2%s%s",
             mode == POWER_GRID_INFERENCE_ARGMAX ? "ARGMAX" : "STOCHASTIC",
             power_grid_user_outage_count(&user),
             episode_status, user_status));

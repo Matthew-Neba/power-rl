@@ -80,13 +80,19 @@ int main(void)
           POWER_GRID_SOLVE_OK);
     CHECK(power_grid_user_set_line_outage(&user, &env, second, 1) ==
           POWER_GRID_SOLVE_OK);
-    PowerGridTopology before_third = env.topology;
-    CHECK(power_grid_user_set_line_outage(&user, &env, third, 1) ==
-          POWER_GRID_INVALID_INPUT);
-    CHECK(memcmp(&env.topology, &before_third, sizeof(before_third)) == 0);
-    CHECK(power_grid_user_set_line_outage(&user, &env, first, 0) ==
+    power_grid_user_set_line_outage(&user, &env, third, 1);
+    CHECK(power_grid_user_outage_count(&user) == 2);
+    CHECK(env.line_available[first] && env.topology.line_closed[first]);
+    CHECK(!user.line_outage[first]);
+    CHECK(!env.line_available[second] && user.line_outage[second]);
+    CHECK(!env.line_available[third] && user.line_outage[third]);
+    CHECK(user.outage_order[0] == second && user.outage_order[1] == third);
+
+    CHECK(power_grid_user_set_line_outage(&user, &env, third, 0) ==
           POWER_GRID_SOLVE_OK);
-    CHECK(env.line_available[first] && !env.topology.line_closed[first]);
+    CHECK(power_grid_user_outage_count(&user) == 1);
+    CHECK(user.outage_order[0] == second);
+    CHECK(env.line_available[third] && !env.topology.line_closed[third]);
 
     PowerGridTopology persistent = env.topology;
     for (int step = 0; step < POWER_GRID_EPISODE_STEPS + 1; step++)

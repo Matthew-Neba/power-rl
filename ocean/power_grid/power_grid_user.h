@@ -9,6 +9,8 @@ typedef struct
 {
     int max_outages;
     unsigned char line_outage[POWER_GRID_NUM_BRANCHES];
+    int outage_order[POWER_GRID_NUM_BRANCHES];
+    int outage_count;
     int last_line;
     PowerGridSolveStatus last_status;
 } PowerGridUserSession;
@@ -17,16 +19,33 @@ static inline void power_grid_user_init(PowerGridUserSession *user, int max_outa
 {
     memset(user, 0, sizeof(*user));
     user->max_outages = max_outages;
+    for (int index = 0; index < POWER_GRID_NUM_BRANCHES; index++)
+        user->outage_order[index] = -1;
     user->last_line = -1;
     user->last_status = POWER_GRID_SOLVE_OK;
 }
 
 static inline int power_grid_user_outage_count(const PowerGridUserSession *user)
 {
-    int count = 0;
-    for (int line = 0; line < POWER_GRID_NUM_BRANCHES; line++)
-        count += user->line_outage[line];
-    return count;
+    return user->outage_count;
+}
+
+static inline void power_grid_user_forget_outage(
+    PowerGridUserSession *user, int line)
+{
+    int found = -1;
+    for (int index = 0; index < user->outage_count; index++)
+        if (user->outage_order[index] == line)
+        {
+            found = index;
+            break;
+        }
+    if (found < 0)
+        return;
+    for (int index = found; index + 1 < user->outage_count; index++)
+        user->outage_order[index] = user->outage_order[index + 1];
+    user->outage_count--;
+    user->outage_order[user->outage_count] = -1;
 }
 
 /* User outages are exogenous events, not agent actions. Apply them exactly as
@@ -42,18 +61,33 @@ static inline PowerGridSolveStatus power_grid_user_set_line_outage(
     if (unavailable == user->line_outage[line])
         return env->solution.status;
 
-    int outage_count = power_grid_user_outage_count(user);
-    if (unavailable && outage_count >= user->max_outages)
+    if (unavailable && user->max_outages <= 0)
         return user->last_status = POWER_GRID_INVALID_INPUT;
     /* An automatic outage is owned by the environment and cannot be restored
      * or reclassified by clicking it in the user controller. */
     if (unavailable && !env->line_available[line])
         return user->last_status = POWER_GRID_INVALID_INPUT;
 
+    /* Keep a rolling N-k user contingency. Once the limit is full, a new
+     * click reconnects the oldest clicked line before opening the new one. */
+    if (unavailable && user->outage_count >= user->max_outages)
+    {
+        int oldest = user->outage_order[0];
+        env->line_available[oldest] = 1;
+        env->topology.line_closed[oldest] = 1;
+        user->line_outage[oldest] = 0;
+        power_grid_user_forget_outage(user, oldest);
+    }
+
     env->line_available[line] = !unavailable;
     user->line_outage[line] = unavailable;
     if (unavailable)
+    {
         env->topology.line_closed[line] = 0;
+        user->outage_order[user->outage_count++] = line;
+    }
+    else
+        power_grid_user_forget_outage(user, line);
     /* Clearing an outage makes the line operable again without overriding a
      * topology choice made by the policy while it was unavailable. */
 

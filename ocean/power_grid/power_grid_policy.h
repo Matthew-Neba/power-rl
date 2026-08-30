@@ -7,10 +7,10 @@
 #include "../../src/puffernet.h"
 
 #ifndef POWER_GRID_POLICY_HIDDEN_SIZE
-#define POWER_GRID_POLICY_HIDDEN_SIZE 256
+#define POWER_GRID_POLICY_HIDDEN_SIZE 512
 #endif
 #ifndef POWER_GRID_POLICY_NUM_LAYERS
-#define POWER_GRID_POLICY_NUM_LAYERS 3
+#define POWER_GRID_POLICY_NUM_LAYERS 1
 #endif
 
 typedef enum

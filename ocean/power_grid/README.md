@@ -149,10 +149,11 @@ generation disconnection, or adding a non-switching remedy; all are outside the 
 optimization target is consequently the highest honest score below this ceiling unless the metric
 is revised explicitly.
 
-The repository policy is currently the exact 221/91 historical baseline from commit `fcef678b`,
-SHA-256 `48b48f0194a4b3a2e19b5cf28332cbf0431e1edb80abad6d9f35e7b43d5a82f8`. It is a temporary
-compatibility baseline, not the result of the RL-only curriculum and not a production-ready model.
-A two-context held-out AC smoke (420 trials) measured 60.0% survival and 29.5% handled overall.
+The historical 221/91 baseline from commit `fcef678b` (SHA-256
+`48b48f0194a4b3a2e19b5cf28332cbf0431e1edb80abad6d9f35e7b43d5a82f8`) was superseded after the
+completed 1,200-run Protein sweep. The browser resource now contains the 512x1 MinGRU AC retrain
+of the winning hyperparameters, SHA-256
+`c0e78af4c2cd14e3659992532da136c5797a3ebcda8e6de32d7cb1c54ea127a6`.
 The strongest allowed from-scratch candidate so far is not promoted into `resources`: across two
 standardized 16-context AC blocks (6,720 trials) it handled 26.85%, survived 56.01%, and served
 62.52% of demand. It is preserved under
@@ -778,11 +779,16 @@ source /path/to/emsdk/emsdk_env.sh
 python -m http.server 8000 --directory build/web/power_grid
 ```
 
-The current browser resource is the historical 256x3 MinGRU compatibility baseline and uses the AC
-solver. It is not the selected one-layer MLP candidate. Automatic outages are disabled; the person
-may click at most two lines. Infeasible clicks remain applied. The existing public deployment may
-lag this source revision and must not be treated as evidence for the current 91-action contract or
-the selected candidate until the correct policy is integrated, rebuilt, and redeployed.
+The browser uses Raylib, the AC solver, and the trained 512x1 MinGRU policy. Emscripten packages the
+C simulation, Puffernet inference code, and policy weights into static WebAssembly assets; both the
+grid and agent therefore run locally in the visitor's browser, following Puffer's Ocean demo
+architecture. Automatic outages are disabled. The person can keep two clicked lines unavailable;
+clicking a third reconnects the oldest user-outaged line and opens the newly selected line. Clicking
+an unavailable line directly restores it without forcing a policy-opened operable line closed.
+Infeasible contingencies remain applied and visible.
+
+Deploy all four generated files together: `game.html`, `game.js`, `game.wasm`, and `game.data`.
+Static hosting must serve `.wasm` as `application/wasm`; no inference server is required.
 
 ## Limitations
 
